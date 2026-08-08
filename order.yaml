@@ -10,7 +10,7 @@ spec:
   prune: true
   sourceRef:
     kind: GitRepository
-    name: flux-system
+    name: basis
   timeout: 10m
   healthChecks:
     - apiVersion: helm.toolkit.fluxcd.io/v2
@@ -43,7 +43,7 @@ spec:
   prune: true
   sourceRef:
     kind: GitRepository
-    name: flux-system
+    name: basis
   timeout: 10m
   healthChecks:
     - apiVersion: pkg.crossplane.io/v1
