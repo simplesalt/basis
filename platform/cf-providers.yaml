@@ -1,0 +1,49 @@
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-cloudflare-dns
+  labels:
+    entity: cluster
+    capability: access
+spec:
+  package: xpkg.upbound.io/wildbitca/provider-cloudflare-dns:v0.2.6
+  runtimeConfigRef:
+    name: cloudflare-providers
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-cloudflare-workers
+  labels:
+    entity: cluster
+    capability: access
+spec:
+  package: xpkg.upbound.io/wildbitca/provider-cloudflare-workers:v0.2.6
+  runtimeConfigRef:
+    name: cloudflare-providers
+---
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-cloudflare-r2
+  labels:
+    entity: cluster
+    capability: access
+spec:
+  package: xpkg.upbound.io/wildbitca/provider-cloudflare-r2:v0.2.6
+  runtimeConfigRef:
+    name: cloudflare-providers
+---
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-cloudflare-zero
+  labels:
+    entity: cluster
+    capability: access
+spec:
+  package: xpkg.upbound.io/wildbitca/provider-cloudflare-zero:v0.2.6
+  runtimeConfigRef:
+    name: cloudflare-providers

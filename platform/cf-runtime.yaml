@@ -1,0 +1,21 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: crossplane-provider-crd-watcher
+  labels:
+    entity: cluster
+    capability: access
+    rbac.crossplane.io/aggregate-to-allowed-provider-permissions: "true"
+rules:
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    verbs: [get, list, watch]
+---
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: cloudflare-providers
+  labels:
+    entity: cluster
+    capability: access
+spec: {}

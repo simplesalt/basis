@@ -1,0 +1,98 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno-cleanup-controller-pods
+  labels:
+    rbac.kyverno.io/aggregate-to-cleanup-controller: "true"
+    entity: cluster
+    capability: basis
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+---
+apiVersion: kyverno.io/v2
+kind: ClusterCleanupPolicy
+metadata:
+  name: reap-orphaned-job-pods
+  labels:
+    app.kubernetes.io/name: reap-orphaned-job-pods
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: basis
+  annotations:
+    policies.kyverno.io/title: Reap Orphaned Job Pods
+    policies.kyverno.io/category: Housekeeping
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Deletes Job-spawned Pods (job-name label present) that carry zero
+      ownerReferences. The Job controller always stamps a controller owner
+      ref on pods it creates; a job-name pod with none is debris left behind
+      when Flux replaces an immutable Job (delete+recreate on reconcile)
+      without cascading the old generation's pods. Left alone these retry
+      forever under restartPolicy OnFailure and never self-terminate -
+      ttlSecondsAfterFinished can't help either since they never reach a Job
+      terminal state. Requires the kyverno-cleanup-controller-pods
+      ClusterRole in policies.cleanup-rbac.yaml.
+spec:
+  schedule: "*/15 * * * *"
+  match:
+    any:
+      - resources:
+          kinds:
+            - Pod
+          selector:
+            matchExpressions:
+              - key: job-name
+                operator: Exists
+  conditions:
+    all:
+      - key: "{{ target.metadata.ownerReferences || `[]` | length(@) }}"
+        operator: Equals
+        value: 0
+---
+apiVersion: kyverno.io/v2
+kind: ClusterCleanupPolicy
+metadata:
+  name: reap-oom-evicted-pods
+  labels:
+    app.kubernetes.io/name: reap-oom-evicted-pods
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: basis
+  annotations:
+    policies.kyverno.io/title: Reap OOM-Evicted Pods
+    policies.kyverno.io/category: Housekeeping
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Deletes Pods left behind after a node-memory-pressure eviction: phase
+      Failed, status.reason OutOfmemory (kubelet's literal casing). When
+      kubelet can't confirm a container's final state with containerd during
+      such an eviction, the Pod object is sometimes left stuck instead of
+      being removed, with containerStatuses reporting
+      ContainerStatusUnknown. Scoped to controller-owned Pods only (a
+      ReplicaSet/Job/etc still tracks it) so deletion is safe - the owning
+      controller already replaces it to satisfy its desired count; this
+      policy only clears the stale debris. Reuses the pods RBAC granted in
+      policies.cleanup-rbac.yaml for reap-orphaned-job-pods.
+spec:
+  schedule: "*/15 * * * *"
+  match:
+    any:
+      - resources:
+          kinds:
+            - Pod
+  conditions:
+    all:
+      - key: "{{ target.status.phase }}"
+        operator: Equals
+        value: Failed
+      - key: "{{ target.status.reason }}"
+        operator: Equals
+        value: OutOfmemory
+      - key: "{{ target.metadata.ownerReferences || `[]` | length(@) }}"
+        operator: GreaterThan
+        value: 0

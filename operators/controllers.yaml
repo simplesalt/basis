@@ -1,0 +1,269 @@
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: cert-manager
+  namespace: cert-manager
+  labels:
+    app.kubernetes.io/name: cert-manager
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: certificates
+    entity: cluster
+    capability: certs
+spec:
+  releaseName: cert-manager
+  chart:
+    spec:
+      chart: cert-manager
+      sourceRef:
+        kind: HelmRepository
+        name: cert-manager
+        namespace: flux-system
+  interval: 5m
+  values:
+    crds:
+      enabled: true
+    namespace: cert-manager
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: crossplane
+  namespace: crossplane-system
+  labels:
+    app.kubernetes.io/name: crossplane
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: iac
+    entity: cluster
+    capability: iac
+spec:
+  interval: 5m
+  releaseName: crossplane
+  chart:
+    spec:
+      chart: crossplane
+      sourceRef:
+        kind: HelmRepository
+        name: crossplane-stable
+        namespace: flux-system
+  values:
+    provider:
+      packages: []
+    configuration:
+      packages: []
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kyverno
+  namespace: kyverno
+  labels:
+    app.kubernetes.io/name: kyverno
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: governance
+spec:
+  interval: 5m
+  releaseName: kyverno-controller
+  chart:
+    spec:
+      chart: kyverno
+      sourceRef:
+        kind: HelmRepository
+        name: kyverno
+        namespace: flux-system
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kube-prometheus-stack
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: kube-prometheus-stack
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: monitoring
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  releaseName: prometheus
+  install:
+    createNamespace: true
+  chart:
+    spec:
+      chart: kube-prometheus-stack
+      sourceRef:
+        kind: HelmRepository
+        name: prometheus-community
+        namespace: flux-system
+  interval: 5m
+  values:
+    prometheus:
+      prometheusSpec:
+        serviceMonitorSelectorNilUsesHelmValues: false
+        honorLabels: true
+        scrapeInterval: 120s
+        evaluationInterval: 120s
+        retention: 3d
+        retentionSize: 5GB
+        resources:
+          requests:
+            cpu: 100m
+            memory: 2Gi
+          limits:
+            memory: 3Gi
+        storageSpec:
+          volumeClaimTemplate:
+            spec:
+              storageClassName: local-path
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 50Gi
+        query:
+          maxConcurrency: 8
+          maxSamples: 25000000
+    kubeApiServer:
+      serviceMonitor:
+        metricRelabelings:
+        - action: drop
+          sourceLabels: [__name__]
+          regex: apiserver_request_duration_seconds_bucket|etcd_request_duration_seconds_bucket|apiserver_request_sli_duration_seconds_bucket|apiserver_request_body_size_bytes_bucket|apiserver_response_sizes_bucket|apiserver_watch_events_sizes_bucket|workqueue_queue_duration_seconds_bucket|workqueue_work_duration_seconds_bucket|apiserver_watch_cache_read_wait_seconds_bucket
+    kubelet:
+      serviceMonitor:
+        cAdvisorMetricRelabelings:
+        - action: drop
+          sourceLabels: [__name__]
+          regex: container_tasks_state|container_memory_failures_total|container_network_tcp_usage_total|container_network_udp_usage_total|container_blkio_device_usage_total|container_network_.*_errors_total|container_network_.*_dropped_total|container_spec_.*|container_file_descriptors|container_threads.*|container_processes|container_sockets|container_last_seen|container_start_time_seconds
+    kubeControllerManager:
+      enabled: false
+    kubeScheduler:
+      enabled: false
+    kubeProxy:
+      enabled: false
+    kubeEtcd:
+      enabled: false
+    grafana:
+      adminPassword: admin
+      persistence:
+        enabled: true
+        storageClassName: local-path
+        size: 10Gi
+      ingress:
+        enabled: false
+    alertmanager:
+      alertmanagerSpec:
+        storage:
+          volumeClaimTemplate:
+            spec:
+              storageClassName: local-path
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 10Gi
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: cnpg
+  namespace: cnpg-system
+  labels:
+    app.kubernetes.io/name: cnpg
+    app.kubernetes.io/part-of: database
+    app.kubernetes.io/component: operator
+    entity: cluster
+    env: main
+    capability: data
+spec:
+  releaseName: cnpg
+  install:
+    createNamespace: true
+  chart:
+    spec:
+      chart: cloudnative-pg
+      sourceRef:
+        kind: HelmRepository
+        name: cnpg
+        namespace: flux-system
+  interval: 5m
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: fluent-bit
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: fluent-bit
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: logging
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  releaseName: fluent-bit
+  install:
+    createNamespace: true
+  chart:
+    spec:
+      chart: fluent-bit
+      sourceRef:
+        kind: HelmRepository
+        name: fluent
+        namespace: flux-system
+  interval: 5m
+  values:
+    kind: DaemonSet
+    config:
+      service: |
+        [SERVICE]
+            Daemon Off
+            Flush 1
+            Log_Level info
+            Parsers_File /fluent-bit/etc/parsers.conf
+            Parsers_File /fluent-bit/etc/conf/custom_parsers.conf
+            HTTP_Server On
+            HTTP_Listen 0.0.0.0
+            HTTP_Port 2020
+            Health_Check On
+      inputs: |
+        [INPUT]
+            Name systemd
+            Tag host.*
+            Read_From_Tail On
+            Strip_Underscores On
+      outputs: |
+        [OUTPUT]
+            Name stdout
+            Match *
+            Format json_lines
+    tolerations:
+      - effect: NoSchedule
+        operator: Exists
+    volumeMounts:
+      - name: varlog
+        mountPath: /var/log
+        readOnly: true
+      - name: varlibdockercontainers
+        mountPath: /var/lib/docker/containers
+        readOnly: true
+      - name: etcmachineid
+        mountPath: /etc/machine-id
+        readOnly: true
+      - name: systemd
+        mountPath: /run/systemd
+        readOnly: true
+    daemonSetVolumes:
+      - name: varlog
+        hostPath:
+          path: /var/log
+      - name: varlibdockercontainers
+        hostPath:
+          path: /var/lib/docker/containers
+      - name: etcmachineid
+        hostPath:
+          path: /etc/machine-id
+          type: File
+      - name: systemd
+        hostPath:
+          path: /run/systemd
