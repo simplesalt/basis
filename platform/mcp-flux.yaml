@@ -1,6 +1,11 @@
 # mcp-flux: MCP server exposing read/write Flux + Kubernetes API access
 # (flux-operator-mcp) to in-cluster consumers.
 #
+# Deliberately internal-only: no Ingress. Every known consumer already
+# reaches it via the in-cluster Service DNS, so there is no need for
+# external/Ingress exposure -- do not "helpfully" re-add one. See the
+# NetworkPolicy below for the exact namespaces admitted.
+#
 # Ported from simplesalt/base-stack (branch `named`) 3.infra/mcp-k8s.yaml.
 # Ref: simplesalt/projects#221.
 #
@@ -113,7 +118,7 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: mcp-flux-allow-ingress
+  name: mcp-flux-allow-internal
   namespace: flux-system
   labels:
     app: mcp-flux
@@ -123,57 +128,33 @@ metadata:
     entity: cluster
     capability: svcs
 spec:
+  # mcp-flux is deliberately internal-only: there is no Ingress for it (see
+  # simplesalt/projects#221), and it must stay that way -- do not re-add one
+  # without also re-reviewing this policy. Reachable only via the in-cluster
+  # Service DNS (http://mcp-flux.flux-system:9090/mcp), which is what every
+  # known consumer already hardcodes (see the file header). Ingress is
+  # restricted to those consumers' namespaces, matched on the built-in
+  # kubernetes.io/metadata.name label:
+  #   - ssint-main-coding (simplesalt/brain manifests/coding.yaml: the
+  #     claude-rc-* coding pods, and simplesalt/oci builder-sb/skel/
+  #     .claude.json.tmpl which they run)
+  #   - ssint-main-ai (simplesalt/brain manifests/hermes-config.yaml:
+  #     the hermes-agent Deployment)
   podSelector:
     matchLabels:
       app: mcp-flux
   ingress:
     - from:
-        - namespaceSelector: {} # Allow from all namespaces (including Traefik)
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values:
+                  - ssint-main-coding
+                  - ssint-main-ai
       ports:
         - protocol: TCP
           port: 9090
----
-# Pre-existing dangling reference, carried forward unresolved per
-# simplesalt/projects#221: secretName famevans-tls is expected in this
-# (flux-system) namespace, but the Certificate that produces that secret in
-# base-stack (3.infra/certs.yaml, name famevans-tls-svcs) only creates it in
-# namespace cluster-named-svcs, with no replication mechanism between
-# namespaces. The famevans ClusterIssuer itself also lives outside this repo
-# (dylannevans/basis, per base-stack's own certs.yaml comment), so this repo
-# cannot mint the certificate itself either. Until that's resolved -- and
-# until the cluster's ingress/domain strategy is decided -- this Ingress
-# will not get valid TLS. Resolving it is out of scope for this port.
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: mcp-flux
-  namespace: flux-system
-  labels:
-    app: mcp-flux
-    app.kubernetes.io/name: mcp-flux
-    app.kubernetes.io/part-of: basis
-    app.kubernetes.io/component: mcp-server
-    entity: cluster
-    capability: svcs
-  annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
-spec:
-  ingressClassName: traefik
-  tls:
-    - hosts:
-        - mcp-flux.famevans.win
-      secretName: famevans-tls
-  rules:
-    - host: mcp-flux.famevans.win
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: mcp-flux
-                port:
-                  number: 9090
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
