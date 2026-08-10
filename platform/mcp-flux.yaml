@@ -174,3 +174,313 @@ spec:
                 name: mcp-flux
                 port:
                   number: 9090
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-flux-operator-role
+  labels:
+    entity: cluster
+    capability: svcs
+rules:
+  # KNOWN ISSUE (accepted, tracked, carried over as-is from base-stack@named):
+  # this blanket list-everything rule includes secrets, so it grants
+  # read access to every Secret's data cluster-wide, silently defeating
+  # the "non-secret resources" restriction on the rule below. This is
+  # not a new regression -- it's the same grant that is live on the
+  # current production cluster today via base-stack. See
+  # simplesalt/basis#8 for the tracked narrowing follow-up.
+  # Allow listing all resources
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["list"]
+  # Read-only verbs for non-secret resources
+  - apiGroups: ["*"]
+    resources:
+      # Core resources
+      - bindings
+      - componentstatuses
+      - configmaps
+      - endpoints
+      - events
+      - limitranges
+      - namespaces
+      - nodes
+      - pods
+      - podtemplates
+      - replicationcontrollers
+      - resourcequotas
+      - serviceaccounts
+      - services
+      - persistentvolumes
+      - persistentvolumeclaims
+      # ACME/Cert-Manager
+      - challenges
+      - orders
+      # Admission
+      - mutatingwebhookconfigurations
+      - validatingadmissionpolicies
+      - validatingadmissionpolicybindings
+      - validatingwebhookconfigurations
+      # API Extensions
+      - customresourcedefinitions
+      - apiservices
+      # Apps
+      - controllerrevisions
+      - daemonsets
+      - deployments
+      - replicasets
+      - statefulsets
+      # Authentication
+      - selfsubjectreviews
+      - tokenreviews
+      - localsubjectaccessreviews
+      - selfsubjectaccessreviews
+      - selfsubjectrulesreviews
+      - subjectaccessreviews
+      # Autoscaling
+      - horizontalpodautoscalers
+      # Batch
+      - cronjobs
+      - jobs
+      # Coordination
+      - leases
+      # Discovery
+      - endpointslices
+      # DNS
+      - dnsendpoints
+      # Flow Control
+      - flowschemas
+      - prioritylevelconfigurations
+      # Flux
+      - fluxreports
+      - fluxinstances
+      - resourcesetinputproviders
+      - resourcesets
+      - helmchartconfigs
+      - helmcharts
+      - helmreleases
+      - kustomizations
+      - gitrepositories
+      - helmrepositories
+      - ocirepositories
+      - buckets
+      - imagepolicies
+      - imagerepositories
+      - imageupdateautomations
+      - alerts
+      - providers
+      - receivers
+      # Gateway API
+      - gatewayclasses
+      - gateways
+      - grpcroutes
+      - httproutes
+      - referencegrants
+      # Hub/Extensions
+      - accesscontrolpolicies
+      - aiservices
+      - apiversions
+      - managedsubscriptions
+      - apiaccesses
+      - apibundles
+      - apicatalogitems
+      - apiplans
+      - apiportals
+      - apiratelimits
+      - apis
+      # Infrastructure
+      - terraforms
+      - addons
+      - etcdsnapshotfiles
+      # MetalLB
+      - bfdprofiles
+      - bgpadvertisements
+      - bgppeers
+      - communities
+      - ipaddresspools
+      - l2advertisements
+      - servicebgpstatuses
+      - servicel2statuses
+      # Networking
+      - ingressclasses
+      - ingresses
+      - networkpolicies
+      # Node
+      - runtimeclasses
+      # Policy
+      - poddisruptionbudgets
+      # RBAC
+      - clusterrolebindings
+      - clusterroles
+      - rolebindings
+      - roles
+      # Scheduling
+      - priorityclasses
+      # Storage
+      - csidrivers
+      - csinodes
+      - csistoragecapacities
+      - storageclasses
+      - volumeattachments
+      # Traefik
+      - ingressroutes
+      - ingressroutetcps
+      - ingressrouteudps
+      - middlewares
+      - middlewaretcps
+      - serverstransports
+      - serverstransporttcps
+      - tlsoptions
+      - traefikservices
+    verbs:
+      - get
+      - describe
+      - logs
+      - top
+      - cluster-info
+      - events
+      - diff
+      - wait
+      - api-resources
+      - api-versions
+      - config
+      - version
+      - auth
+      - completion
+      - explain
+      - exec
+      - attach
+      - port-forward
+      - proxy
+      - cp
+      - certificate
+      - debug
+  # Allow delete for non-persistent resources
+  - apiGroups: ["*"]
+    resources:
+      - bindings
+      - componentstatuses
+      - configmaps
+      - endpoints
+      - events
+      - limitranges
+      - namespaces
+      - nodes
+      - pods
+      - podtemplates
+      - replicationcontrollers
+      - resourcequotas
+      - serviceaccounts
+      - services
+      - challenges
+      - orders
+      - mutatingwebhookconfigurations
+      - validatingadmissionpolicies
+      - validatingadmissionpolicybindings
+      - validatingwebhookconfigurations
+      - customresourcedefinitions
+      - apiservices
+      - controllerrevisions
+      - daemonsets
+      - deployments
+      - replicasets
+      - statefulsets
+      - selfsubjectreviews
+      - tokenreviews
+      - localsubjectaccessreviews
+      - selfsubjectaccessreviews
+      - selfsubjectrulesreviews
+      - subjectaccessreviews
+      - horizontalpodautoscalers
+      - cronjobs
+      - jobs
+      - leases
+      - endpointslices
+      - dnsendpoints
+      - flowschemas
+      - prioritylevelconfigurations
+      - fluxreports
+      - resourcesetinputproviders
+      - resourcesets
+      - gatewayclasses
+      - gateways
+      - grpcroutes
+      - httproutes
+      - referencegrants
+      - helmchartconfigs
+      - helmcharts
+      - helmreleases
+      - accesscontrolpolicies
+      - aiservices
+      - apiversions
+      - managedsubscriptions
+      - imagepolicies
+      - imagerepositories
+      - imageupdateautomations
+      - terraforms
+      - addons
+      - etcdsnapshotfiles
+      - kustomizations
+      - bfdprofiles
+      - bgpadvertisements
+      - bgppeers
+      - communities
+      - ipaddresspools
+      - l2advertisements
+      - servicebgpstatuses
+      - servicel2statuses
+      - ingressclasses
+      - ingresses
+      - networkpolicies
+      - runtimeclasses
+      - alerts
+      - providers
+      - receivers
+      - poddisruptionbudgets
+      - clusterrolebindings
+      - clusterroles
+      - rolebindings
+      - roles
+      - priorityclasses
+      - buckets
+      - gitrepositories
+      - helmcharts
+      - helmrepositories
+      - ocirepositories
+      - csidrivers
+      - csinodes
+      - csistoragecapacities
+      - storageclasses
+      - volumeattachments
+      - ingressroutes
+      - ingressroutetcps
+      - ingressrouteudps
+      - middlewares
+      - middlewaretcps
+      - serverstransports
+      - serverstransporttcps
+      - tlsoptions
+      - traefikservices
+    verbs:
+      - delete
+  # Special permission for FluxInstances
+  - apiGroups: ["fluxcd.controlplane.io"]
+    resources: ["fluxinstances"]
+    verbs: ["apply"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-flux-operator-role
+  labels:
+    entity: cluster
+    capability: svcs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mcp-flux-operator-role
+subjects:
+  - kind: ServiceAccount
+    name: mcp-flux
+    namespace: flux-system
