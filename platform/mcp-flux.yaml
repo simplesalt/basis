@@ -1,0 +1,176 @@
+# mcp-flux: MCP server exposing read/write Flux + Kubernetes API access
+# (flux-operator-mcp) to in-cluster consumers.
+#
+# Ported from simplesalt/base-stack (branch `named`) 3.infra/mcp-k8s.yaml.
+# Ref: simplesalt/projects#221.
+#
+# Name (mcp-flux), namespace (flux-system) and port (9090) are load-bearing:
+# three consumers hardcode http://mcp-flux.flux-system:9090/mcp --
+# simplesalt/brain manifests/hermes-config.yaml, simplesalt/brain
+# manifests/coding.yaml, and simplesalt/oci builder-sb/skel/.claude.json.tmpl.
+# Do not rename or move without updating all three.
+#
+# NOT included in this port: the ClusterRole/ClusterRoleBinding RBAC
+# (`operator-role` / `operator-role-mcp-flux` in base-stack's
+# 2.access/rbac.yaml) that this ServiceAccount needs to actually call the
+# K8s/Flux API. That grant includes a broad `delete` verb across most
+# cluster resources and issue simplesalt/projects#221 explicitly calls for a
+# security review (and a rename to mcp-flux-operator-role) before it's
+# re-applied here -- it was intentionally left out of this change rather
+# than copied uncritically. Without it, this Deployment will run but every
+# API call it makes will be forbidden. Track as follow-up.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-flux
+  namespace: flux-system
+  labels:
+    entity: cluster
+    capability: svcs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-flux
+  namespace: flux-system
+  labels:
+    app: mcp-flux
+    app.kubernetes.io/name: mcp-flux
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: mcp-server
+    entity: cluster
+    capability: svcs
+spec:
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+  selector:
+    app: mcp-flux
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-flux
+  namespace: flux-system
+  labels:
+    app: mcp-flux
+    app.kubernetes.io/name: mcp-flux
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: mcp-server
+    entity: cluster
+    capability: svcs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-flux
+  template:
+    metadata:
+      labels:
+        app: mcp-flux
+        app.kubernetes.io/name: mcp-flux
+        app.kubernetes.io/part-of: basis
+        app.kubernetes.io/component: mcp-server
+        entity: cluster
+        capability: svcs
+    spec:
+      serviceAccountName: mcp-flux
+      containers:
+        - name: manager
+          image: ghcr.io/controlplaneio-fluxcd/flux-operator-mcp:v0.49.0
+          imagePullPolicy: Always
+          args:
+            - serve
+            - --transport=http
+            - --port=9090
+            - --read-only=false
+          env:
+            - name: RUNTIME_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: http
+              containerPort: 9090
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+            requests:
+              cpu: 10m
+              memory: 64Mi
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-flux-allow-ingress
+  namespace: flux-system
+  labels:
+    app: mcp-flux
+    app.kubernetes.io/name: mcp-flux
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: mcp-server
+    entity: cluster
+    capability: svcs
+spec:
+  podSelector:
+    matchLabels:
+      app: mcp-flux
+  ingress:
+    - from:
+        - namespaceSelector: {} # Allow from all namespaces (including Traefik)
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+# Pre-existing dangling reference, carried forward unresolved per
+# simplesalt/projects#221: secretName famevans-tls is expected in this
+# (flux-system) namespace, but the Certificate that produces that secret in
+# base-stack (3.infra/certs.yaml, name famevans-tls-svcs) only creates it in
+# namespace cluster-named-svcs, with no replication mechanism between
+# namespaces. The famevans ClusterIssuer itself also lives outside this repo
+# (dylannevans/basis, per base-stack's own certs.yaml comment), so this repo
+# cannot mint the certificate itself either. Until that's resolved -- and
+# until the cluster's ingress/domain strategy is decided -- this Ingress
+# will not get valid TLS. Resolving it is out of scope for this port.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mcp-flux
+  namespace: flux-system
+  labels:
+    app: mcp-flux
+    app.kubernetes.io/name: mcp-flux
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: mcp-server
+    entity: cluster
+    capability: svcs
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - mcp-flux.famevans.win
+      secretName: famevans-tls
+  rules:
+    - host: mcp-flux.famevans.win
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp-flux
+                port:
+                  number: 9090
