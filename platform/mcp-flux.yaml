@@ -15,15 +15,17 @@
 # manifests/coding.yaml, and simplesalt/oci builder-sb/skel/.claude.json.tmpl.
 # Do not rename or move without updating all three.
 #
-# NOT included in this port: the ClusterRole/ClusterRoleBinding RBAC
-# (`operator-role` / `operator-role-mcp-flux` in base-stack's
-# 2.access/rbac.yaml) that this ServiceAccount needs to actually call the
-# K8s/Flux API. That grant includes a broad `delete` verb across most
-# cluster resources and issue simplesalt/projects#221 explicitly calls for a
-# security review (and a rename to mcp-flux-operator-role) before it's
-# re-applied here -- it was intentionally left out of this change rather
-# than copied uncritically. Without it, this Deployment will run but every
-# API call it makes will be forbidden. Track as follow-up.
+# The ClusterRole/ClusterRoleBinding RBAC this ServiceAccount needs to call
+# the K8s/Flux API IS now included below, ported from base-stack's
+# 2.access/rbac.yaml (`operator-role` / `operator-role-mcp-flux`) and renamed
+# to `mcp-flux-operator-role` as simplesalt/projects#221 required. Two
+# deviations from the base-stack original, both deliberate:
+#   - the inert kubectl-subcommand "verbs" are dropped and `pods/log` is
+#     granted explicitly, so log reads actually work (see the rule comments);
+#   - the broad `delete` verb is carried over as-is for now.
+# The security review #221 calls for is NOT finished: the blanket
+# `list` on all resources still exposes every Secret cluster-wide
+# (simplesalt/basis#8), and the `delete` breadth is still unreviewed.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -314,29 +316,24 @@ rules:
       - serverstransporttcps
       - tlsoptions
       - traefikservices
+    # Only real Kubernetes API verbs belong here. base-stack carried kubectl
+    # *subcommand* names (describe, logs, top, cluster-info, diff, wait, exec,
+    # attach, port-forward, cp, debug, ...) in this list. The authorizer can
+    # never match those, so they were silently inert -- and they made the role
+    # read as though it granted log and exec access when it granted neither.
+    # Dropping them changes no authorization outcome. Note flux-operator-mcp has
+    # no exec/attach/port-forward tool, so no such grant is reinstated here.
     verbs:
       - get
-      - describe
-      - logs
-      - top
-      - cluster-info
-      - events
-      - diff
-      - wait
-      - api-resources
-      - api-versions
-      - config
-      - version
-      - auth
-      - completion
-      - explain
-      - exec
-      - attach
-      - port-forward
-      - proxy
-      - cp
-      - certificate
-      - debug
+  # Pod logs are a subresource: `get` on `pods` does not imply `get` on
+  # `pods/log`. Granted explicitly so get_kubernetes_logs works -- without it
+  # the tool fails with `cannot get resource "pods/log" in API group ""`, which
+  # is what made the 2026-08-12 claude-rc CrashLoopBackOff undiagnosable.
+  - apiGroups: [""]
+    resources:
+      - pods/log
+    verbs:
+      - get
   # Allow delete for non-persistent resources
   - apiGroups: ["*"]
     resources:
