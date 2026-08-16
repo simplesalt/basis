@@ -16,45 +16,16 @@
 # Do not rename or move without updating all three.
 #
 # The ClusterRole/ClusterRoleBinding RBAC this ServiceAccount needs to call
-# the K8s/Flux API IS included below, ported from base-stack's
+# the K8s/Flux API IS now included below, ported from base-stack's
 # 2.access/rbac.yaml (`operator-role` / `operator-role-mcp-flux`) and renamed
-# to `mcp-flux-operator-role` as simplesalt/projects#221 required, then
-# rewritten to a least-privilege policy per simplesalt/basis#8/#11/#12.
-#
-# Governing principle: the MCP server may read broadly, may write Flux CRs
-# and the workload/config objects needed to unstick a reconcile, and may
-# never write cluster-scoped identity, policy or infrastructure objects.
-# Concretely (see each rule's own comment below for the full rationale):
-#   - Broad read (get+list, not just get) over the same long explicit
-#     resource list as before. The old apiGroups:["*"] resources:["*"]
-#     verbs:["list"] blanket rule is deleted -- that rule, not the
-#     "non-secret" list below it, was what actually granted cluster-wide
-#     Secret reads (simplesalt/basis#8).
-#   - Secrets get their own get-only rule (no `list`): narrows #8, does
-#     not close it -- a named Secret is still readable.
-#   - pods/log get is unchanged. metrics.k8s.io pods/nodes get+list is new
-#     (previously covered only by the now-removed blanket rule).
-#   - Flux CR apiGroups get get/list/create/patch/delete, so the mutating
-#     tools (reconcile_flux_*, suspend_/resume_flux_reconciliation,
-#     apply_kubernetes_manifest) actually work -- the role previously had
-#     no `patch` verb at all, so they were silently forbidden despite the
-#     `apply` grant that used to sit at the bottom of this file (`apply`
-#     is not a real Kubernetes RBAC verb; that rule was inert and is now
-#     deleted).
-#   - A second write rule covers only the core/apps/batch workload+config
-#     kinds apply_kubernetes_manifest and pod/job cleanup actually need.
-#   - Everything else the old ~100-resource `delete` rule used to cover is
-#     now not writable at all: nodes, namespaces, CRDs, RBAC
-#     (clusterroles/clusterrolebindings/roles/rolebindings),
-#     serviceaccounts, admission webhooks, storageclasses,
-#     persistentvolumes/persistentvolumeclaims and priorityclasses
-#     (simplesalt/basis#12) -- a real authorization boundary backing up
-#     ~/.claude/scripts/require-node-mutation-confirmation.sh, which is
-#     only a best-effort pod-side guard.
-#   - install_flux_instance now fails by design: it needs to create CRDs
-#     and cluster RBAC, neither of which this role grants. Not needed --
-#     the cluster installs Flux via simplesalt/oci
-#     cluster/flux-bootstrap.sh, not via this MCP server.
+# to `mcp-flux-operator-role` as simplesalt/projects#221 required. Two
+# deviations from the base-stack original, both deliberate:
+#   - the inert kubectl-subcommand "verbs" are dropped and `pods/log` is
+#     granted explicitly, so log reads actually work (see the rule comments);
+#   - the broad `delete` verb is carried over as-is for now.
+# The security review #221 calls for is NOT finished: the blanket
+# `list` on all resources still exposes every Secret cluster-wide
+# (simplesalt/basis#8), and the `delete` breadth is still unreviewed.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -62,10 +33,6 @@ metadata:
   name: mcp-flux
   namespace: flux-system
   labels:
-    app: mcp-flux
-    app.kubernetes.io/name: mcp-flux
-    app.kubernetes.io/part-of: basis
-    app.kubernetes.io/component: mcp-server
     entity: cluster
     capability: svcs
 ---
@@ -199,15 +166,18 @@ metadata:
     entity: cluster
     capability: svcs
 rules:
-  # Broad read. Explicit resource list (apiGroups: ["*"]) covering every
-  # kind get_kubernetes_resources / get_flux_instance / get_kubernetes_logs
-  # / get_kubernetes_api_versions need, plus events (Flux/HelmRelease event
-  # export) and customresourcedefinitions (get_kubernetes_api_versions). No
-  # `secrets` here -- see the dedicated get-only rule below. The old
-  # apiGroups:["*"] resources:["*"] verbs:["list"] blanket rule that used to
-  # sit above this one is deleted: it, not this list, was what actually
-  # granted cluster-wide Secret reads (simplesalt/basis#8), silently
-  # defeating this list's intended non-secret scope.
+  # KNOWN ISSUE (accepted, tracked, carried over as-is from base-stack@named):
+  # this blanket list-everything rule includes secrets, so it grants
+  # read access to every Secret's data cluster-wide, silently defeating
+  # the "non-secret resources" restriction on the rule below. This is
+  # not a new regression -- it's the same grant that is live on the
+  # current production cluster today via base-stack. See
+  # simplesalt/basis#8 for the tracked narrowing follow-up.
+  # Allow listing all resources
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["list"]
+  # Read-only verbs for non-secret resources
   - apiGroups: ["*"]
     resources:
       # Core resources
@@ -353,23 +323,6 @@ rules:
     # read as though it granted log and exec access when it granted neither.
     # Dropping them changes no authorization outcome. Note flux-operator-mcp has
     # no exec/attach/port-forward tool, so no such grant is reinstated here.
-    # `list` is added alongside `get`: get_kubernetes_resources and
-    # get_flux_instance call client.List even for a single named lookup
-    # (k8s/export.go filters by field selector inside the List), so without
-    # `list` this rule's real code path was nearly inert -- reads worked
-    # before only because of the now-removed blanket `list` rule.
-    verbs:
-      - get
-      - list
-  # Secrets: get only, deliberately no list. Needed because exporting a
-  # HelmRelease does a client.Get on its Helm storage Secret
-  # (sh.helm.release.v1.<name>.v<n>) in status.storageNamespace. Withholding
-  # `list` means the SA can still read a Secret it already knows the name
-  # of, but can no longer enumerate/dump every Secret cluster-wide -- this
-  # narrows simplesalt/basis#8, it does not close it.
-  - apiGroups: [""]
-    resources:
-      - secrets
     verbs:
       - get
   # Pod logs are a subresource: `get` on `pods` does not imply `get` on
@@ -381,82 +334,118 @@ rules:
       - pods/log
     verbs:
       - get
-  # Metrics API: get_kubernetes_metrics needs get+list on pods and nodes in
-  # the metrics.k8s.io API group specifically -- distinct from the core
-  # pods/nodes above, and previously covered only by the now-removed
-  # apiGroups:["*"] blanket rule.
-  - apiGroups: ["metrics.k8s.io"]
+  # Allow delete for non-persistent resources
+  - apiGroups: ["*"]
     resources:
-      - pods
-      - nodes
-    verbs:
-      - get
-      - list
-  # Flux CR writes: reconcile_flux_* (Get+Patch of the
-  # reconcile.fluxcd.io/requestedAt annotation, and reconcile.fluxcd.io/
-  # forceAt for HelmRelease), suspend_/resume_flux_reconciliation (Get+Patch
-  # of spec.suspend, or of the fluxcd.controlplane.io/reconcile annotation
-  # for FluxInstance/ResourceSet), and apply_kubernetes_manifest /
-  # delete_kubernetes_resource against Flux objects. `create`+`patch` cover
-  # server-side apply -- SSA is an HTTP PATCH with
-  # application/apply-patch+yaml, not a distinct "apply" RBAC verb (see the
-  # deleted fluxinstances rule that used to close out this file).
-  - apiGroups:
-      - source.toolkit.fluxcd.io
-      - kustomize.toolkit.fluxcd.io
-      - helm.toolkit.fluxcd.io
-      - notification.toolkit.fluxcd.io
-      - image.toolkit.fluxcd.io
-      - fluxcd.controlplane.io
-    resources: ["*"]
-    verbs:
-      - get
-      - list
-      - create
-      - patch
-      - delete
-  # Workload/config writes: the apply_kubernetes_manifest finalizer-
-  # unsticking path, and pod/job cleanup via delete_kubernetes_resource.
-  # Deliberately scoped to just the core/apps/batch kinds those tools
-  # actually touch -- this, plus the Flux CR rule above, is the entire
-  # write/delete surface of the role now, replacing the old
-  # ~100-resource `delete` rule. Cluster-scoped identity, policy and
-  # infrastructure objects -- nodes, namespaces, CRDs, RBAC
-  # (clusterroles/clusterrolebindings/roles/rolebindings),
-  # serviceaccounts, admission webhooks, storageclasses,
-  # persistentvolumes/persistentvolumeclaims, priorityclasses -- are
-  # deliberately NOT writable anywhere in this role (simplesalt/basis#12).
-  # That makes RBAC an actual authorization boundary for those objects,
-  # backing up ~/.claude/scripts/require-node-mutation-confirmation.sh
-  # (a best-effort pod-side guard, not an access-control guarantee) with
-  # a real deny.
-  - apiGroups: ["", "apps", "batch"]
-    resources:
+      - bindings
+      - componentstatuses
       - configmaps
+      - endpoints
+      - events
+      - limitranges
+      - namespaces
+      - nodes
       - pods
+      - podtemplates
+      - replicationcontrollers
+      - resourcequotas
+      - serviceaccounts
       - services
-      - deployments
-      - statefulsets
+      - challenges
+      - orders
+      - mutatingwebhookconfigurations
+      - validatingadmissionpolicies
+      - validatingadmissionpolicybindings
+      - validatingwebhookconfigurations
+      - customresourcedefinitions
+      - apiservices
+      - controllerrevisions
       - daemonsets
+      - deployments
       - replicasets
-      - jobs
+      - statefulsets
+      - selfsubjectreviews
+      - tokenreviews
+      - localsubjectaccessreviews
+      - selfsubjectaccessreviews
+      - selfsubjectrulesreviews
+      - subjectaccessreviews
+      - horizontalpodautoscalers
       - cronjobs
+      - jobs
+      - leases
+      - endpointslices
+      - dnsendpoints
+      - flowschemas
+      - prioritylevelconfigurations
+      - fluxreports
+      - resourcesetinputproviders
+      - resourcesets
+      - gatewayclasses
+      - gateways
+      - grpcroutes
+      - httproutes
+      - referencegrants
+      - helmchartconfigs
+      - helmcharts
+      - helmreleases
+      - accesscontrolpolicies
+      - aiservices
+      - apiversions
+      - managedsubscriptions
+      - imagepolicies
+      - imagerepositories
+      - imageupdateautomations
+      - terraforms
+      - addons
+      - etcdsnapshotfiles
+      - kustomizations
+      - bfdprofiles
+      - bgpadvertisements
+      - bgppeers
+      - communities
+      - ipaddresspools
+      - l2advertisements
+      - servicebgpstatuses
+      - servicel2statuses
+      - ingressclasses
+      - ingresses
+      - networkpolicies
+      - runtimeclasses
+      - alerts
+      - providers
+      - receivers
+      - poddisruptionbudgets
+      - clusterrolebindings
+      - clusterroles
+      - rolebindings
+      - roles
+      - priorityclasses
+      - buckets
+      - gitrepositories
+      - helmcharts
+      - helmrepositories
+      - ocirepositories
+      - csidrivers
+      - csinodes
+      - csistoragecapacities
+      - storageclasses
+      - volumeattachments
+      - ingressroutes
+      - ingressroutetcps
+      - ingressrouteudps
+      - middlewares
+      - middlewaretcps
+      - serverstransports
+      - serverstransporttcps
+      - tlsoptions
+      - traefikservices
     verbs:
-      - get
-      - list
-      - create
-      - patch
       - delete
-  # No `apiGroups: ["fluxcd.controlplane.io"] resources: ["fluxinstances"]
-  # verbs: ["apply"]` rule here (deleted). `apply` is not a Kubernetes RBAC
-  # verb -- server-side apply is authorized as `patch` (+ `create` for new
-  # objects), both already granted for fluxinstances by the Flux CR write
-  # rule above. The rule was pure dead weight.
-  #
-  # install_flux_instance will fail by design under this role: it needs to
-  # create CustomResourceDefinitions and cluster RBAC, neither of which is
-  # granted anywhere above. That's fine -- the cluster installs Flux via
-  # simplesalt/oci cluster/flux-bootstrap.sh, not via this MCP server.
+  # Special permission for FluxInstances
+  - apiGroups: ["fluxcd.controlplane.io"]
+    resources: ["fluxinstances"]
+    verbs: ["apply"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
