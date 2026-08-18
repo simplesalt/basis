@@ -244,6 +244,70 @@ spec:
           -- 2 = record replaced, original timestamp kept
           return 2, ts, record
         end
+      # One broken workload should not be able to evict every other workload
+      # from the feed. Before this, a single cal pod repeating the same
+      # CLIENT_FETCH_ERROR every 5s was ~85% of all records, and gbrain-pg-1
+      # another ~1/s on top -- so the feed was technically complete and
+      # practically unreadable, which is the same failure the token limit
+      # caused, arriving by a different route.
+      #
+      # This is deliberately lossy. Occurrences 2..N inside a window are
+      # DROPPED, not buffered: the next emission of that signature carries a
+      # `suppressed` count instead. If you need every occurrence of something,
+      # read that pod's own log directly -- this feed is a triage surface, not
+      # an audit trail.
+      dedup.lua: |
+        -- Seconds a signature stays suppressed after being emitted once.
+        local WINDOW = 60
+        -- Bound on tracked signatures. On overflow the whole table is dropped
+        -- rather than grown or LRU-evicted: the cost is one extra emitted
+        -- record per live signature, which is the safe direction to fail for
+        -- a filter whose bug mode is "silently discards errors".
+        local MAX_KEYS = 5000
+
+        local seen = {}
+        local nkeys = 0
+
+        -- Signature, not equality. The repeating records are never byte-equal:
+        -- CNPG varies log_time/process_id/session_line_num and Kubernetes
+        -- events carry an ever-incrementing count, all of which sit early in
+        -- the string. Collapsing every digit run to '#' makes those variants
+        -- hash together while still separating genuinely different messages.
+        -- Capped at 400 chars so signature cost stays flat regardless of
+        -- record size.
+        local function signature(record)
+          local text = record.log or record.message or ""
+          local src = record.k8s_pod_name
+                      or record.obj_name
+                      or "?"
+          local sig = string.gsub(string.sub(text, 1, 400), "%d+", "#")
+          return src .. "\0" .. (record.reason or "") .. "\0" .. sig
+        end
+
+        function dedup(tag, ts, record)
+          local key = signature(record)
+          local entry = seen[key]
+
+          if entry ~= nil and (ts - entry.last) < WINDOW then
+            entry.count = entry.count + 1
+            return -1, ts, record
+          end
+
+          if entry ~= nil and entry.count > 0 then
+            record["suppressed"] = entry.count
+          end
+
+          if entry == nil then
+            if nkeys >= MAX_KEYS then
+              seen = {}
+              nkeys = 0
+            end
+            nkeys = nkeys + 1
+          end
+          seen[key] = { last = ts, count = 0 }
+
+          return 2, ts, record
+        end
     config:
       service: |
         [SERVICE]
@@ -372,14 +436,24 @@ spec:
             Allowlist_key message
             Allowlist_key count
 
-        # Last, deliberately: the greps above must match against the full
-        # untruncated text, or a long record whose only error keyword sits
-        # past byte 600 would be silently dropped instead of trimmed.
+        # After the greps, deliberately: the greps above must match against
+        # the full untruncated text, or a long record whose only error
+        # keyword sits past byte 600 would be silently dropped instead of
+        # trimmed.
         [FILTER]
             Name    lua
             Match   *
             script  /fluent-bit/scripts/truncate.lua
             call    truncate
+
+        # After truncate, not before: signature() reads only the first 400
+        # chars, so it sees identical input either way, and running last keeps
+        # this the single place records leave the pipeline.
+        [FILTER]
+            Name    lua
+            Match   *
+            script  /fluent-bit/scripts/dedup.lua
+            call    dedup
       outputs: |
         # stdout IS the delivery mechanism here, not a placeholder. It puts
         # the whole cluster's errors into one pod's log stream, which is the
