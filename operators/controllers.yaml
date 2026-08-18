@@ -267,3 +267,116 @@ spec:
       - name: systemd
         hostPath:
           path: /run/systemd
+---
+# kured — the cluster half of unattended node updates.
+#
+# The node half lives in simplesalt/oci: cluster/Containerfile's
+# bootc-update.timer runs cluster/bootc-update.sh nightly at 03:00, which runs
+# `bootc upgrade` and — only if that actually staged a new deployment — touches
+# /var/run/reboot-required. `bootc upgrade` never reboots on its own, so without
+# something on this side the staged deployment sits there forever and nodes
+# drift arbitrarily far behind the image they are supposed to be running.
+# Nothing errors; they just quietly stop updating.
+#
+# kured is that something: it watches for the sentinel, takes a cluster-wide
+# lock so only one node reboots at a time, cordons, drains, reboots, and
+# uncordons on the way back.
+#
+# Why it is here rather than baked into the node image: ostree does not deploy a
+# container image's /var to the node, so a manifest written into k3s's
+# auto-apply directory at build time simply does not exist at runtime. (Same
+# constraint that keeps kube-vip in oci's node bootstrap — see this repo's
+# README — except that one lands on the other side of the line.) It also belongs
+# here on the merits: maintenance windows, drain policy and concurrency are
+# cluster policy, and changing them should not require reimaging a node.
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: kured
+  namespace: kured
+  labels:
+    app.kubernetes.io/name: kured
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: node-lifecycle
+    entity: cluster
+    capability: node-lifecycle
+spec:
+  interval: 5m
+  releaseName: kured
+  chart:
+    spec:
+      chart: kured
+      # Pinned, unlike the other releases in this file. Those float because a bad
+      # upgrade degrades a service; a bad upgrade here reboots every node in the
+      # cluster, and the blast radius justifies breaking the local convention.
+      version: "6.1.0"
+      sourceRef:
+        kind: HelmRepository
+        name: kured
+        namespace: flux-system
+  values:
+    configuration:
+      # Must match what cluster/bootc-update.sh touches in simplesalt/oci. It is
+      # also the chart default, but pinned here rather than left implicit: the
+      # two halves live in different repos, and a default drifting on either side
+      # would break reboots in the quietest possible way — no error anywhere,
+      # just nodes that stage upgrades and never activate them.
+      #
+      # useRebootSentinelHostPath (chart default true) hostPath-mounts the
+      # sentinel's *directory* read-only at /sentinel and rewrites the flag to
+      # /sentinel/reboot-required. /var/run is a symlink to /run on Fedora
+      # CoreOS, so this resolves to tmpfs — which is what makes the sentinel
+      # self-clearing across the reboot it asked for, with no "unstick it"
+      # step and no risk of a stale file causing a second pointless reboot.
+      rebootSentinel: "/var/run/reboot-required"
+      useRebootSentinelHostPath: true
+
+      # Every 15m rather than the 1h default, so a sentinel dropped at 03:00 is
+      # acted on inside the window below rather than possibly falling out the
+      # far end of it.
+      period: "15m"
+
+      # Nothing enforces that a node is idle; this window is the whole of the
+      # "don't reboot during the working day" policy. Note the current node also
+      # hosts live Claude Code builder-rc sessions (simplesalt/brain,
+      # ssint-main-coding) — a reboot destroys whatever uncommitted state they
+      # hold, which is exactly why it is confined to hours nobody works in.
+      startTime: "03:15"
+      endTime: "05:45"
+      timeZone: "UTC"
+
+      # SINGLE-NODE CLUSTER. k1 is currently the only node, and a lone node
+      # cannot drain itself: there is nowhere to reschedule to, the eviction
+      # would take out kured along with everything else, and with the default
+      # forceReboot: false the drain would block until it timed out and then give
+      # up without rebooting. Nothing would ever reboot, and the failure would
+      # look like "kured is running fine."
+      #
+      # drainPodSelector names a label nothing in this cluster carries, which
+      # makes the drain a well-defined no-op that succeeds immediately rather
+      # than a timeout we have to paper over. Pods still stop gracefully: the
+      # node image sets shutdownGracePeriod: 60s /
+      # shutdownGracePeriodCriticalPods: 10s in kubelet.config, so kubelet's
+      # systemd inhibitor handles termination during the reboot itself.
+      #
+      # WHEN THIS CLUSTER GROWS PAST ONE NODE, delete drainPodSelector and
+      # forceReboot. Real draining is the entire point of kured on a multi-node
+      # cluster, and leaving these in place would silently keep it switched off.
+      drainPodSelector: "kured.io/drain-me=never"
+      drainTimeout: "5m"
+      forceReboot: true
+
+      # One at a time (also the default). Stated explicitly because this is the
+      # property that matters most once there is more than one control-plane
+      # node: k3s runs embedded etcd, and rebooting two voters at once on a
+      # three-node cluster loses quorum.
+      concurrency: 1
+
+      # A node that dies partway through its reboot would otherwise hold the
+      # lock forever and no other node could ever reboot again.
+      lockTtl: "30m"
+
+      # weave.works/kured-reboot-in-progress and
+      # weave.works/kured-most-recent-reboot-needed on the node object — the only
+      # cheap way to see what kured thinks is going on without reading its logs.
+      annotateNodes: true

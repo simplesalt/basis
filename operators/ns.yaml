@@ -58,3 +58,19 @@ metadata:
     pod-security.kubernetes.io/enforce: privileged
     pod-security.kubernetes.io/audit: privileged
     pod-security.kubernetes.io/warn: privileged
+---
+# kured — coordinated node reboots for bootc upgrades. See operators/controllers.yaml.
+# privileged is not negotiable here: kured runs privileged with hostPID and
+# nsenters /proc/1/ns/mnt to invoke `systemctl reboot` on the host. That is the
+# entire job.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kured
+  labels:
+    name: kured
+    entity: cluster
+    capability: node-lifecycle
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
