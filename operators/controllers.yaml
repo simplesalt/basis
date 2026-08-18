@@ -227,96 +227,72 @@ spec:
         memory: 64Mi
       limits:
         memory: 256Mi
-    # CNPG wraps every postgres ERROR in a JSON record that embeds the entire
-    # offending SQL statement -- one such record measured 4494 bytes, and
-    # fifty of them overflowed get_kubernetes_logs outright. The identifying
-    # part (error_severity, sql_state_code, message) is always near the front;
-    # the tail is query text nobody reads from a log feed.
-    luaScripts:
-      truncate.lua: |
-        function truncate(tag, ts, record)
-          for _, k in ipairs({"log", "message"}) do
-            local v = record[k]
-            if type(v) == "string" and #v > 600 then
-              record[k] = string.sub(v, 1, 600) .. " ...[truncated]"
-            end
-          end
-          -- 2 = record replaced, original timestamp kept
-          return 2, ts, record
-        end
-      # One broken workload should not be able to evict every other workload
-      # from the feed. Before this, a single cal pod repeating the same
-      # CLIENT_FETCH_ERROR every 5s was ~85% of all records, and gbrain-pg-1
-      # another ~1/s on top -- so the feed was technically complete and
-      # practically unreadable, which is the same failure the token limit
-      # caused, arriving by a different route.
-      #
-      # This is deliberately lossy. Occurrences 2..N inside a window are
-      # DROPPED, not buffered: the next emission of that signature carries a
-      # `suppressed` count instead. If you need every occurrence of something,
-      # read that pod's own log directly -- this feed is a triage surface, not
-      # an audit trail.
-      dedup.lua: |
-        -- Seconds a signature stays suppressed after being emitted once.
-        local WINDOW = 60
-        -- Bound on tracked signatures. On overflow the whole table is dropped
-        -- rather than grown or LRU-evicted: the cost is one extra emitted
-        -- record per live signature, which is the safe direction to fail for
-        -- a filter whose bug mode is "silently discards errors".
-        local MAX_KEYS = 5000
-
-        local seen = {}
-        local nkeys = 0
-
-        -- Signature, not equality. The repeating records are never byte-equal:
-        -- CNPG varies log_time/process_id/session_line_num and Kubernetes
-        -- events carry an ever-incrementing count, all of which sit early in
-        -- the string. Collapsing every digit run to '#' makes those variants
-        -- hash together while still separating genuinely different messages.
-        -- Capped at 400 chars so signature cost stays flat regardless of
-        -- record size.
-        local function signature(record)
-          local text = record.log or record.message or ""
-          local src = record.k8s_pod_name
-                      or record.obj_name
-                      or "?"
-          -- Hex before digits, and both are needed. CNPG stamps a hex
-          -- session_id into every record (6a845d2d.4808e vs 6a845cf1.4806f
-          -- one second apart), which a digits-only pass normalizes to
-          -- #a#d#d and #a#cf# -- still different, so the repeat leaked
-          -- through. Six is the shortest run worth collapsing; it does mean
-          -- an all-hex English word like "facade" normalizes too, which
-          -- costs nothing here because this string is only ever a grouping
-          -- key and never reaches the output.
-          local sig = string.gsub(string.sub(text, 1, 400), "%x%x%x%x%x%x+", "#")
-          sig = string.gsub(sig, "%d+", "#")
-          return src .. "\0" .. (record.reason or "") .. "\0" .. sig
-        end
-
-        function dedup(tag, ts, record)
-          local key = signature(record)
-          local entry = seen[key]
-
-          if entry ~= nil and (ts - entry.last) < WINDOW then
-            entry.count = entry.count + 1
-            return -1, ts, record
-          end
-
-          if entry ~= nil and entry.count > 0 then
-            record["suppressed"] = entry.count
-          end
-
-          if entry == nil then
-            if nkeys >= MAX_KEYS then
-              seen = {}
-              nkeys = 0
-            end
-            nkeys = nkeys + 1
-          end
-          seen[key] = { last = ts, count = 0 }
-
-          return 2, ts, record
-        end
+    # Truncation and dedup used to be two Lua filters running inside Fluent
+    # Bit. Fluent Bit has no Python filter plugin -- embedded scripting is
+    # filter_lua or filter_wasm and nothing else -- so the logic moved out of
+    # the Fluent Bit process into this sidecar. Fluent Bit keeps doing what it
+    # is genuinely good at (tail with rotation and offset handling, CRI
+    # decoding, Kubernetes metadata enrichment, the events watch, the cheap
+    # grep prefilter) and POSTs the survivors to loopback; feed.py does the
+    # editorial work, and ITS stdout is the feed.
+    #
+    # The move bought real verifiability. There is no Lua interpreter in the
+    # environment these manifests are edited from, so both Lua filters shipped
+    # without so much as a syntax check -- and the dedup signature turned out
+    # to be wrong in a way no amount of reading caught: the hex rule below is
+    # a rewrite of one that provably failed on the exact CNPG records it was
+    # written for. feed.py ships with a unit suite that runs before deploy.
+    #
+    # A sidecar rather than a separate Deployment, for three reasons: it keeps
+    # everything inside this one values block (so this file stays byte-identical
+    # with its counterpart in the other repo), the transport is loopback with
+    # no Service or cluster DNS in the path, and the sidecar's log lands at
+    # /var/log/containers/fluent-bit-*_feed-*.log, which the Exclude_Path below
+    # already matches -- so the amplification loop stays closed for free.
+    #
+    # Read the feed with get_kubernetes_logs container_name=feed. NOT
+    # container_name=fluent-bit; that one is now only the shipper's own
+    # service log.
+    extraContainers:
+      - name: feed
+        image: python:3.13-alpine
+        # -u is not optional. Without unbuffered stdout the records sit in a
+        # libc buffer and never reach the pod log, which presents as an empty
+        # feed attached to a perfectly healthy pod.
+        command: ["python3", "-u", "/etc/feed/feed.py"]
+        env:
+          - name: PYTHONDONTWRITEBYTECODE
+            value: "1"
+        volumeMounts:
+          # The same ConfigMap the Fluent Bit container mounts at
+          # /fluent-bit/etc/conf -- config.extraFiles below places feed.py in
+          # it. Reusing that ConfigMap is what makes the chart's
+          # checksum/config annotation cover the Python too, so editing the
+          # script triggers a rolling restart exactly like editing the
+          # pipeline does. A hand-rolled ConfigMap would lose that.
+          - name: config
+            mountPath: /etc/feed
+            readOnly: true
+        # If the sidecar is not listening then the feed is down, and that
+        # should surface as an unready pod rather than as Fluent Bit quietly
+        # retrying into a closed port.
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+              - ALL
     config:
       service: |
         [SERVICE]
@@ -351,6 +327,14 @@ spec:
         # unbounded amplification, not a duplicate-line annoyance. The glob is
         # deliberately namespace-agnostic so it still holds if the release's
         # targetNamespace changes.
+        #
+        # The feed sidecar is covered by the same glob without needing a
+        # second entry: the kubelet names container log files
+        # <pod>_<namespace>_<container>-<id>.log, and the sidecar shares this
+        # pod, so its file is fluent-bit-<suffix>_<ns>_feed-<id>.log. That is
+        # the whole reason the sidecar lives in this pod rather than in a
+        # Deployment of its own -- a separate pod would need its own exclusion
+        # here, and forgetting it would be the amplification bug again.
         [INPUT]
             Name              tail
             Alias             container_logs
@@ -445,46 +429,374 @@ spec:
             Allowlist_key message
             Allowlist_key count
 
-        # After the greps, deliberately: the greps above must match against
-        # the full untruncated text, or a long record whose only error
-        # keyword sits past byte 600 would be silently dropped instead of
-        # trimmed.
-        [FILTER]
-            Name    lua
-            Match   *
-            script  /fluent-bit/scripts/truncate.lua
-            call    truncate
-
-        # After truncate, not before: signature() reads only the first 400
-        # chars, so it sees identical input either way, and running last keeps
-        # this the single place records leave the pipeline.
-        [FILTER]
-            Name    lua
-            Match   *
-            script  /fluent-bit/scripts/dedup.lua
-            call    dedup
+        # Truncation and dedup used to sit here as two Lua filters. They now
+        # run in the feed sidecar instead; see extraContainers above. The
+        # ordering constraint that mattered still holds and is now structural
+        # rather than a matter of filter order: the greps above run against
+        # the full untruncated text, so a long record whose only error keyword
+        # sits past byte 600 is still trimmed rather than silently dropped.
       outputs: |
-        # stdout IS the delivery mechanism here, not a placeholder. It puts
-        # the whole cluster's errors into one pod's log stream, which is the
-        # one shape mcp-flux's get_kubernetes_logs can read -- that tool
-        # fetches a single named pod, so "which pod?" has to stop being a
-        # question you need answered before you can look.
+        # A single pod's stdout IS the delivery mechanism here, not a
+        # placeholder -- it is the one shape mcp-flux's get_kubernetes_logs
+        # can read, since that tool fetches one named pod, so "which pod?"
+        # has to stop being a question you need answered before you can look.
+        # What changed is only which container's stdout: records go over
+        # loopback to the feed sidecar, which prints the survivors.
         #
-        # Retention is therefore only whatever kubelet log rotation gives.
-        # A durable backend is deliberate follow-on work, not part of this.
+        # Retention is therefore still only whatever kubelet log rotation
+        # gives. A durable backend is deliberate follow-on work, not part of
+        # this.
+        #
+        # Retry_Limit is bounded on purpose. The sidecar starts in about a
+        # second while Fluent Bit's first flush is at one second, so a couple
+        # of early retries are expected; unbounded retries would instead let a
+        # persistently wedged sidecar back pressure into Mem_Buf_Limit and
+        # stall the tail.
         [OUTPUT]
-            Name             stdout
-            Match            kube.*
+            Name             http
+            Match            *
+            Host             127.0.0.1
+            Port             8080
+            URI              /
             Format           json_lines
             json_date_key    time
             json_date_format iso8601
+            Retry_Limit      10
+      # config.extraFiles writes arbitrary key/value pairs as files into the
+      # same ConfigMap as the pipeline above, mounted at /fluent-bit/etc/conf
+      # in the Fluent Bit container and at /etc/feed in the sidecar. Fluent
+      # Bit itself never reads feed.py -- it only ever opens the files its
+      # own config names -- so parking it here is free, and it is what makes
+      # checksum/config cover the script.
+      #
+      # This block is the single source of truth for the script. The test
+      # suite that guards it extracts it from this YAML rather than keeping
+      # its own copy, so the tests can never drift from what is deployed:
+      #   yq '.spec.values.config.extraFiles."feed.py"' controllers.yaml
+      #
+      # CNPG is the workload that forced both halves of this. It wraps every
+      # postgres ERROR in a JSON record embedding the entire offending SQL
+      # statement -- one measured 4494 bytes, and fifty of them overflowed
+      # get_kubernetes_logs outright -- and it stamps a per-record hex
+      # session_id that made naive dedup signatures never match. The
+      # identifying part (error_severity, sql_state_code, message) is always
+      # near the front; the tail is query text nobody reads from a log feed.
+      #
+      # The dedup half is deliberately lossy. Occurrences 2..N inside a
+      # window are DROPPED, not buffered: the next emission of that signature
+      # carries a `suppressed` count instead. If you need every occurrence of
+      # something, read that pod's own log directly -- this feed is a triage
+      # surface, not an audit trail. Before it existed, one cal pod repeating
+      # the same CLIENT_FETCH_ERROR every 5s was ~85% of all records, so the
+      # feed was technically complete and practically unreadable.
+      extraFiles:
+        feed.py: |
+          #!/usr/bin/env python3
+          """feed.py -- HTTP sink for Fluent Bit that ports two former Lua filters:
 
-        [OUTPUT]
-            Name             stdout
-            Match            k8sevent
-            Format           json_lines
-            json_date_key    time
-            json_date_format iso8601
+              1. truncate  -- clip oversized "log"/"message" fields so one runaway
+                               record can't blow out the pod log.
+              2. dedup      -- collapse bursts of near-identical records within a
+                               rolling window, the same way the old Lua filter did.
+
+          Fluent Bit POSTs batches of records here (its http output plugin can be
+          configured to send either JSON-lines or a single JSON array -- we accept
+          both). Surviving records are printed to stdout as compact JSON lines.
+          stdout IS the product: it becomes a Kubernetes pod log that an MCP tool
+          reads, so formatting and flushing discipline matter more than they would
+          in an ordinary service.
+
+          STDLIB ONLY -- this must run unmodified on the bare python:3.13-alpine
+          image, no pip install step.
+          """
+
+          import json
+          import os
+          import re
+          import signal
+          import sys
+          import threading
+          import time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          # --------------------------------------------------------------------------
+          # Configuration (env-overridable, matching the knobs the Lua filter exposed)
+          # --------------------------------------------------------------------------
+
+          WINDOW = int(os.environ.get("FEED_WINDOW", "60"))
+          MAX_KEYS = int(os.environ.get("FEED_MAX_KEYS", "5000"))
+          PORT = int(os.environ.get("FEED_PORT", "8080"))
+
+          # Indirection so tests can inject a fake clock without patching the stdlib.
+          # time.monotonic() is deliberate, not time.time(): this is a rate limiter,
+          # not an audit trail, and must not be fooled (or made to hang forever) by
+          # an NTP step or a container clock jump. The record's own timestamp is
+          # untrusted input and is never used for window math.
+          _now = time.monotonic
+
+          # Precompiled once at import time -- these run on every record, on the hot
+          # path of every batch POST.
+          #
+          # Identifier-ish tokens have to be collapsed BEFORE digit runs are, and the
+          # rule has to work on whole alphanumeric tokens rather than on raw character
+          # runs. CloudNativePG stamps a hex session_id into every record, and two
+          # records a second apart look like:
+          #
+          #     6a845d2d.4808e     6a845cf1.4806f
+          #
+          # A digits-only pass leaves those distinct (they differ in non-digit
+          # positions). A "6-or-more hex characters" pass is also not enough: the
+          # second component is only five characters, so it survives to the digit
+          # pass, which eats "4808" and leaves a bare "e" vs "f" -- still distinct,
+          # and the duplicate still leaks into the feed.
+          #
+          # So: collapse a whole alphanumeric token when it is entirely hex AND
+          # either contains a digit (>=4 chars) or is long enough to be a hash on
+          # its own (>=6 chars). Requiring a digit at the short end is what keeps
+          # ordinary English words out of it -- "cafe" and "dead" are hex-only but
+          # carry no digit, so they survive. Over-collapsing is the dangerous
+          # direction here (it would merge two genuinely different errors into one
+          # signature and drop one of them), which is why the short rule is the
+          # narrow one.
+          _TOKEN_RE = re.compile(r"[0-9A-Za-z]+")
+          _DIGIT_RE = re.compile(r"\d+")
+          _HEX_CHARS = frozenset("0123456789abcdefABCDEF")
+          _DIGITS = frozenset("0123456789")
+
+
+          def _collapse_token(match):
+              token = match.group(0)
+              if len(token) >= 4 and _HEX_CHARS.issuperset(token):
+                  if len(token) >= 6 or not _DIGITS.isdisjoint(token):
+                      return "#"
+              return token
+
+          # signature -> {"last": <monotonic float>, "count": <int>}
+          # Module-level and shared across requests/threads by design -- dedup state
+          # has to survive across the life of the process, not just one batch.
+          _state = {}
+          _lock = threading.Lock()
+
+
+          def truncate(record):
+              """Clip "log"/"message" to 600 chars in place. No other keys touched."""
+              for key in ("log", "message"):
+                  value = record.get(key)
+                  if isinstance(value, str) and len(value) > 600:
+                      record[key] = value[:600] + " ...[truncated]"
+
+
+          def _normalize(text):
+              if not isinstance(text, str):
+                  # Defensive: record.get("log") can be a non-string JSON value
+                  # (number, bool, ...) if upstream sends something odd. The Lua
+                  # filter only ever saw strings; str() is the closest equivalent
+                  # of Lua's implicit tostring() coercion and keeps signature() from
+                  # blowing up on a slice of a non-string.
+                  text = str(text)
+              text = text[:400]
+              text = _TOKEN_RE.sub(_collapse_token, text)
+              text = _DIGIT_RE.sub("#", text)
+              return text
+
+
+          def signature(record):
+              """Build the dedup key for a record, matching the Lua filter exactly."""
+              # `or` here is deliberately Lua-style falsy-or, not "prefer log if
+              # present": an empty string or JSON null in "log" falls through to
+              # "message", same as the original filter.
+              text = record.get("log") or record.get("message") or ""
+              src = record.get("k8s_pod_name") or record.get("obj_name") or "?"
+              normalized = _normalize(text)
+              return src + "\0" + str(record.get("reason") or "") + "\0" + normalized
+
+
+          def dedup(record, now=None):
+              """Return True if the record should be emitted, False if it's a dup.
+
+              Mutates `record` to add a "suppressed" count when a run of dupes ends.
+              Uses module-level _state; callers that need isolation (tests) should
+              reset feed._state between cases.
+              """
+              if now is None:
+                  now = _now()
+
+              key = signature(record)
+              entry = _state.get(key)
+
+              if entry is not None and (now - entry["last"]) < WINDOW:
+                  # Still inside the window opened by the last *emitted* record.
+                  # Note we do NOT touch entry["last"] here -- the window is fixed
+                  # from the first emit, not a sliding/refreshing window. A steady
+                  # 1/sec stream of the same signature therefore emits at t=0 and
+                  # again at t=60, not "never" (which is what a sliding window,
+                  # continuously refreshed by every dropped duplicate, would do).
+                  entry["count"] += 1
+                  return False
+
+              if entry is not None and entry["count"] > 0:
+                  # The window just closed on a run of suppressed dupes -- surface
+                  # how many were dropped so the emitted record carries that context.
+                  record["suppressed"] = entry["count"]
+
+              if entry is None:
+                  if len(_state) >= MAX_KEYS:
+                      # Whole-table clear, not LRU eviction. Cheap to implement and
+                      # correctness-safe: the failure mode is one extra emitted
+                      # record per still-live signature (each has to re-open its
+                      # window), never a false drop. Silently discarding a record
+                      # that should have been emitted is the failure mode this
+                      # filter exists to avoid, so we bias hard away from it even
+                      # at the cost of a duplicate flood right after a clear.
+                      _state.clear()
+
+              _state[key] = {"last": now, "count": 0}
+              return True
+
+
+          # --------------------------------------------------------------------------
+          # HTTP layer
+          # --------------------------------------------------------------------------
+
+
+          def _parse_body(body):
+              """Parse a POST body into a list of dict records.
+
+              Accepts either a single JSON array of objects, or JSON-lines (one
+              object per line, blank lines ignored). A line/entry that isn't valid
+              JSON, or isn't a JSON object, is skipped silently -- Fluent Bit will
+              keep sending batches and one bad record must never take the rest of
+              the batch down with it. Raises only when the body can't even be
+              decoded as UTF-8, which is the one case the caller treats as a real
+              400 (the whole body is unreadable, not just one record in it).
+              """
+              text = body.decode("utf-8")
+              text = text.strip()
+              if not text:
+                  return []
+
+              if text[0] == "[":
+                  try:
+                      parsed = json.loads(text)
+                  except ValueError:
+                      parsed = None
+                  if isinstance(parsed, list):
+                      return [r for r in parsed if isinstance(r, dict)]
+                  # Fall through to line-by-line parsing below -- e.g. a body that
+                  # merely starts with "[" but is actually malformed. Best-effort
+                  # recovery rather than a hard failure, consistent with "skip bad
+                  # lines, don't crash".
+
+              records = []
+              for line in text.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      obj = json.loads(line)
+                  except ValueError:
+                      continue
+                  if isinstance(obj, dict):
+                      records.append(obj)
+              return records
+
+
+          class Handler(BaseHTTPRequestHandler):
+              # BaseHTTPRequestHandler defaults to HTTP/1.0, which closes the socket
+              # after every response. Fluent Bit's http output keeps connections alive
+              # by default, so speaking 1.1 (with an explicit Content-Length, or the
+              # client can't tell where the empty body ends) avoids reconnecting on
+              # every one-second flush.
+              protocol_version = "HTTP/1.1"
+
+              # BaseHTTPRequestHandler logs one line per request to stderr by
+              # default. At Fluent Bit's flush cadence that's pure noise next to the
+              # actual record stream, so silence it entirely.
+              def log_message(self, format, *args):  # noqa: A002 (stdlib signature)
+                  pass
+
+              def do_POST(self):
+                  try:
+                      try:
+                          length = int(self.headers.get("Content-Length") or 0)
+                      except ValueError:
+                          length = 0
+                      body = self.rfile.read(length) if length > 0 else b""
+
+                      try:
+                          records = _parse_body(body)
+                      except UnicodeDecodeError:
+                          self._respond(400)
+                          return
+
+                      with _lock:
+                          for record in records:
+                              if not isinstance(record, dict):
+                                  continue
+                              truncate(record)
+                              if dedup(record):
+                                  sys.stdout.write(
+                                      json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+                                  )
+                                  sys.stdout.write("\n")
+                          # Flush once per batch, inside the lock, so a slow flush
+                          # can't interleave with another thread's batch. This is
+                          # the single most important line in the file: unflushed
+                          # stdout never reaches the pod log, full stop.
+                          sys.stdout.flush()
+
+                      self._respond(200)
+                  except Exception as exc:  # noqa: BLE001 -- must never kill the server
+                      print(f"feed: unexpected error handling request: {exc!r}", file=sys.stderr)
+                      try:
+                          self._respond(500)
+                      except Exception:
+                          # Connection may already be broken; nothing more to do.
+                          pass
+
+              def _respond(self, code):
+                  # Under HTTP/1.1 keep-alive, a response with no Content-Length and
+                  # no Transfer-Encoding is ambiguous: the client can't tell where
+                  # the (empty) body ends short of the connection closing, so it
+                  # blocks forever waiting for bytes that never come on a connection
+                  # we intend to keep open. Always claim the length explicitly, even
+                  # though it's always zero -- this is what actually makes keep-alive
+                  # safe to reuse for Fluent Bit's next flush.
+                  self.send_response(code)
+                  self.send_header("Content-Length", "0")
+                  self.end_headers()
+
+
+          def _serve():
+              # Pin stdout to UTF-8 with lossy fallback. Log lines carry arbitrary
+              # application bytes, and the default encoding is locale-derived -- on a
+              # bare container image with no LANG set that is not guaranteed to be
+              # UTF-8. A UnicodeEncodeError here would raise inside the request
+              # handler, return 500, and make Fluent Bit retry the identical bad
+              # record forever, so the feed would wedge on a single stray character.
+              # errors="replace" degrades one glyph instead.
+              sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+              server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+
+              def _handle_sigterm(signum, frame):
+                  # Flush whatever's pending before we start tearing down, then stop
+                  # accepting/serving. shutdown() blocks until serve_forever's loop
+                  # notices, so run it off the signal-handling thread.
+                  sys.stdout.flush()
+                  threading.Thread(target=server.shutdown, daemon=True).start()
+
+              signal.signal(signal.SIGTERM, _handle_sigterm)
+
+              try:
+                  server.serve_forever()
+              finally:
+                  server.server_close()
+                  sys.stdout.flush()
+
+
+          if __name__ == "__main__":
+              _serve()
     tolerations:
       - effect: NoSchedule
         operator: Exists
