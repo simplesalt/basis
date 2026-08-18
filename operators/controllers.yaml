@@ -527,6 +527,20 @@ spec:
           MAX_KEYS = int(os.environ.get("FEED_MAX_KEYS", "5000"))
           PORT = int(os.environ.get("FEED_PORT", "8080"))
 
+          # SIG_RAW_CAP bounds the regex passes in _normalize() against a runaway raw
+          # input -- a CPU guard only, not a signature boundary -- and it has to sit
+          # far past any signature-relevant cut so it never actually performs one. See
+          # the comment inside _normalize() for why that distinction matters. SIG_CAP
+          # is the real, signature-relevant limit: how much of the *normalized* text
+          # actually enters the dedup key. It has to reach far enough into the record
+          # to still catch discriminating content that lands well past the front --
+          # CloudNativePG's own "message" field starts around raw char ~505 -- which
+          # is why it is 600, not the tighter 400 an earlier version used (that
+          # earlier, smaller window is exactly what let two different CNPG errors
+          # collapse into one signature and silently drop one of them).
+          SIG_RAW_CAP = 4000
+          SIG_CAP = 600
+
           # Indirection so tests can inject a fake clock without patching the stdlib.
           # time.monotonic() is deliberate, not time.time(): this is a rate limiter,
           # not an audit trail, and must not be fooled (or made to hang forever) by
@@ -558,6 +572,20 @@ spec:
           # direction here (it would merge two genuinely different errors into one
           # signature and drop one of them), which is why the short rule is the
           # narrow one.
+          #
+          # Just as important as the collapsing rule itself is WHEN it runs relative
+          # to any length cut: it has to happen before any cut that can land inside
+          # signature-relevant content, never after. A cut taken on raw text (before
+          # collapsing) sits at a fixed raw offset, but two records with the same
+          # shape can carry digit runs of different LENGTHS upstream of that offset
+          # (e.g. a timestamp's fractional-second digits, or the hex session_id this
+          # comment is about) -- so the same raw offset lands at a different point in
+          # each record's actual content. That is what let two different CloudNativePG
+          # errors collapse into one signature and silently drop one of them: the
+          # raw cut fell before the record's discriminating "message" field, so
+          # neither record's signature ever saw it. Collapsing first removes that
+          # jitter, so any cut taken afterward (see SIG_CAP / _normalize()) lands at
+          # an equivalent point across records instead of an arbitrary raw offset.
           _TOKEN_RE = re.compile(r"[0-9A-Za-z]+")
           _DIGIT_RE = re.compile(r"\d+")
           _HEX_CHARS = frozenset("0123456789abcdefABCDEF")
@@ -579,7 +607,15 @@ spec:
 
 
           def truncate(record):
-              """Clip "log"/"message" to 600 chars in place. No other keys touched."""
+              """Clip "log"/"message" to 600 chars in place. No other keys touched.
+
+              Must run on a record AFTER dedup(record) has already computed its
+              signature from the untruncated text -- see the do_POST loop. dedup()
+              only reads "log"/"message" (via signature()/_normalize()) and writes
+              "suppressed", so it can never observe this function's edits either
+              way; the ordering constraint is one-directional, purely about not
+              feeding dedup() text this function has already clipped.
+              """
               for key in ("log", "message"):
                   value = record.get(key)
                   if isinstance(value, str) and len(value) > 600:
@@ -594,10 +630,38 @@ spec:
                   # of Lua's implicit tostring() coercion and keeps signature() from
                   # blowing up on a slice of a non-string.
                   text = str(text)
-              text = text[:400]
+              # Order matters here, and it is the entire fix for the two bugs this
+              # function used to have:
+              #
+              #   1. Cut raw text at SIG_RAW_CAP -- a CPU guard only. It sits at 4000,
+              #      far past SIG_CAP (600) and past any realistic signature-relevant
+              #      content, specifically so it can never be the cut that actually
+              #      shapes a signature. Slicing here, on raw text, before collapsing
+              #      is safe ONLY because it is that far out.
+              #   2. Collapse identifier-ish tokens (hex/session-id shaped) and THEN
+              #      digit runs, on the (still effectively full-length) text. This is
+              #      what removes upstream length jitter -- e.g. a timestamp's
+              #      fractional-second digit run being 8 digits in one record and 9 in
+              #      another -- before any signature-relevant cut happens, so that
+              #      jitter can't shift where the cut below lands.
+              #   3. THEN cut the collapsed text at SIG_CAP (600). This is the cut
+              #      that actually determines what enters the signature, and doing it
+              #      after collapsing is what lets it reach CloudNativePG's own
+              #      "message" field (raw char ~505) reliably across records instead
+              #      of at an offset that drifts with upstream jitter.
+              #
+              # The previous version cut raw text at 400 chars BEFORE collapsing --
+              # both wrong for the same underlying reason. It made the signature
+              # sensitive to raw-offset jitter (bug 1: near-duplicates that differ
+              # only in digit-run length got different signatures), and because 400
+              # raw chars falls short of where "message" starts, it also cut that
+              # field out of the signature entirely for some records -- collapsing two
+              # genuinely different CNPG errors into one signature and silently
+              # dropping one of them (bug 2, the more serious one).
+              text = text[:SIG_RAW_CAP]
               text = _TOKEN_RE.sub(_collapse_token, text)
               text = _DIGIT_RE.sub("#", text)
-              return text
+              return text[:SIG_CAP]
 
 
           def signature(record):
@@ -733,8 +797,22 @@ spec:
                           for record in records:
                               if not isinstance(record, dict):
                                   continue
-                              truncate(record)
+                              # dedup() BEFORE truncate() is deliberate, not
+                              # incidental: dedup() computes its signature from
+                              # "log"/"message" via _normalize(), and that signature
+                              # must see the untruncated text so its own SIG_CAP cut
+                              # (600 chars of *normalized* text -- see _normalize())
+                              # is the only length cut that shapes it. Truncating
+                              # first would reintroduce a raw-offset cut ahead of
+                              # normalization, the same class of bug _normalize()
+                              # itself was fixed to avoid. This ordering is safe
+                              # because the two functions don't interfere: dedup()
+                              # only reads "log"/"message" and writes "suppressed";
+                              # truncate() only rewrites "log"/"message". A record
+                              # dedup() drops here is never truncated -- there is no
+                              # point clipping text that will never be emitted.
                               if dedup(record):
+                                  truncate(record)
                                   sys.stdout.write(
                                       json.dumps(record, separators=(",", ":"), ensure_ascii=False)
                                   )

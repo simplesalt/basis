@@ -300,8 +300,18 @@ class TestSignature(unittest.TestCase):
         b = feed.signature({"message": "same", "obj_name": "svc-y"})
         self.assertNotEqual(a, b)
 
-    def test_only_first_400_chars_considered(self):
-        base = "A" * 400
+    def test_only_first_600_normalized_chars_considered(self):
+        """SIG_CAP is 600, applied to normalized text -- not the old 400.
+
+        The old version cut raw text at 400 chars BEFORE collapsing, which
+        is exactly the bug this suite now guards against elsewhere (it cut
+        CNPG's "message" field out of the signature). This uses a 600-char
+        prefix of "g"s -- not a hex character, so nothing about it collapses
+        during normalization, meaning the normalized text is identical to
+        the raw text up to the cap. Content starting exactly at char 600
+        must therefore fall outside the signature.
+        """
+        base = "g" * 600
         a = feed.signature({"log": base + "tail-one"})
         b = feed.signature({"log": base + "tail-two"})
         self.assertEqual(a, b)
@@ -504,6 +514,226 @@ class TestEndToEnd(DedupStateMixin, unittest.TestCase):
         body = json.dumps({"log": "café ☕ error", "k8s_pod_name": "pod-a"})
         self.assertEqual(self._post(body), 200)
         self.assertEqual(self._emitted()[0]["log"], "café ☕ error")
+
+
+# --------------------------------------------------------------------------
+# Regression coverage for the _normalize()/do_POST ordering fix.
+#
+# Both bugs this class guards against were confirmed against live cluster
+# logs, not hypothesized: (1) _normalize() used to slice raw text at 400
+# chars BEFORE collapsing digit/hex runs, so records differing only in the
+# LENGTH of a digit run (a timestamp's fractional seconds, a session id)
+# got different signatures and near-duplicates leaked into the feed; and
+# (2) that same pre-collapse 400-char cut fell before CloudNativePG's own
+# "message" field (which lands around raw char ~505), so two genuinely
+# different postgres errors from the same pod collapsed onto one signature
+# and one was silently dropped -- the more serious of the two. The fix
+# collapses first and only then cuts, at 600 chars of *normalized* text
+# (SIG_CAP), and moved do_POST's dedup()/truncate() call order so the
+# signature is always computed over untruncated text.
+#
+# The fixtures below build realistic CNPG-shaped JSON log lines (the
+# record's own JSON-encoded log entry, embedded as the "log" field's
+# string value) so these tests exercise the same field layout that
+# produced the bug on the live cluster, not a synthetic shape that happens
+# to dodge it.
+# --------------------------------------------------------------------------
+
+_CNPG_TEMPLATE = (
+    '{{"level":"error","ts":"2026-08-18T12:00:00.{frac}Z",'
+    '"logger":"postgres","msg":"record",'
+    '"record":{{"log_time":"2026-08-18 12:00:00.123 UTC",'
+    '"user_name":"app","database_name":"gbrain",'
+    '"process_id":{pid},"connection_from":"10.0.0.{ip}:54321",'
+    '"session_id":"{session_id}","session_line_num":1,'
+    '"command_tag":"SELECT","session_start_time":"2026-08-18 11:00:00 UTC",'
+    '"virtual_transaction_id":"{vxid}","transaction_id":{txid},'
+    '"application_name":"gbrain-worker",'
+    '"error_severity":"ERROR","sql_state_code":"42601",'
+    '"message":"{message}","query":"{query}"}}}}'
+)
+
+# A second template with extra filler fields between the identifying
+# columns and "message", used only by the ordering test below. It pushes
+# "message" out past raw char 600 (deliberately, past where truncate()
+# clips) while staying comfortably inside SIG_CAP once the digit/hex runs
+# ahead of it collapse -- the exact situation that distinguishes "cut
+# before collapsing" from "cut after collapsing".
+_CNPG_TEMPLATE_LATE_MESSAGE = (
+    '{{"level":"error","ts":"2026-08-18T12:00:00.{frac}Z",'
+    '"logger":"postgres","msg":"record",'
+    '"record":{{"log_time":"2026-08-18 12:00:00.123 UTC",'
+    '"user_name":"app","database_name":"gbrain",'
+    '"process_id":{pid},"connection_from":"10.0.0.{ip}:54321",'
+    '"session_id":"{session_id}","session_line_num":1,'
+    '"command_tag":"SELECT","session_start_time":"2026-08-18 11:00:00 UTC",'
+    '"virtual_transaction_id":"{vxid}","transaction_id":{txid},'
+    '"application_name":"gbrain-worker-1",'
+    '"backend_type":"client backend","statement_timestamp":"2026-08-18T12:00:00.000Z",'
+    '"error_severity":"ERROR","sql_state_code":"42601",'
+    '"context":"SQL statement executed by parallel worker 1",'
+    '"message":"{message}","query":"{query}"}}}}'
+)
+
+_DEFAULT_QUERY = "INSERT INTO foo (id, name) VALUES (1, 'bar') ON CONFLICT DO NOTHING"
+_MSG_DUPLICATE_KEY = 'duplicate key value violates unique constraint \\"foo_pkey\\"'
+_MSG_DEADLOCK = 'deadlock detected while waiting for lock on relation \\"bar\\"'
+
+
+def _cnpg_log(frac="52698433", session_id="6a845d2d.4808e", pid=4808, ip=42,
+              vxid="3/12345", txid=987654321, message=_MSG_DUPLICATE_KEY,
+              query=_DEFAULT_QUERY, template=_CNPG_TEMPLATE):
+    """Build one CNPG-shaped JSON log line as a "log" field value.
+
+    Defaults reproduce the exact identifier shapes ("message" at raw char
+    ~505 in a ~650-char envelope) that motivated both the hex-token pass
+    (see the comment above _TOKEN_RE) and this ordering fix. Callers
+    override only the field(s) under test.
+    """
+    return template.format(
+        frac=frac, session_id=session_id, pid=pid, ip=ip, vxid=vxid, txid=txid,
+        message=message, query=query,
+    )
+
+
+class TestSignatureOrderingFix(unittest.TestCase):
+    def test_digit_run_length_jitter_yields_same_signature(self):
+        """Bug 1: a timestamp/id LENGTH difference must not split the sig.
+
+        8-digit vs 9-digit fractional seconds, plus differing session id,
+        pid, connection ip, vxid and transaction id -- everything that
+        varies between two occurrences of the same CNPG error a moment
+        apart -- collapses to the same normalized text.
+        """
+        a = _cnpg_log(frac="52698433", session_id="6a845d2d.4808e", pid=4808,
+                      ip=42, vxid="3/12345", txid=987654321)
+        b = _cnpg_log(frac="560486694", session_id="6a845cf1.4806f", pid=4809,
+                      ip=57, vxid="3/12346", txid=987654322)
+        rec_a = {"log": a, "k8s_pod_name": "gbrain-pg-1"}
+        rec_b = {"log": b, "k8s_pod_name": "gbrain-pg-1"}
+        self.assertEqual(feed.signature(rec_a), feed.signature(rec_b))
+
+    def test_extreme_digit_jitter_still_yields_same_signature(self):
+        """Same as above, at the extreme: single-digit ids, 1-digit frac."""
+        a = _cnpg_log(frac="52698433", session_id="6a845d2d.4808e", pid=4808,
+                      ip=42, vxid="3/12345", txid=987654321)
+        c = _cnpg_log(frac="4", session_id="1.2", pid=1, ip=1, vxid="1/1", txid=1)
+        rec_a = {"log": a, "k8s_pod_name": "gbrain-pg-1"}
+        rec_c = {"log": c, "k8s_pod_name": "gbrain-pg-1"}
+        self.assertEqual(feed.signature(rec_a), feed.signature(rec_c))
+
+    def test_different_message_yields_different_signature(self):
+        """Bug 2: the real bug. Two genuinely different CNPG errors from the
+        same pod must NOT collapse onto one signature just because
+        "message" used to fall outside the old 400-char raw window.
+        """
+        a = _cnpg_log(message=_MSG_DUPLICATE_KEY)
+        b = _cnpg_log(message=_MSG_DEADLOCK)
+        rec_a = {"log": a, "k8s_pod_name": "gbrain-pg-1"}
+        rec_b = {"log": b, "k8s_pod_name": "gbrain-pg-1"}
+        self.assertNotEqual(feed.signature(rec_a), feed.signature(rec_b))
+
+    def test_different_query_yields_different_signature(self):
+        a = _cnpg_log(query=_DEFAULT_QUERY)
+        b = _cnpg_log(query="DELETE FROM foo WHERE created_at < now() - interval '30 days'")
+        rec_a = {"log": a, "k8s_pod_name": "gbrain-pg-1"}
+        rec_b = {"log": b, "k8s_pod_name": "gbrain-pg-1"}
+        self.assertNotEqual(feed.signature(rec_a), feed.signature(rec_b))
+
+    def test_ordering_property_signature_uses_untruncated_text(self):
+        """Direct proof of the do_POST ordering fix, without going through
+        signature()/dedup() plumbing: build a record whose "log" is well
+        over 600 raw chars, with the only distinguishing content (the
+        "message" field) pushed out past raw char 600 -- past where
+        truncate() would have clipped it. Confirm two such records still
+        get different signatures (i.e. the signature was computed on text
+        truncate() has not touched), while separately confirming truncate()
+        still clips what actually gets emitted to 600 chars.
+        """
+        x = _cnpg_log(message=_MSG_DUPLICATE_KEY, template=_CNPG_TEMPLATE_LATE_MESSAGE)
+        y = _cnpg_log(message=_MSG_DEADLOCK, template=_CNPG_TEMPLATE_LATE_MESSAGE)
+        self.assertGreater(len(x), 600)
+        self.assertGreater(x.index('"message":"'), 600)
+
+        # Same untruncated text feeds a different signature per message --
+        # this is what "dedup() before truncate()" buys us.
+        self.assertNotEqual(
+            feed.signature({"log": x}),
+            feed.signature({"log": y}),
+        )
+
+        # truncate() itself is unchanged: whatever IS emitted still gets
+        # clipped to 600 chars, regardless of when it runs relative to
+        # dedup().
+        record = {"log": x}
+        feed.truncate(record)
+        self.assertEqual(len(record["log"]), 600 + len(" ...[truncated]"))
+        self.assertTrue(record["log"].endswith(" ...[truncated]"))
+
+
+class TestEndToEndSignatureOrderingFix(DedupStateMixin, unittest.TestCase):
+    """End-to-end proof that bug 2 (the silent drop) is actually fixed:
+
+    two CNPG records that differ only in "message" -- previously collapsed
+    onto one signature because "message" fell outside the pre-collapse
+    400-char raw window -- POSTed together in one batch must BOTH be
+    emitted, not just the first.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.captured = io.StringIO()
+        self._real_stdout = sys.stdout
+        sys.stdout = self.captured
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), feed.Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        sys.stdout = self._real_stdout
+        super().tearDown()
+
+    def _post(self, body, content_type="application/json"):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/",
+            data=body if isinstance(body, bytes) else body.encode("utf-8"),
+            headers={"Content-Type": content_type},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status
+
+    def _emitted(self):
+        raw = self.captured.getvalue()
+        return [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+    def test_distinct_cnpg_errors_both_survive_one_batch(self):
+        a = _cnpg_log(message=_MSG_DUPLICATE_KEY)
+        b = _cnpg_log(message=_MSG_DEADLOCK)
+        body = json.dumps([
+            {"log": a, "k8s_pod_name": "gbrain-pg-1"},
+            {"log": b, "k8s_pod_name": "gbrain-pg-1"},
+        ])
+        self.assertEqual(self._post(body), 200)
+        emitted = self._emitted()
+        self.assertEqual(len(emitted), 2, "both distinct CNPG errors must survive, not just one")
+        # Both source records are over 600 raw chars, so what lands on
+        # stdout is truncate()'s clipped form, not the original -- that's
+        # expected and orthogonal to what this test is proving. The point
+        # is that dedup() ran on the untruncated text first, so both
+        # records survived as two distinct emissions in the first place;
+        # confirm that, plus that each retains its own message content up
+        # to the (shared) clip point.
+        self.assertTrue(emitted[0]["log"].endswith(" ...[truncated]"))
+        self.assertTrue(emitted[1]["log"].endswith(" ...[truncated]"))
+        self.assertEqual(emitted[0]["log"], a[:600] + " ...[truncated]")
+        self.assertEqual(emitted[1]["log"], b[:600] + " ...[truncated]")
+        self.assertNotEqual(emitted[0]["log"], emitted[1]["log"])
 
 
 if __name__ == "__main__":
