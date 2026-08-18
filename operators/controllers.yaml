@@ -280,7 +280,16 @@ spec:
           local src = record.k8s_pod_name
                       or record.obj_name
                       or "?"
-          local sig = string.gsub(string.sub(text, 1, 400), "%d+", "#")
+          -- Hex before digits, and both are needed. CNPG stamps a hex
+          -- session_id into every record (6a845d2d.4808e vs 6a845cf1.4806f
+          -- one second apart), which a digits-only pass normalizes to
+          -- #a#d#d and #a#cf# -- still different, so the repeat leaked
+          -- through. Six is the shortest run worth collapsing; it does mean
+          -- an all-hex English word like "facade" normalizes too, which
+          -- costs nothing here because this string is only ever a grouping
+          -- key and never reaches the output.
+          local sig = string.gsub(string.sub(text, 1, 400), "%x%x%x%x%x%x+", "#")
+          sig = string.gsub(sig, "%d+", "#")
           return src .. "\0" .. (record.reason or "") .. "\0" .. sig
         end
 
