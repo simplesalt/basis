@@ -214,6 +214,19 @@ spec:
   interval: 5m
   values:
     kind: DaemonSet
+    # The kubernetes_events input reads core/v1 Events, which the chart's
+    # default ClusterRole (namespaces + pods only) does not cover.
+    rbac:
+      eventsAccess: true
+    # Tailing every container log on the node is meaningfully more work than
+    # reading the journal was. No CPU limit on purpose: throttling a log
+    # shipper does not shed load, it just moves the backlog into memory.
+    resources:
+      requests:
+        cpu: 20m
+        memory: 64Mi
+      limits:
+        memory: 256Mi
     config:
       service: |
         [SERVICE]
@@ -227,43 +240,137 @@ spec:
             HTTP_Port 2020
             Health_Check On
       inputs: |
+        # Container stdout/stderr. multiline.parser cri both strips the CRI
+        # envelope and rejoins partial (P) lines, so a stack trace arrives as
+        # ONE record instead of forty -- which is what lets the grep filter
+        # below keep the whole trace off its single "Exception" line.
+        #
+        # It emits the message under the key `log`. The plain
+        # `[PARSER] Name cri` emits it under `message` instead. If you ever
+        # swap one for the other, update every `log`-keyed filter below, or
+        # the feed silently goes empty while still looking healthy.
+        #
+        # Exclude_Path is load-bearing, not tidiness: this pipeline's OUTPUT
+        # is this pod's own stdout, which the kubelet writes straight back
+        # into /var/log/containers. Tailing our own log would re-ingest every
+        # record we emit, and because we keep only lines matching
+        # /error|fatal|.../ the re-ingested copies match too. That is
+        # unbounded amplification, not a duplicate-line annoyance. The glob is
+        # deliberately namespace-agnostic so it still holds if the release's
+        # targetNamespace changes.
         [INPUT]
-            Name systemd
-            Tag host.*
-            Read_From_Tail On
-            Strip_Underscores On
+            Name              tail
+            Alias             container_logs
+            Tag               kube.*
+            Path              /var/log/containers/*.log
+            Exclude_Path      /var/log/containers/fluent-bit-*.log
+            multiline.parser  cri
+            Skip_Long_Lines   On
+            Refresh_Interval  10
+            Mem_Buf_Limit     16MB
+            DB                /var/log/flb-container.db
+
+        # Crashes are the case container logs help with least: OOMKilled,
+        # CrashLoopBackOff, FailedScheduling and image-pull failures produce
+        # no application log line at all, and the pod whose log you would want
+        # is usually already gone. Events carry those reasons.
+        [INPUT]
+            Name              kubernetes_events
+            Alias             warning_events
+            Tag               k8sevent
+      filters: |
+        # Merge_Log is deliberately Off. With it On, a JSON-logging app has
+        # its fields lifted to the record root and the `log` key is dropped --
+        # so the grep below, which keys on `log`, would discard exactly those
+        # apps' errors while quietly keeping everyone else's.
+        [FILTER]
+            Name                kubernetes
+            Match               kube.*
+            Merge_Log           Off
+            Labels              Off
+            Annotations         Off
+            K8S-Logging.Parser  Off
+            K8S-Logging.Exclude On
+
+        # This regex is the entire editorial policy of the feed: widen it and
+        # the feed drowns, narrow it and real failures go missing. A pod can
+        # opt out of collection entirely with the annotation
+        # fluentbit.io/exclude: "true" (K8S-Logging.Exclude, above).
+        [FILTER]
+            Name    grep
+            Match   kube.*
+            Regex   log (?i)\b(errors?|fatal|panic|critical|exception|traceback|segfault|oomkilled|failed|failure)\b
+
+        [FILTER]
+            Name         nest
+            Match        kube.*
+            Operation    lift
+            Nested_under kubernetes
+            Add_prefix   k8s_
+
+        # Trim hard. The previous config put whole records on stdout and the
+        # result overflowed get_kubernetes_logs' token limit within minutes,
+        # which is a way of being unreadable that looks like working.
+        [FILTER]
+            Name          record_modifier
+            Match         kube.*
+            Allowlist_key k8s_namespace_name
+            Allowlist_key k8s_pod_name
+            Allowlist_key k8s_container_name
+            Allowlist_key stream
+            Allowlist_key log
+
+        [FILTER]
+            Name    grep
+            Match   k8sevent
+            Regex   type Warning
+
+        [FILTER]
+            Name         nest
+            Match        k8sevent
+            Operation    lift
+            Nested_under involvedObject
+            Add_prefix   obj_
+
+        [FILTER]
+            Name          record_modifier
+            Match         k8sevent
+            Allowlist_key obj_namespace
+            Allowlist_key obj_kind
+            Allowlist_key obj_name
+            Allowlist_key reason
+            Allowlist_key message
+            Allowlist_key count
       outputs: |
+        # stdout IS the delivery mechanism here, not a placeholder. It puts
+        # the whole cluster's errors into one pod's log stream, which is the
+        # one shape mcp-flux's get_kubernetes_logs can read -- that tool
+        # fetches a single named pod, so "which pod?" has to stop being a
+        # question you need answered before you can look.
+        #
+        # Retention is therefore only whatever kubelet log rotation gives.
+        # A durable backend is deliberate follow-on work, not part of this.
         [OUTPUT]
-            Name stdout
-            Match *
-            Format json_lines
+            Name             stdout
+            Match            kube.*
+            Format           json_lines
+            json_date_key    time
+            json_date_format iso8601
+
+        [OUTPUT]
+            Name             stdout
+            Match            k8sevent
+            Format           json_lines
+            json_date_key    time
+            json_date_format iso8601
     tolerations:
       - effect: NoSchedule
         operator: Exists
-    volumeMounts:
-      - name: varlog
-        mountPath: /var/log
-        readOnly: true
-      - name: varlibdockercontainers
-        mountPath: /var/lib/docker/containers
-        readOnly: true
-      - name: etcmachineid
-        mountPath: /etc/machine-id
-        readOnly: true
-      - name: systemd
-        mountPath: /run/systemd
-        readOnly: true
-    daemonSetVolumes:
-      - name: varlog
-        hostPath:
-          path: /var/log
-      - name: varlibdockercontainers
-        hostPath:
-          path: /var/lib/docker/containers
-      - name: etcmachineid
-        hostPath:
-          path: /etc/machine-id
-          type: File
-      - name: systemd
-        hostPath:
-          path: /run/systemd
+    # The chart's default daemonSetVolumes/daemonSetVolumeMounts already mount
+    # hostPath /var/log read-write, which is all this pipeline needs:
+    # /var/log/containers/*.log are symlinks into /var/log/pods, and the tail
+    # DB above needs the write. There was previously a `volumeMounts:`
+    # override here; it was inert. Chart 0.58.1's pod template reads
+    # daemonSetVolumeMounts / extraVolumeMounts and never .Values.volumeMounts,
+    # so the /run/systemd mount it declared was never actually applied -- do
+    # not reintroduce that key expecting it to do something.
