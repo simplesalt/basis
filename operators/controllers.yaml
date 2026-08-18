@@ -227,12 +227,32 @@ spec:
         memory: 64Mi
       limits:
         memory: 256Mi
+    # CNPG wraps every postgres ERROR in a JSON record that embeds the entire
+    # offending SQL statement -- one such record measured 4494 bytes, and
+    # fifty of them overflowed get_kubernetes_logs outright. The identifying
+    # part (error_severity, sql_state_code, message) is always near the front;
+    # the tail is query text nobody reads from a log feed.
+    luaScripts:
+      truncate.lua: |
+        function truncate(tag, ts, record)
+          for _, k in ipairs({"log", "message"}) do
+            local v = record[k]
+            if type(v) == "string" and #v > 600 then
+              record[k] = string.sub(v, 1, 600) .. " ...[truncated]"
+            end
+          end
+          -- 2 = record replaced, original timestamp kept
+          return 2, ts, record
+        end
     config:
       service: |
         [SERVICE]
             Daemon Off
             Flush 1
-            Log_Level info
+            # error, not info: this service log shares stdout with the JSON
+            # records below, so every inotify_fs_add() lands in the feed. No
+            # filter can reach it -- level is the only lever.
+            Log_Level error
             Parsers_File /fluent-bit/etc/parsers.conf
             Parsers_File /fluent-bit/etc/conf/custom_parsers.conf
             HTTP_Server On
@@ -325,6 +345,16 @@ spec:
             Match   k8sevent
             Regex   type Warning
 
+        # DNSConfigForming fires on essentially every pod on this node (three
+        # upstream nameservers configured, kubelet keeps two) and is already
+        # at count 7000+ and climbing. It is a permanent property of the
+        # node's resolv.conf, not an incident, and it was the single largest
+        # source of event volume in the feed.
+        [FILTER]
+            Name    grep
+            Match   k8sevent
+            Exclude reason DNSConfigForming
+
         [FILTER]
             Name         nest
             Match        k8sevent
@@ -341,6 +371,15 @@ spec:
             Allowlist_key reason
             Allowlist_key message
             Allowlist_key count
+
+        # Last, deliberately: the greps above must match against the full
+        # untruncated text, or a long record whose only error keyword sits
+        # past byte 600 would be silently dropped instead of trimmed.
+        [FILTER]
+            Name    lua
+            Match   *
+            script  /fluent-bit/scripts/truncate.lua
+            call    truncate
       outputs: |
         # stdout IS the delivery mechanism here, not a placeholder. It puts
         # the whole cluster's errors into one pod's log stream, which is the
