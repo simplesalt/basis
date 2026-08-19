@@ -445,10 +445,18 @@ rules:
       - traefikservices
     verbs:
       - delete
-  # Special permission for FluxInstances
-  - apiGroups: ["fluxcd.controlplane.io"]
-    resources: ["fluxinstances"]
-    verbs: ["apply"]
+  # Do NOT re-add a "Special permission for FluxInstances" rule granting
+  # apiGroups: ["fluxcd.controlplane.io"], resources: ["fluxinstances"],
+  # verbs: ["apply"]. `apply` is not a Kubernetes RBAC verb -- the
+  # authorizer only ever matches get/list/watch/create/update/patch/delete/
+  # deletecollection, plus the special verbs use/bind/escalate/impersonate/
+  # approve/sign. Server-side apply is authorized as `patch` (plus `create`
+  # for object creation), sent as an HTTP PATCH with content-type
+  # application/apply-patch+yaml. So that rule granted nothing at all --
+  # its only effect was to make this role read as though mcp-flux had a
+  # mutation capability it never had. This role is intentionally
+  # non-mutating; removing the rule changes no authorization outcome. See
+  # simplesalt/basis#11.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
