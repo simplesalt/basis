@@ -5,5 +5,7 @@ resources:
   - cf-runtime.yaml
   - gcp-providers.yaml
   - gcp-runtime.yaml
+  - human-operator.yaml
   - mcp-flux.yaml
   - policies.cleanup.yaml
+  - policies.secrets.yaml

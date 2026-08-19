@@ -1,0 +1,124 @@
+---
+# human-operator -- a deliberately self-limited identity for hands-on cluster
+# work from a privileged workstation.
+#
+# WHAT THIS IS FOR. Every Secret in this cluster is declared by Flux as an empty
+# placeholder and then filled in by hand with `kubectl patch secret`. The failure
+# mode this identity guards against is drifting off that discipline -- reaching
+# for `kubectl create secret` or `kubectl delete secret` and ending up with a
+# live Secret that Git has no record of. It is a guardrail, NOT a security
+# boundary: the k3s admin kubeconfig (CN=system:admin, O=system:masters) is
+# short-circuited ahead of the RBAC authorizer entirely, so anyone holding it
+# can step around this role by switching kubeconfig contexts. That is the
+# intended escape hatch for break/fix -- see the note on self-patching below.
+#
+# HOW IT IS USED. Mint a short-lived token and give it its own context:
+#   kubectl create token human-operator -n flux-system --duration=1h
+# then `kubectl config set-credentials`/`set-context` and work from that context.
+# The guardrail only applies while that context is selected.
+#
+# THE VERB SET IS THE WHOLE POINT.
+#   granted   get/list/watch on everything -- read is not a discipline risk, and
+#             an identity that cannot read cannot verify its own writes. This
+#             includes Secrets: the operator is the person supplying those
+#             values, so withholding read buys nothing and only adds friction.
+#   granted   patch on everything -- `kubectl patch`, `kubectl annotate`,
+#             `kubectl label`, `kubectl scale`, and `kubectl apply --server-side`
+#             against an object that ALREADY EXISTS.
+#   withheld  create -- blocks `kubectl create secret`, and blocks server-side
+#             apply against an object Git has not declared yet (SSA needs create
+#             to materialize an absent object, so it fails closed). This is the
+#             load-bearing omission.
+#   withheld  update -- blocks `kubectl replace` and `kubectl edit` (both do a
+#             read-then-PUT).
+#   withheld  delete/deletecollection -- blocks `kubectl delete`. No
+#             delete-and-recreate-by-hand escape hatch.
+#
+# BEYOND SECRETS: this applies cluster-wide, not just to Secrets. Nothing can be
+# created or deleted from this context at all -- no scratch namespace, no debug
+# pod, no `kubectl delete pod` to declog a stuck reconcile. Nor can it
+# `kubectl exec` or `kubectl port-forward`: both are authorized as CREATE on the
+# pods/exec and pods/portforward subresources, so both are denied here. They can
+# be added as narrow create-on-subresource rules if the debugging friction
+# outweighs the fact that exec into a pod inherits that pod's ServiceAccount.
+# `kubectl drain` half-works and should not be used: the cordon is a PATCH and
+# succeeds, the pod evictions are CREATEs and fail, leaving the node cordoned
+# but not drained.
+#
+# TWO THINGS PATCH PERMITS THAT YOU PROBABLY DO NOT WANT.
+#   1. `kubectl rollout restart` is a PATCH, so RBAC allows it. The GitOps
+#      convention here forbids it anyway -- bump a restart-epoch annotation in
+#      Git and let Flux perform the restart (simplesalt/oci#28). RBAC is not
+#      enforcing that rule; you are.
+#   2. CLIENT-SIDE `kubectl apply -f` against an existing object is also a PATCH,
+#      so it is permitted -- and it writes the full applied manifest into the
+#      kubectl.kubernetes.io/last-applied-configuration annotation. Applied to a
+#      Secret, that copies the payload into an annotation, which is exactly the
+#      exposure the Secret discipline exists to avoid. Use `kubectl patch` or
+#      `kubectl apply --server-side` (neither writes that annotation). RBAC has
+#      no way to distinguish the two PATCHes -- admission does, which is what
+#      the reject-last-applied-on-secrets ClusterPolicy in policies.secrets.yaml
+#      is for.
+#
+# SELF-PATCHING FOR BREAK/FIX DOES NOT WORK, BY DESIGN. `patch` on
+# rbac.authorization.k8s.io/clusterroles is granted below, but the API server
+# runs a privilege-escalation check on every write to a Role/ClusterRole: the
+# request is rejected unless the requester already holds every permission the
+# rule would grant, or holds the `escalate` verb on roles/clusterroles. This
+# identity holds neither, so patching this ClusterRole to add `delete` on
+# Secrets is refused. Granting `escalate` would make that work and would also
+# make the entire guardrail decorative -- `escalate` is equivalent to
+# cluster-admin for anyone who can reach it. The break/fix path is to switch
+# back to the admin kubeconfig context, which is a deliberate, visible act.
+# (Same story for ClusterRoleBindings and the `bind` verb.)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: human-operator
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/name: human-operator
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: operator-identity
+    entity: cluster
+    capability: access
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: human-operator
+  labels:
+    app.kubernetes.io/name: human-operator
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: operator-identity
+    entity: cluster
+    capability: access
+rules:
+  # Read anything. `*` in `resources` matches subresources too, so this covers
+  # pods/log for `kubectl logs`.
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  # Mutate only what already exists.
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: human-operator
+  labels:
+    app.kubernetes.io/name: human-operator
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: operator-identity
+    entity: cluster
+    capability: access
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: human-operator
+subjects:
+  - kind: ServiceAccount
+    name: human-operator
+    namespace: flux-system
