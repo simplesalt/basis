@@ -23,9 +23,10 @@
 #   - the inert kubectl-subcommand "verbs" are dropped and `pods/log` is
 #     granted explicitly, so log reads actually work (see the rule comments);
 #   - the broad `delete` verb is carried over as-is for now.
-# The security review #221 calls for is NOT finished: the blanket
-# `list` on all resources still exposes every Secret cluster-wide
-# (simplesalt/basis#8), and the `delete` breadth is still unreviewed.
+# The security review #221 calls for is still not finished -- the `delete`
+# breadth is unreviewed -- but the blanket `list` on all resources
+# (simplesalt/basis#8) has been narrowed to exclude Secrets; see the rule
+# comments below.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -166,15 +167,120 @@ metadata:
     entity: cluster
     capability: svcs
 rules:
-  # KNOWN ISSUE (accepted, tracked, carried over as-is from base-stack@named):
-  # this blanket list-everything rule includes secrets, so it grants
-  # read access to every Secret's data cluster-wide, silently defeating
-  # the "non-secret resources" restriction on the rule below. This is
-  # not a new regression -- it's the same grant that is live on the
-  # current production cluster today via base-stack. See
-  # simplesalt/basis#8 for the tracked narrowing follow-up.
-  # Allow listing all resources
-  - apiGroups: ["*"]
+  # `list` deliberately excludes Secrets. This rule used to be a blanket
+  # apiGroups/resources `["*"]`, which handed this identity every Secret in the
+  # cluster and silently defeated the "non-secret resources" restriction on the
+  # rule below. RBAC has no deny and no field-level scoping -- a LIST response
+  # carries complete object bodies, `data` included -- so the only way to keep
+  # Secret payloads away from this identity is to not grant the verb at all.
+  # (flux-operator-mcp masks `data` in its own output, but that is
+  # application-level redaction, not an authorization boundary: the
+  # ServiceAccount token works directly against the API server.)
+  #
+  # `secrets` exists only in the core ("") API group, so the grant splits in
+  # two: the core group enumerated by resource with `secrets` omitted, and
+  # every other API group wildcarded. The core group's resource set is fixed by
+  # Kubernetes and does not grow, so that list is stable. The group list is
+  # not, and it fails CLOSED -- a newly installed CRD group is invisible to the
+  # MCP server until it is added here. That is the intended failure direction,
+  # but it does mean a new Crossplane provider (or similar) needs a matching
+  # line below. Listing a group that isn't installed is inert, not an error, so
+  # entries may be added ahead of the CRDs. Ref: simplesalt/basis#8.
+  - apiGroups: [""]
+    resources:
+      - bindings
+      - componentstatuses
+      - configmaps
+      - endpoints
+      - events
+      - limitranges
+      - namespaces
+      - nodes
+      - persistentvolumeclaims
+      - persistentvolumes
+      - pods
+      - podtemplates
+      - replicationcontrollers
+      - resourcequotas
+      - serviceaccounts
+      - services
+    verbs: ["list"]
+  - apiGroups:
+      # Kubernetes built-ins -- none of these groups defines a `secrets` resource
+      - admissionregistration.k8s.io
+      - apiextensions.k8s.io
+      - apiregistration.k8s.io
+      - apps
+      - authentication.k8s.io
+      - authorization.k8s.io
+      - autoscaling
+      - batch
+      - certificates.k8s.io
+      - coordination.k8s.io
+      - discovery.k8s.io
+      - events.k8s.io
+      - flowcontrol.apiserver.k8s.io
+      - metrics.k8s.io
+      - networking.k8s.io
+      - node.k8s.io
+      - policy
+      - rbac.authorization.k8s.io
+      - scheduling.k8s.io
+      - storage.k8s.io
+      - storagemigration.k8s.io
+      # Flux
+      - fluxcd.controlplane.io
+      - helm.toolkit.fluxcd.io
+      - image.toolkit.fluxcd.io
+      - kustomize.toolkit.fluxcd.io
+      - notification.toolkit.fluxcd.io
+      - source.toolkit.fluxcd.io
+      # k3s
+      - helm.cattle.io
+      - k3s.cattle.io
+      # cert-manager
+      - acme.cert-manager.io
+      - cert-manager.io
+      # Traefik
+      - hub.traefik.io
+      - traefik.io
+      # Gateway API
+      - gateway.networking.k8s.io
+      # MetalLB
+      - frrk8s.metallb.io
+      - metallb.io
+      # Kyverno
+      - kyverno.io
+      - policies.kyverno.io
+      - reports.kyverno.io
+      - wgpolicyk8s.io
+      # CloudNativePG
+      - postgresql.cnpg.io
+      # Prometheus operator
+      - monitoring.coreos.com
+      # ExternalDNS
+      - externaldns.k8s.io
+      # Crossplane core
+      - apiextensions.crossplane.io
+      - ops.crossplane.io
+      - pkg.crossplane.io
+      - protection.crossplane.io
+      # Crossplane provider-gcp
+      - cloudplatform.gcp.m.upbound.io
+      - cloudplatform.gcp.upbound.io
+      - gcp.m.upbound.io
+      - gcp.upbound.io
+      # Crossplane provider-cloudflare
+      - dns.upjet-cloudflare.m.upbound.io
+      - dns.upjet-cloudflare.upbound.io
+      - r2.upjet-cloudflare.m.upbound.io
+      - r2.upjet-cloudflare.upbound.io
+      - upjet-cloudflare.m.upbound.io
+      - upjet-cloudflare.upbound.io
+      - workers.upjet-cloudflare.m.upbound.io
+      - workers.upjet-cloudflare.upbound.io
+      - zero.upjet-cloudflare.m.upbound.io
+      - zero.upjet-cloudflare.upbound.io
     resources: ["*"]
     verbs: ["list"]
   # Read-only verbs for non-secret resources
