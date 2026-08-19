@@ -334,7 +334,11 @@ rules:
       - pods/log
     verbs:
       - get
-  # Allow delete for non-persistent resources
+  # Allow delete for non-persistent resources, to unclog stuck Flux
+  # reconciles (e.g. a wedged Job or Pod blocking a Kustomization). `nodes`
+  # was removed from this list: deleting a Node object decommissions a
+  # cluster member, which is neither stateless nor recoverable by this
+  # identity, unlike everything else here. See simplesalt/basis#12.
   - apiGroups: ["*"]
     resources:
       - bindings
@@ -344,7 +348,6 @@ rules:
       - events
       - limitranges
       - namespaces
-      - nodes
       - pods
       - podtemplates
       - replicationcontrollers
