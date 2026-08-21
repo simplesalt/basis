@@ -74,18 +74,34 @@ umask 077
 # Prefer naming keys explicitly: it turns "the source grew a key nobody
 # reviewed" from a silent copy into a visible skip.
 #
+# BUT name EVERY key the source actually holds. This script reports a named key
+# that is missing from the source; it does NOT report a source key the row
+# omits. An under-specified row therefore copies a subset in total silence --
+# invisible in both dry run and apply. Two rows shipped that way and were
+# caught only by diffing key sets by hand: ssint-main-cf held
+# CLOUDFLARE_ACCOUNT_ID beside api_token, and gcp-credentials held sa_key
+# beside credentials. Audit both sides before trusting a row.
+#
+# The durable fix is upstream, in how Secrets are declared: one hand-populated
+# Secret should hold ONE key holding ONE opaque string, never several values
+# and never a JSON bundling them. Composites (a GCP service-account JSON,
+# {"api_token":...}) get assembled at deploy time from single-value Secrets --
+# see the assemble-cloudflare-credentials-main Job for the shape. One value per
+# Secret makes every row all-or-nothing and this whole class of bug impossible.
+#
 # Namespaces are mostly identical on both sides. The ssint-main-* namespaces and
 # their Secrets are declared by simplesalt/brain@main, which BOTH clusters
 # subscribe to, so those rows are name-for-name by construction.
 # --------------------------------------------------------------------------
 SECRETS=(
-  # -- test subset ---------------------------------------------------------
-  # Three low-blast-radius rows to validate the mechanism before widening it.
-  # Single-key, unambiguous mapping, and each one's effect is observable.
+  # -- proven first, on 2026-08-21 -----------------------------------------
+  # These three were run alone to validate the mechanism: single-key,
+  # unambiguous mapping, each one's effect observable. The rest of the
+  # inventory was enabled once they landed.
 
   # Raw ssint-main Cloudflare API token. A Job wraps it into
   # cloudflare-credentials-main; verify by watching that ProviderConfig go ready.
-  'crossplane-system|ssint-main-cf|crossplane-system|ssint-main-cf|api_token'
+  'crossplane-system|ssint-main-cf|crossplane-system|ssint-main-cf|api_token,CLOUDFLARE_ACCOUNT_ID'
 
   # Google OAuth client_id for the SS SSO IdP. A client_id is a public
   # identifier rather than credential material, so it is the safest possible
@@ -97,35 +113,50 @@ SECRETS=(
   # OpenAI key for gbrain's embedding provider. Single consumer, mounted
   # optional:true, so a bad copy degrades embeddings instead of crash-looping.
   'ssint-main-ai|gbrain-embedding-secret|ssint-main-ai|gbrain-embedding-secret|OPENAI_API_KEY'
+  # -- rest of the inventory, enabled 2026-08-21 --------------------------
+  'crossplane-system|gcp-credentials|crossplane-system|gcp-credentials|credentials,sa_key'
+  'cert-manager|ss-acme-cf-token|cert-manager|ss-acme-cf-token|api-token'
+  'crossplane-system|ssint-main-g-idp-secret|crossplane-system|ssint-main-g-idp-secret|client_secret'
+  'cert-manager|fe-acme-cf-token|cert-manager|fe-acme-cf-token|api-token'
+  # Explicit key list, NOT '*'. When this ran, '*' would have swept in
+  # CLAUDE_CODE_OAUTH_TOKEN -- a rotating Anthropic token that both clusters'
+  # hermes-agent still referenced, and two live holders invalidate each other
+  # on refresh. simplesalt/brain#12 has since removed Claude auth from
+  # hermes-agent, so that key is now unused and the hazard is gone; the list
+  # stays explicit anyway, per the rule above.
+  'ssint-main-ai|hermes-secrets|ssint-main-ai|hermes-secrets|CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_API_TOKEN,FIRECRAWL_API_KEY,GENERAL_API_LLM_API_KEY,GITHUB_TOKEN,GOOGLE_CLIENT_ID,GOOGLE_PRIVATE_KEY_B64,GOOGLE_PRIVATE_KEY_ID,HERMES_BEARER_TOKEN,HERMES_WEBHOOK_HMAC_KEY,HINDSIGHT_API_LLM_API_KEY,TAVILY_API_KEY,WORK_EMAIL'
+  'ssint-main-ai|team-roster|ssint-main-ai|team-roster|roster.json'
+  'ssint-main-ai|project-tracking|ssint-main-ai|project-tracking|board-config.json'
+  'ssint-main-ai|google-dwd-key|ssint-main-ai|google-dwd-key|*'
+  'ssint-main-msg|google-dwd-key|ssint-main-msg|google-dwd-key|*'
+  'ssint-main-msg|google-private-key-id|ssint-main-msg|google-private-key-id|private_key_id'
+  'ssint-main-msg|duxsoup-api-key|ssint-main-msg|duxsoup-api-key|api_key'
+  'ssint-main-msg|duxsoup-user-id|ssint-main-msg|duxsoup-user-id|user_id'
+  'ssint-main-msg|quo-api-key|ssint-main-msg|quo-api-key|api_key'
+  'ssint-main-msg|quo-from-number|ssint-main-msg|quo-from-number|from_number'
+  'ssint-main-cal|team-roster|ssint-main-cal|team-roster|roster.json'
+  'ssint-main-coding|gh-auth|ssint-main-coding|gh-auth|GITHUB_TOKEN'
+  'ssint-main-coding|cf-secret|ssint-main-coding|cf-secret|CLOUDFLARE_API_TOKEN'
+  'ssint-main-coding|cf-id|ssint-main-coding|cf-id|CLOUDFLARE_ACCOUNT_ID'
+  'ssint-main-coding|claude-identity|ssint-main-coding|claude-identity|*'
 )
 
 # --------------------------------------------------------------------------
-# The rest of the inventory, held back until the three above are proven.
+# Rows above were verified against BOTH live clusters on 2026-08-21 (key sets
+# compared old vs new, values never read). Result: 14 secrets / 38 keys copied.
 #
-# Compiled from the manifests, NOT from the live cluster: the flux MCP's
-# ServiceAccount is deliberately denied get/list on Secrets, so no row here --
-# including the three active ones -- has been checked against a live object.
-# Expect at least one to be absent or to carry a key set that has drifted.
+# Known permanent no-ops -- these report as failures every run, and that is
+# correct, not a regression:
+#   ss-acme-cf-token, duxsoup-api-key, duxsoup-user-id, quo-api-key,
+#   quo-from-number  Declared on both clusters but EMPTY at the source: the
+#     values were never populated on the old cluster either.
+#   cert-manager/fe-acme-cf-token  Genuinely not declared on the new cluster
+#     (absent from brain's Kustomization inventory). A manifest gap to fix in
+#     Git if it is still wanted, which is what the SKIP is telling you.
 #
-# 'crossplane-system|gcp-credentials|crossplane-system|gcp-credentials|credentials'
-# 'cert-manager|ss-acme-cf-token|cert-manager|ss-acme-cf-token|api-token'
-# 'crossplane-system|ssint-main-g-idp-secret|crossplane-system|ssint-main-g-idp-secret|client_secret'
-# 'cert-manager|fe-acme-cf-token|cert-manager|fe-acme-cf-token|api-token'
-# 'ssint-main-ai|hermes-secrets|ssint-main-ai|hermes-secrets|*'
-# 'ssint-main-ai|team-roster|ssint-main-ai|team-roster|roster.json'
-# 'ssint-main-ai|project-tracking|ssint-main-ai|project-tracking|board-config.json'
-# 'ssint-main-ai|google-dwd-key|ssint-main-ai|google-dwd-key|*'
-# 'ssint-main-msg|google-dwd-key|ssint-main-msg|google-dwd-key|*'
-# 'ssint-main-msg|google-private-key-id|ssint-main-msg|google-private-key-id|private_key_id'
-# 'ssint-main-msg|duxsoup-api-key|ssint-main-msg|duxsoup-api-key|api_key'
-# 'ssint-main-msg|duxsoup-user-id|ssint-main-msg|duxsoup-user-id|user_id'
-# 'ssint-main-msg|quo-api-key|ssint-main-msg|quo-api-key|api_key'
-# 'ssint-main-msg|quo-from-number|ssint-main-msg|quo-from-number|from_number'
-# 'ssint-main-cal|team-roster|ssint-main-cal|team-roster|roster.json'
-# 'ssint-main-coding|gh-auth|ssint-main-coding|gh-auth|GITHUB_TOKEN'
-# 'ssint-main-coding|cf-secret|ssint-main-coding|cf-secret|CLOUDFLARE_API_TOKEN'
-# 'ssint-main-coding|cf-id|ssint-main-coding|cf-id|CLOUDFLARE_ACCOUNT_ID'
-# 'ssint-main-coding|claude-identity|ssint-main-coding|claude-identity|*'
+# When probing whether a target exists, distinguish "not found" from "exists
+# but empty": these placeholders are declared with no .data at all, so a naive
+# shell default (${x:-ABSENT}) reports every VALID target as missing.
 #
 # Unresolved -- needs a decision before it can get a row:
 #   cluster-named-svcs/cnpg-backup-credentials  CNPG R2 backup creds. No
