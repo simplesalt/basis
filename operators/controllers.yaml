@@ -120,7 +120,7 @@ spec:
               accessModes: ["ReadWriteOnce"]
               resources:
                 requests:
-                  storage: 50Gi
+                  storage: 8Gi
         query:
           maxConcurrency: 8
           maxSamples: 25000000
