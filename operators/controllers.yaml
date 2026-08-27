@@ -147,21 +147,13 @@ spec:
     grafana:
       adminPassword: admin
       persistence:
-        enabled: true
-        storageClassName: local-path
-        size: 10Gi
+        enabled: false
       ingress:
         enabled: false
     alertmanager:
       alertmanagerSpec:
         storage:
-          volumeClaimTemplate:
-            spec:
-              storageClassName: local-path
-              accessModes: ["ReadWriteOnce"]
-              resources:
-                requests:
-                  storage: 10Gi
+          emptyDir: {}
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
