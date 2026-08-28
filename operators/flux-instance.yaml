@@ -1,0 +1,25 @@
+---
+apiVersion: fluxcd.controlplane.io/v1
+kind: FluxInstance
+metadata:
+  name: flux
+  namespace: flux-system
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
+spec:
+  cluster:
+    domain: k.famevans.win
+    multitenant: false
+    networkPolicy: true
+    type: kubernetes
+  components:
+    - source-controller
+    - kustomize-controller
+    - helm-controller
+    - notification-controller
+  distribution:
+    registry: ghcr.io/fluxcd
+    version: 2.x
+  storage:
+    class: local-path
+    size: 10Gi
