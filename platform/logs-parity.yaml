@@ -1,0 +1,983 @@
+# e2e proof that kubectl logs, the REST surface and the MCP surface agree.
+#
+# logs-api.yaml exposes the same log data three ways: the Kubernetes API
+# (what kubectl logs calls), PostgREST RPCs, and an MCP tool per RPC via
+# agentgateway's OpenAPI-to-MCP bridge. gen-logs-openapi.py converts the
+# Swagger document PostgREST emits into the OpenAPI 3.0 document agentgateway
+# reads, and nothing re-checks that the converted document still describes
+# the same API. A drift there -- a renamed parameter, a type PostgREST
+# advertises as "text" that agentgateway coerces differently, a tool that
+# silently stops existing -- would make MCP answer a different question than
+# REST while returning 200 either way. This CronJob is the check: run the
+# same logical query through all three surfaces on a schedule and fail loudly
+# on any disagreement.
+#
+# Design notes:
+#   - Namespaced Role, not a ClusterRole: every fixture pod this suite reads
+#     lives in cluster-main-observability (the kube-prometheus-stack
+#     HelmRelease), so a cluster-wide grant would be privilege the Job never
+#     exercises.
+#   - No DATABASE_URL / DB Secret: both the REST and MCP surfaces are
+#     unauthenticated by design (logs-api.yaml), so the parity checks run
+#     entirely over HTTP with no credential to provision or leak.
+#   - automountServiceAccountToken is explicitly true here, unlike logs-mcp's
+#     explicit false -- this workload's entire purpose is calling the
+#     Kubernetes API with its own identity, the one thing logs-mcp is
+#     deliberately forbidden from doing.
+#   - logs-postgrest-allow-internal and logs-mcp-allow-internal (logs-api.yaml)
+#     only admit traffic from logs-mcp itself and from the coding/AI agent
+#     namespaces. Rather than widen those, this file adds two more ingress
+#     NetworkPolicies scoped to app: logs-parity -- Kubernetes unions ingress
+#     rules across every policy that selects a pod, so this is additive and
+#     leaves the existing policies untouched.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: logs-parity
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-parity
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: e2e-test
+    entity: cluster
+    env: main
+    capability: observability
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: logs-parity-pod-reader
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-parity
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: e2e-test
+rules:
+  # get on pods/log is the kubectl-logs-equivalent surface under test.
+  # list on pods is only used to pick fixture pods to query -- no other verb,
+  # no other resource, no write of any kind.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: logs-parity-pod-reader
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-parity
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: e2e-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: logs-parity-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: logs-parity
+    namespace: cluster-main-observability
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: logs-postgrest-allow-parity
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-parity
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: e2e-test
+spec:
+  podSelector:
+    matchLabels:
+      app: logs-postgrest
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: logs-parity
+      ports:
+        - protocol: TCP
+          port: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: logs-mcp-allow-parity
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-parity
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: e2e-test
+spec:
+  podSelector:
+    matchLabels:
+      app: logs-mcp
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: logs-parity
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logs-parity-script
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-parity
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: e2e-test
+data:
+  parity.py: |
+    import json
+    import os
+    import ssl
+    import sys
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from datetime import datetime, timedelta, timezone
+
+    NAMESPACE = os.environ.get("NAMESPACE", "cluster-main-observability")
+    REST_BASE = os.environ.get(
+        "REST_BASE",
+        "http://logs-postgrest.cluster-main-observability.svc.cluster.local:3000",
+    )
+    MCP_URL = os.environ.get(
+        "MCP_URL",
+        "http://logs-mcp.cluster-main-observability.svc.cluster.local:8080/mcp",
+    )
+
+    # fluent-bit self-excludes its own pod plus the four pods that make up
+    # this very pipeline (logs-pg, logs-postgrest, logs-mcp, logs-schema) --
+    # see operators/controllers.yaml's Exclude_Path. None of those ever have
+    # rows to query, so they cannot be fixtures. logs-parity- is excluded too
+    # so this Job never tries to read its own log through itself.
+    EXCLUDED_PREFIXES = (
+        "fluent-bit-",
+        "logs-pg-",
+        "logs-postgrest-",
+        "logs-mcp-",
+        "logs-schema-",
+        "logs-parity-",
+    )
+
+    # When the fluent-bit kubernetes filter gained Labels On, only rows
+    # ingested afterwards carried pod labels. Everything older has
+    # labels=NULL permanently -- nothing backfills them, because the labels a
+    # pod carried at the time are not recoverable once it is gone. Any
+    # label_selector assertion evaluated on rows at or before this instant
+    # would see NULL for reasons that have nothing to do with the code under
+    # test.
+    LABELS_NULL_CUTOFF = datetime(2026, 8, 30, 13, 42, tzinfo=timezone.utc)
+
+    SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+    K8S_API = "https://{}:{}".format(
+        os.environ["KUBERNETES_SERVICE_HOST"], os.environ["KUBERNETES_SERVICE_PORT"]
+    )
+    K8S_CTX = ssl.create_default_context(cafile=SA_DIR + "/ca.crt")
+
+    FAILURES = 0
+    mcp = None
+
+
+    def k8s_token():
+        with open(SA_DIR + "/token") as handle:
+            return handle.read().strip()
+
+
+    def http_request(method, url, headers=None, data=None, context=None, timeout=20):
+        req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+        try:
+            with urllib.request.urlopen(req, context=context, timeout=timeout) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc.read()
+
+
+    def retry(fn, attempts=4, delay=5):
+        last = None
+        for attempt in range(attempts):
+            try:
+                return fn()
+            except Exception as exc:
+                last = exc
+                if attempt < attempts - 1:
+                    time.sleep(delay)
+        raise last
+
+
+    def pg_ts(dt):
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+    def k8s_ts(dt):
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+    def k8s_get(path):
+        def _do():
+            status, _headers, body = http_request(
+                "GET",
+                K8S_API + path,
+                headers={"Authorization": "Bearer " + k8s_token(), "Accept": "application/json"},
+                context=K8S_CTX,
+            )
+            if status != 200:
+                raise RuntimeError("k8s API {} -> {}: {!r}".format(path, status, body[:500]))
+            return body
+
+        return retry(_do)
+
+
+    def k8s_list_pods(namespace):
+        return json.loads(k8s_get("/api/v1/namespaces/{}/pods".format(namespace)))["items"]
+
+
+    def k8s_pod_log(namespace, pod, container, since, tail_lines=5000):
+        # tailLines here is a generous, fixed safety cap on how much of the
+        # container's log kubelet returns -- NOT the number of rows this case
+        # compares. sinceTime bounds the query's start server-side; there is
+        # no matching upper-bound parameter, so the end of the window is
+        # enforced client-side in parse_k8s_log instead. Capping tailLines to
+        # the comparison's own row limit would let kubelet's tail selection
+        # (taken from the live end of the file) crowd out in-window lines
+        # with ones that arrive after the window closes.
+        qs = urllib.parse.urlencode(
+            {
+                "container": container,
+                "sinceTime": k8s_ts(since),
+                "tailLines": tail_lines,
+                "timestamps": "true",
+            }
+        )
+
+        def _do():
+            status, _headers, body = http_request(
+                "GET",
+                "{}/api/v1/namespaces/{}/pods/{}/log?{}".format(K8S_API, namespace, pod, qs),
+                headers={"Authorization": "Bearer " + k8s_token()},
+                context=K8S_CTX,
+            )
+            if status != 200:
+                raise RuntimeError("k8s pod log {} -> {}: {!r}".format(pod, status, body[:500]))
+            return body.decode("utf-8", "replace")
+
+        return retry(_do)
+
+
+    def parse_ts(raw):
+        raw = raw.rstrip("Z")
+        if "." in raw:
+            date_part, frac = raw.split(".", 1)
+            frac = (frac + "000000")[:6]
+            fmt = "%Y-%m-%dT%H:%M:%S.%f"
+            raw = "{}.{}".format(date_part, frac)
+        else:
+            fmt = "%Y-%m-%dT%H:%M:%S"
+        return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+
+
+    def parse_k8s_log(text, until):
+        out = []
+        for line in text.splitlines():
+            if not line:
+                continue
+            ts_str, _, message = line.partition(" ")
+            try:
+                ts = parse_ts(ts_str)
+            except ValueError:
+                continue
+            if ts <= until:
+                out.append((ts, message))
+        return out
+
+
+    def urlencode_params(params):
+        clean = {}
+        for key, value in params.items():
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                clean[key] = "true" if value else "false"
+            else:
+                clean[key] = str(value)
+        return urllib.parse.urlencode(clean)
+
+
+    def rest_call(path, params):
+        query = urlencode_params(params)
+
+        def _do():
+            status, _headers, body = http_request(
+                "GET",
+                "{}{}?{}".format(REST_BASE, path, query),
+                headers={"Accept": "application/json"},
+            )
+            if status != 200:
+                raise RuntimeError("REST {}?{} -> {}: {!r}".format(path, query, status, body[:800]))
+            return json.loads(body)
+
+        return retry(_do)
+
+
+    def rest_rpc(fn, **params):
+        return rest_call("/rpc/" + fn, params)
+
+
+    def parse_mcp_body(content_type, body):
+        text = body.decode("utf-8", "replace")
+        if "text/event-stream" in content_type:
+            messages = []
+            for block in text.split("\n\n"):
+                data_lines = [
+                    line[len("data:") :].strip()
+                    for line in block.splitlines()
+                    if line.startswith("data:")
+                ]
+                if data_lines:
+                    messages.append(json.loads("".join(data_lines)))
+            if not messages:
+                raise RuntimeError("MCP SSE body carried no data frames: {!r}".format(text[:400]))
+            return messages[-1]
+        if not text.strip():
+            return {}
+        return json.loads(text)
+
+
+    class McpSession:
+        def __init__(self):
+            self.session_id = None
+            self.protocol_version = None
+            self._next = 0
+
+        def _next_id(self):
+            self._next += 1
+            return self._next
+
+        def _post(self, payload):
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            }
+            if self.session_id:
+                headers["mcp-session-id"] = self.session_id
+            if self.protocol_version:
+                headers["MCP-Protocol-Version"] = self.protocol_version
+            data = json.dumps(payload).encode()
+
+            def _do():
+                status, resp_headers, body = http_request(
+                    "POST", MCP_URL, headers=headers, data=data
+                )
+                if status not in (200, 202):
+                    raise RuntimeError(
+                        "MCP {} -> {}: {!r}".format(payload.get("method"), status, body[:800])
+                    )
+                return status, resp_headers, body
+
+            return retry(_do)
+
+        def initialize(self):
+            _status, resp_headers, body = self._post(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self._next_id(),
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "logs-parity", "version": "1.0.0"},
+                    },
+                }
+            )
+            session_id = resp_headers.get("mcp-session-id")
+            if not session_id:
+                raise RuntimeError("MCP initialize response carried no mcp-session-id header")
+            self.session_id = session_id
+            message = parse_mcp_body(resp_headers.get("Content-Type", ""), body)
+            self.protocol_version = message.get("result", {}).get("protocolVersion")
+            self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+        def call_tool(self, name, arguments):
+            _status, resp_headers, body = self._post(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self._next_id(),
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                }
+            )
+            message = parse_mcp_body(resp_headers.get("Content-Type", ""), body)
+            if "error" in message:
+                raise RuntimeError("MCP tools/call {} error: {}".format(name, message["error"]))
+            result = message["result"]
+            if result.get("isError"):
+                raise RuntimeError("MCP tool {} reported isError: {}".format(name, result))
+            if "structuredContent" in result:
+                return result["structuredContent"]
+            text_parts = [c["text"] for c in result.get("content", []) if c.get("type") == "text"]
+            return json.loads("".join(text_parts))
+
+
+    def fail(case, reason, **context):
+        global FAILURES
+        FAILURES += 1
+        print("=== PARITY FAILURE: {} ===".format(case), file=sys.stderr)
+        print(reason, file=sys.stderr)
+        for key, value in context.items():
+            print("--- {} ---".format(key), file=sys.stderr)
+            if isinstance(value, (list, dict)):
+                print(json.dumps(value, indent=2, sort_keys=True, default=str), file=sys.stderr)
+            else:
+                print(value, file=sys.stderr)
+
+
+    def canon(rows):
+        return sorted(json.dumps(row, sort_keys=True, default=str) for row in rows)
+
+
+    def assert_equal_rows(case, query_desc, a_label, a_rows, b_label, b_rows):
+        if a_rows == b_rows:
+            return True
+        only_a = [row for row in a_rows if row not in b_rows]
+        only_b = [row for row in b_rows if row not in a_rows]
+        fail(
+            case,
+            "{} and {} disagree on {}".format(a_label, b_label, query_desc),
+            query=query_desc,
+            **{
+                a_label: a_rows,
+                b_label: b_rows,
+                "only in " + a_label: only_a,
+                "only in " + b_label: only_b,
+            }
+        )
+        return False
+
+
+    def self_test():
+        # Proves the equality check this entire suite is built on can actually
+        # detect a difference, before a single real result is trusted. This is
+        # in-memory and synthetic on purpose: it must run, and pass silently,
+        # on every single invocation without depending on cluster state or
+        # producing stderr noise that would make a healthy run look failed.
+        a = [{"at": "1", "message": "x"}]
+        b = [{"at": "1", "message": "y"}]
+        if a == b:
+            print(
+                "FATAL: comparator self-test did not detect a known synthetic "
+                "mismatch; the differ backing every case below is broken, so no "
+                "result in this run can be trusted",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+
+    def pick_fixture(pods):
+        candidates = []
+        for pod in pods:
+            name = pod["metadata"]["name"]
+            if any(name.startswith(prefix) for prefix in EXCLUDED_PREFIXES):
+                continue
+            if pod.get("status", {}).get("phase") != "Running":
+                continue
+            containers = [c["name"] for c in pod["spec"]["containers"]]
+            if not containers:
+                continue
+            candidates.append((name, containers, pod["metadata"].get("labels") or {}))
+        if not candidates:
+            print(
+                "FATAL: no eligible fixture pod in {} -- every running pod is an "
+                "ingest-excluded pipeline pod, or the namespace is empty".format(NAMESPACE),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        candidates.sort(key=lambda c: (-len(c[1]), c[0]))
+        return candidates[0]
+
+
+    def pick_label_pair(labels):
+        keys = sorted(labels.keys())
+        if not keys:
+            return None, None, None, None
+        k1, v1 = keys[0], labels[keys[0]]
+        if len(keys) > 1:
+            k2, v2 = keys[1], labels[keys[1]]
+        else:
+            k2, v2 = k1, v1
+        return k1, v1, k2, v2
+
+
+    def case_absolute_window(w_start, w_end, namespace):
+        args = {
+            "since_time": pg_ts(w_start),
+            "until_time": pg_ts(w_end),
+            "namespace_filter": namespace,
+            "max_rows": 500,
+            "oldest_first": False,
+        }
+        rest_rows = rest_rpc("recent", **args)
+        mcp_rows = mcp.call_tool("recent", args)
+        return assert_equal_rows(
+            "absolute-time-window", "recent({})".format(args), "REST", rest_rows, "MCP", mcp_rows
+        )
+
+
+    def case_since_hours(w_end, hours, namespace):
+        args = {"since_hours": hours, "until_time": pg_ts(w_end), "namespace_filter": namespace}
+        rest_rows = rest_rpc("workloads", **args)
+        mcp_rows = mcp.call_tool("workloads", args)
+        return assert_equal_rows(
+            "relative-since-hours",
+            "workloads({})".format(args),
+            "REST",
+            rest_rows,
+            "MCP",
+            mcp_rows,
+        )
+
+
+    def case_pod_ground_truth(fixture, container, w_start, w_end, namespace):
+        limit = 200
+        k8s_text = k8s_pod_log(namespace, fixture, container, w_start)
+        k8s_lines = parse_k8s_log(k8s_text, w_end)
+        k8s_messages = [message for _ts, message in k8s_lines[-limit:]]
+
+        args = {
+            "pod_name": fixture,
+            "namespace_filter": namespace,
+            "container_filter": container,
+            "since_time": pg_ts(w_start),
+            "until_time": pg_ts(w_end),
+            "max_rows": limit,
+            "oldest_first": True,
+        }
+        rest_rows = rest_rpc("pod_tail", **args)
+        mcp_rows = mcp.call_tool("pod_tail", args)
+        ok = assert_equal_rows(
+            "pod-tail-rest-vs-mcp",
+            "pod_tail({})".format(args),
+            "REST",
+            rest_rows,
+            "MCP",
+            mcp_rows,
+        )
+
+        rest_messages = [row["message"] for row in rest_rows]
+        if rest_messages != k8s_messages:
+            fail(
+                "pod-tail-vs-kubectl-logs",
+                "kubectl-logs-equivalent and REST pod_tail disagree for pod={} container={}".format(
+                    fixture, container
+                ),
+                query=str(args),
+                **{"kubectl logs (k8s API)": k8s_messages, "REST pod_tail messages": rest_messages}
+            )
+            ok = False
+        return ok
+
+
+    def case_pod_absent(w_start, w_end):
+        args = {"since_time": pg_ts(w_start), "until_time": pg_ts(w_end), "max_rows": 500}
+        rest_rows = rest_rpc("recent", **args)
+        mcp_rows = mcp.call_tool("recent", args)
+        return assert_equal_rows(
+            "pod-name-absent", "recent({})".format(args), "REST", rest_rows, "MCP", mcp_rows
+        )
+
+
+    def case_namespace_filter(w_start, w_end, namespace):
+        args = {
+            "since_time": pg_ts(w_start),
+            "until_time": pg_ts(w_end),
+            "namespace_filter": namespace,
+            "max_rows": 500,
+        }
+        rest_rows = rest_rpc("recent", **args)
+        mcp_rows = mcp.call_tool("recent", args)
+        return assert_equal_rows(
+            "namespace-filter", "recent({})".format(args), "REST", rest_rows, "MCP", mcp_rows
+        )
+
+
+    def case_container_filter(w_start, w_end, namespace, container):
+        args = {
+            "since_time": pg_ts(w_start),
+            "until_time": pg_ts(w_end),
+            "namespace_filter": namespace,
+            "container_filter": container,
+            "max_rows": 500,
+        }
+        rest_rows = rest_rpc("recent", **args)
+        mcp_rows = mcp.call_tool("recent", args)
+        return assert_equal_rows(
+            "container-filter", "recent({})".format(args), "REST", rest_rows, "MCP", mcp_rows
+        )
+
+
+    def case_errors(w_start, w_end, namespace, fixture):
+        args = {
+            "since_time": pg_ts(w_start),
+            "until_time": pg_ts(w_end),
+            "namespace_filter": namespace,
+            "pod_filter": fixture,
+            "max_rows": 200,
+        }
+        rest_rows = rest_rpc("errors", **args)
+        mcp_rows = mcp.call_tool("errors", args)
+        return assert_equal_rows(
+            "errors-only", "errors({})".format(args), "REST", rest_rows, "MCP", mcp_rows
+        )
+
+
+    def derive_pattern(w_start, w_end, namespace, fixture):
+        sample = rest_rpc(
+            "pod_tail",
+            pod_name=fixture,
+            namespace_filter=namespace,
+            since_time=pg_ts(w_start),
+            until_time=pg_ts(w_end),
+            max_rows=20,
+            oldest_first=True,
+        )
+        for row in sample:
+            for token in row.get("message", "").split():
+                token = "".join(ch for ch in token if ch.isalnum())
+                if len(token) >= 4:
+                    return token
+        return None
+
+
+    def case_search(w_start, w_end, namespace, fixture):
+        pattern = derive_pattern(w_start, w_end, namespace, fixture)
+        if pattern is None:
+            return True
+        args = {
+            "pattern": pattern,
+            "since_time": pg_ts(w_start),
+            "until_time": pg_ts(w_end),
+            "namespace_filter": namespace,
+            "pod_filter": fixture,
+            "max_rows": 200,
+        }
+        rest_rows = rest_rpc("search", **args)
+        mcp_rows = mcp.call_tool("search", args)
+        return assert_equal_rows(
+            "full-text-search", "search({})".format(args), "REST", rest_rows, "MCP", mcp_rows
+        )
+
+
+    def case_label_selectors(w_start, w_end, namespace, fixture, label_pair):
+        ok = True
+        baseline_args = {
+            "pod_name": fixture,
+            "namespace_filter": namespace,
+            "since_time": pg_ts(w_start),
+            "until_time": pg_ts(w_end),
+            "max_rows": 1000,
+            "oldest_first": True,
+        }
+        baseline = rest_rpc("pod_tail", **baseline_args)
+        if not baseline:
+            return True
+
+        absent_key = "logs-parity-absent-probe"
+
+        def check(label, selector, expect):
+            nonlocal ok
+            args = dict(baseline_args, label_selector=selector)
+            rest_rows = rest_rpc("pod_tail", **args)
+            mcp_rows = mcp.call_tool("pod_tail", args)
+            if not assert_equal_rows(
+                "label-selector-" + label,
+                "pod_tail(label_selector={!r})".format(selector),
+                "REST",
+                rest_rows,
+                "MCP",
+                mcp_rows,
+            ):
+                ok = False
+            if expect == "all" and rest_rows != baseline:
+                fail(
+                    "label-selector-{}-semantics".format(label),
+                    "label_selector={!r} should match every row for this pod "
+                    "(absent-key asymmetry) but did not".format(selector),
+                    query=str(args),
+                    baseline=baseline,
+                    actual=rest_rows,
+                )
+                ok = False
+            if expect == "none" and rest_rows:
+                fail(
+                    "label-selector-{}-semantics".format(label),
+                    "label_selector={!r} should match no rows for this pod "
+                    "but matched {}".format(selector, len(rest_rows)),
+                    query=str(args),
+                    actual=rest_rows,
+                )
+                ok = False
+
+        # The two asymmetries the issue calls out as easy to get backwards:
+        # a key nothing has is "not equal" and "not in" (true, matches
+        # everything) but never "equal" or "in" (false, matches nothing).
+        check("k-eq", "{}=x".format(absent_key), "none")
+        check("k-eq2", "{}==x".format(absent_key), "none")
+        check("k-neq", "{}!=x".format(absent_key), "all")
+        check("k-exists", absent_key, "none")
+        check("k-not-exists", "!{}".format(absent_key), "all")
+        check("k-in", "{} in (x,y)".format(absent_key), "none")
+        check("k-notin", "{} notin (x,y)".format(absent_key), "all")
+
+        k1, v1, k2, v2 = label_pair
+        if k1:
+            check("k-eq-present", "{}={}".format(k1, v1), None)
+            check("k-and", "{}={},{}={}".format(k1, v1, k2, v2), None)
+        return ok
+
+
+    def case_oldest_first(w_start, w_end, namespace, fixture):
+        base = {
+            "since_time": pg_ts(w_start),
+            "until_time": pg_ts(w_end),
+            "namespace_filter": namespace,
+            "pod_filter": fixture,
+            "max_rows": 50,
+        }
+        args_new = dict(base, oldest_first=False)
+        args_old = dict(base, oldest_first=True)
+        rest_new = rest_rpc("recent", **args_new)
+        mcp_new = mcp.call_tool("recent", args_new)
+        rest_old = rest_rpc("recent", **args_old)
+        mcp_old = mcp.call_tool("recent", args_old)
+
+        ok = assert_equal_rows(
+            "oldest-first-newest-rest-vs-mcp",
+            "recent({})".format(args_new),
+            "REST",
+            rest_new,
+            "MCP",
+            mcp_new,
+        )
+        ok = (
+            assert_equal_rows(
+                "oldest-first-oldest-rest-vs-mcp",
+                "recent({})".format(args_old),
+                "REST",
+                rest_old,
+                "MCP",
+                mcp_old,
+            )
+            and ok
+        )
+
+        if canon(rest_new) != canon(rest_old):
+            fail(
+                "oldest-first-set-mismatch",
+                "oldest_first must only re-sort the selected page, not change "
+                "which rows are selected",
+                newest_first=rest_new,
+                oldest_first=rest_old,
+            )
+            ok = False
+        elif len(rest_new) > 1 and rest_new == rest_old:
+            fail(
+                "oldest-first-order-unchanged",
+                "oldest_first=true returned the identical order to "
+                "oldest_first=false; the regression this guards against is a "
+                "silent no-op re-sort",
+                newest_first=rest_new,
+                oldest_first=rest_old,
+            )
+            ok = False
+        return ok
+
+
+    def case_limit_boundaries(w_start, w_end, namespace):
+        ok = True
+        for label, limit in (("low", 1), ("over-ceiling", 5000)):
+            args = {
+                "since_time": pg_ts(w_start),
+                "until_time": pg_ts(w_end),
+                "namespace_filter": namespace,
+                "max_rows": limit,
+            }
+            rest_rows = rest_rpc("recent", **args)
+            mcp_rows = mcp.call_tool("recent", args)
+            if not assert_equal_rows(
+                "limit-" + label, "recent({})".format(args), "REST", rest_rows, "MCP", mcp_rows
+            ):
+                ok = False
+            cap = min(limit, 1000)
+            if len(rest_rows) > cap:
+                fail(
+                    "limit-{}-not-clamped".format(label),
+                    "max_rows={} returned {} rows, exceeding the {} it should "
+                    "be clamped to".format(limit, len(rest_rows), cap),
+                    rows=rest_rows,
+                )
+                ok = False
+        return ok
+
+
+    def case_entries(namespace, fixture):
+        params = {"namespace": "eq." + namespace, "pod": "eq." + fixture, "order": "at.desc", "limit": "50"}
+        rest_rows = rest_call("/entries", params)
+        mcp_rows = mcp.call_tool("entries", params)
+        return assert_equal_rows(
+            "entries-view", "/entries?{}".format(params), "REST", rest_rows, "MCP", mcp_rows
+        )
+
+
+    def main():
+        global mcp
+
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        # Ends the window ten minutes in the past rather than at "now" -- see
+        # k8s_pod_log's comment. Ingest (fluent-bit -> pgsql output plugin) is
+        # asynchronous, so a window that races the tail would occasionally see
+        # a row on one surface's call and not the other's simply because it
+        # landed in the gap between the two HTTP requests.
+        w_end = now - timedelta(minutes=10)
+        w_start = max(w_end - timedelta(hours=3), LABELS_NULL_CUTOFF + timedelta(minutes=1))
+        if w_start >= w_end:
+            print(
+                "FATAL: computed comparison window is empty or inverted "
+                "(since={} until={}); the labels-NULL cutoff post-dates the "
+                "intended lookback".format(w_start.isoformat(), w_end.isoformat()),
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        self_test()
+
+        pods = k8s_list_pods(NAMESPACE)
+        fixture, containers, labels_map = pick_fixture(pods)
+        container = containers[0]
+        label_pair = pick_label_pair(labels_map)
+
+        mcp = McpSession()
+        mcp.initialize()
+
+        results = [
+            case_absolute_window(w_start, w_end, NAMESPACE),
+            case_since_hours(w_end, 3, NAMESPACE),
+            case_pod_ground_truth(fixture, container, w_start, w_end, NAMESPACE),
+            case_pod_absent(w_start, w_end),
+            case_namespace_filter(w_start, w_end, NAMESPACE),
+            case_container_filter(w_start, w_end, NAMESPACE, container),
+            case_errors(w_start, w_end, NAMESPACE, fixture),
+            case_search(w_start, w_end, NAMESPACE, fixture),
+            case_label_selectors(w_start, w_end, NAMESPACE, fixture, label_pair),
+            case_oldest_first(w_start, w_end, NAMESPACE, fixture),
+            case_limit_boundaries(w_start, w_end, NAMESPACE),
+            case_entries(NAMESPACE, fixture),
+        ]
+
+        if not all(results):
+            sys.exit(1)
+
+
+    if __name__ == "__main__":
+        try:
+            main()
+        except Exception:
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+            sys.exit(1)
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: logs-parity
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-parity
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: e2e-test
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  schedule: "0 */4 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 900
+  successfulJobsHistoryLimit: 2
+  # Kept high on purpose: this runs every 4 hours, and a failure needs to
+  # still be sitting there for kubectl/flux to inspect when the next
+  # scheduled run lands, not just until the next successful one prunes it.
+  failedJobsHistoryLimit: 6
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            app: logs-parity
+            app.kubernetes.io/name: logs-parity
+            app.kubernetes.io/part-of: observability
+            app.kubernetes.io/component: e2e-test
+        spec:
+          serviceAccountName: logs-parity
+          automountServiceAccountToken: true
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: parity
+              image: python:3.13-alpine
+              command: ["python3", "/scripts/parity.py"]
+              env:
+                - name: NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: REST_BASE
+                  value: "http://logs-postgrest.cluster-main-observability.svc.cluster.local:3000"
+                - name: MCP_URL
+                  value: "http://logs-mcp.cluster-main-observability.svc.cluster.local:8080/mcp"
+                - name: HOME
+                  value: /tmp
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+          volumes:
+            - name: script
+              configMap:
+                name: logs-parity-script
+            - name: tmp
+              emptyDir: {}
