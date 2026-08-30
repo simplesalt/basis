@@ -920,8 +920,16 @@ data:
         # nothing exercised stream_filter at all.
         ok = True
         cap = 1000
+        # Deliberately a narrower window than every other case. The partition
+        # assertion below is the only one here that can catch a filter
+        # quietly dropping rows, and it cannot run on a saturated page -- over
+        # the full three hours both arms hit the cap and it never fires at
+        # all. Thirty minutes of this namespace is a few hundred rows, which
+        # is ample for the parity and purity checks and leaves the partition
+        # live rather than permanently skipped.
+        w_from = max(w_start, w_end - timedelta(minutes=30))
         base_args = {
-            "since_time": pg_ts(w_start),
+            "since_time": pg_ts(w_from),
             "until_time": pg_ts(w_end),
             "namespace_filter": namespace,
             "max_rows": cap,
