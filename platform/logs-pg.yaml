@@ -12,11 +12,30 @@
 # health-checks the cnpg HelmRelease, so the CNPG CRDs are guaranteed registered
 # before any of this reconciles.
 #
-# Note the deliberate ordering inversion: fluent-bit (the writer) lives in
-# operators/ and so reconciles BEFORE logs-pg exists. That is benign. The pgsql
-# output returns FLB_RETRY on a failed connection and the filesystem buffer
-# holds the backlog, which is exactly the designed behaviour for a database
-# that is down -- it is not a special case worth restructuring the layering for.
+# Note the ordering inversion: fluent-bit (the writer) lives in operators/ and
+# so reconciles BEFORE logs-pg exists. It is tolerable, but not free, and the
+# distinction matters:
+#
+#   At RUNTIME, out_pgsql returns FLB_RETRY on a failed flush and the
+#   filesystem buffer holds the backlog -- the designed behaviour for a
+#   database that goes down under a running fluent-bit.
+#
+#   At STARTUP it does not. out_pgsql connects during plugin init, and a
+#   refused connection there is fatal to the whole engine
+#   ("failed to initialize 'pgsql' plugin" -> "output initialization failed"),
+#   so fluent-bit CrashLoopBackOffs until logs-pg accepts connections. While it
+#   is down it ships nothing at all, including the systemd stream that has
+#   nothing to do with this database.
+#
+# The exposure is bounded rather than eliminated: the tail input's position DB
+# survives the restarts, so container logs are replayed from the node's own
+# files once fluent-bit comes up, losing only what kubelet rotated away during
+# the outage. The systemd input has no cursor DB and loses its gap outright,
+# which was already true of any fluent-bit restart before this change.
+#
+# Restructuring the layering would not fix this -- Flux ordering cannot help a
+# node that reboots while the database is down. Fixing it properly means
+# separating the systemd and container pipelines, which is not worth it yet.
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -131,6 +150,30 @@ data:
     -- positional INSERT supplying three values leaves the rest to be computed,
     -- which is exactly what generated columns do. Putting one earlier in the
     -- column order would break ingest.
+    --
+    -- fluent-bit and this Job race for the empty database on a cold start, and
+    -- CREATE TABLE IF NOT EXISTS silently loses that race: if out_pgsql gets
+    -- there first, public.logs exists as a plain unpartitioned table with only
+    -- the three columns, the statement below no-ops, and the generated columns,
+    -- the partitioning and every logs_api view are gone for the life of the
+    -- cluster -- with ingest still apparently working. relkind discriminates
+    -- the two cases exactly: 'p' is the table this file builds, 'r' is
+    -- fluent-bit's. Dropping 'r' costs only the log lines written during the
+    -- race window and makes the Job self-healing on every rerun.
+    DO $guard$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_class
+        WHERE relname = 'logs'
+          AND relnamespace = 'public'::regnamespace
+          AND relkind = 'r'
+      ) THEN
+        RAISE NOTICE 'dropping unpartitioned public.logs left by fluent-bit auto-create';
+        DROP TABLE public.logs;
+      END IF;
+    END
+    $guard$;
+
     CREATE TABLE IF NOT EXISTS public.logs (
       tag       varchar,
       "time"    timestamp,
