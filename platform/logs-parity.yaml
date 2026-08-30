@@ -191,6 +191,7 @@ data:
     K8S_CTX = ssl.create_default_context(cafile=SA_DIR + "/ca.crt")
 
     FAILURES = 0
+    COMPARISONS = []
     mcp = None
 
 
@@ -476,6 +477,14 @@ data:
 
 
     def assert_equal_rows(case, query_desc, a_label, a_rows, b_label, b_rows):
+        # Every case in this suite reaches its verdict through here, so this
+        # is the one place that can say how much evidence a green run
+        # actually rested on. Without it a run that compared twelve empty
+        # lists exits zero and looks exactly like one that compared
+        # thousands of rows -- and the first is worth nothing.
+        COMPARISONS.append(
+            (case, len(a_rows) if isinstance(a_rows, list) else -1)
+        )
         if a_rows == b_rows:
             return True
         # A surface that answers with something other than a row list has a
@@ -925,6 +934,36 @@ data:
             case_limit_boundaries(w_start, w_end, NAMESPACE),
             case_entries(NAMESPACE, fixture),
         ]
+
+        per_case = {}
+        for case, count in COMPARISONS:
+            checks, rows = per_case.get(case, (0, 0))
+            per_case[case] = (checks + 1, rows + max(count, 0))
+        print(
+            "window {} .. {}  namespace {}  fixture {}/{}".format(
+                pg_ts(w_start), pg_ts(w_end), NAMESPACE, fixture, container
+            )
+        )
+        for case in sorted(per_case):
+            checks, rows = per_case[case]
+            print("  {:<22} {:>2} checks {:>6} rows".format(case, checks, rows))
+        total_rows = sum(rows for _checks, rows in per_case.values())
+        print("  {:<22} {:>2} checks {:>6} rows".format("TOTAL", len(COMPARISONS), total_rows))
+
+        # An empty database, a broken filter that matches nothing on both
+        # surfaces, or a window that lands in a gap all produce twelve
+        # agreements over twelve empty lists. That is a passing run that
+        # tested nothing, and it must be as loud as a mismatch.
+        if total_rows == 0:
+            print(
+                "=== PARITY FAILURE: vacuous-run ===\nevery case compared zero "
+                "rows on both surfaces, so nothing was actually verified; the "
+                "window {} .. {} is empty in the database".format(
+                    pg_ts(w_start), pg_ts(w_end)
+                ),
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
         if not all(results):
             sys.exit(1)
