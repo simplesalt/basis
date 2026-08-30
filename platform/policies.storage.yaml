@@ -1,0 +1,204 @@
+---
+# Makes `resiliency.simplesalt.company/storage-tier` mean something.
+#
+# An annotation nothing reads is decoration. This policy is the consumer: it
+# turns the declared tier into actual volume behaviour at admission. The tier is
+# a statement about interruption tolerance -- the one thing an author knows that
+# a controller cannot infer -- and each value gets a different implementation.
+#
+#   ephemeral      Nothing this pod writes needs to survive the pod. Every
+#                  persistentVolumeClaim volume is replaced with a memory-backed
+#                  emptyDir, so the data never reaches a disk at all. Same shape
+#                  as the build pods.
+#
+#   blips-are-ok   The data must survive the pod but the workload tolerates the
+#                  pod going away with the node. Every PVC is pinned to the
+#                  node-local StorageClass.
+#
+#   replicated     The workload requires a filesystem that survives losing the
+#                  node. This cluster has no such storage, so the pod is denied
+#                  rather than being silently given something weaker.
+#
+# blips-are-ok is the default and needs no annotation: local-path is the only
+# StorageClass here and it is already the cluster default, so the pinning rule is
+# unconditional. It exists to hold that behaviour still if the default ever
+# changes, not to make authors restate it. Annotating is only required to leave
+# the default -- and `replicated` is a way of leaving it that fails loudly, which
+# is the honest version of "do not reboot the node under me". Nothing here can
+# survive a reboot, so nothing gets to claim it can.
+#
+# The ephemeral size is a flat 100Mi default with an explicit per-pod override
+# via `resiliency.simplesalt.company/ephemeral-size`. It deliberately does NOT
+# inherit the PVC's request. tmpfs pages are charged to the pod's own memory
+# cgroup, so a memory-backed emptyDir sized from the PVC request would count
+# against the container's memory limit and OOMKill it. The existing PVC requests
+# total 28Gi against 30.5GiB of node memory; sizing from them is not merely
+# wrong, it is impossible.
+#
+# An unrecognised tier value is denied. Without that rule a typo
+# ("ephemerall") reads as "no annotation", which is the default tier -- the
+# failure mode would be a workload silently getting durable disk when the author
+# asked for memory.
+#
+# This is a no-op against everything currently running. The mutate rules fire
+# only on pods that opt in, and nothing does yet; the deny rules fire only on
+# values nothing currently sets. The one unconditional rule sets the
+# storageClassName that the cluster default would have supplied anyway, and only
+# on CREATE, so no bound volume is touched.
+#
+# failurePolicy is deliberately Ignore, for the same reason as
+# policies.secrets.yaml: a Kyverno outage should not become an outage of every
+# pod and PVC write in the cluster. This is governance, not an availability
+# dependency.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: storage-tier
+  labels:
+    app.kubernetes.io/name: storage-tier
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: storage
+  annotations:
+    policies.kyverno.io/title: Implement storage-tier
+    policies.kyverno.io/category: Resiliency
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod, PersistentVolumeClaim
+    policies.kyverno.io/description: >-
+      Implements the resiliency.simplesalt.company/storage-tier declaration.
+      `ephemeral` replaces every PVC volume on the pod with a memory-backed
+      emptyDir so nothing is written to disk. `blips-are-ok` (the default) pins
+      PVCs to the node-local StorageClass. `replicated` is denied, because this
+      cluster provides no storage that survives losing the node.
+spec:
+  background: true
+  webhookConfiguration:
+    failurePolicy: Ignore
+  rules:
+    - name: reject-unknown-storage-tier
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+                - UPDATE
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."resiliency.simplesalt.company/storage-tier" || '''' }}'
+            operator: NotEquals
+            value: ""
+      validate:
+        failureAction: Enforce
+        message: >-
+          resiliency.simplesalt.company/storage-tier must be one of ephemeral,
+          blips-are-ok, or replicated. Omit it entirely to get blips-are-ok,
+          which is the default tier for this cluster.
+        deny:
+          conditions:
+            all:
+              - key: '{{ request.object.metadata.annotations."resiliency.simplesalt.company/storage-tier" }}'
+                operator: AnyNotIn
+                value:
+                  - ephemeral
+                  - blips-are-ok
+                  - replicated
+
+    - name: reject-replicated-pods
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+                - UPDATE
+      validate:
+        failureAction: Enforce
+        message: >-
+          This pod declares storage-tier replicated, but this cluster has no
+          replicated filesystem. Every StorageClass here is node-local, so a
+          volume does not survive losing the node that holds it. Either move the
+          durability requirement into the application layer (as the CNPG
+          clusters do) and declare blips-are-ok, or do not schedule this
+          workload here.
+        deny:
+          conditions:
+            all:
+              - key: '{{ request.object.metadata.annotations."resiliency.simplesalt.company/storage-tier" || '''' }}'
+                operator: Equals
+                value: replicated
+
+    - name: reject-replicated-workloads
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - StatefulSet
+                - DaemonSet
+                - Job
+                - CronJob
+              operations:
+                - CREATE
+                - UPDATE
+      validate:
+        failureAction: Enforce
+        message: >-
+          This workload's pod template declares storage-tier replicated, but
+          this cluster has no replicated filesystem. Every StorageClass here is
+          node-local, so a volume does not survive losing the node that holds
+          it. Either move the durability requirement into the application layer
+          (as the CNPG clusters do) and declare blips-are-ok, or do not schedule
+          this workload here.
+        deny:
+          conditions:
+            all:
+              - key: '{{ request.object.spec.template.metadata.annotations."resiliency.simplesalt.company/storage-tier" || request.object.spec.jobTemplate.spec.template.metadata.annotations."resiliency.simplesalt.company/storage-tier" || '''' }}'
+                operator: Equals
+                value: replicated
+
+    - name: ephemeral-volumes-to-memory
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."resiliency.simplesalt.company/storage-tier" || '''' }}'
+            operator: Equals
+            value: ephemeral
+      mutate:
+        foreach:
+          - list: request.object.spec.volumes[?persistentVolumeClaim]
+            patchStrategicMerge:
+              spec:
+                volumes:
+                  - name: '{{ element.name }}'
+                    emptyDir:
+                      medium: Memory
+                      sizeLimit: '{{ request.object.metadata.annotations."resiliency.simplesalt.company/ephemeral-size" || ''100Mi'' }}'
+                    persistentVolumeClaim: null
+
+    - name: pin-node-local-storage-class
+      match:
+        any:
+          - resources:
+              kinds:
+                - PersistentVolumeClaim
+              operations:
+                - CREATE
+      preconditions:
+        all:
+          - key: '{{ request.object.spec.storageClassName || '''' }}'
+            operator: Equals
+            value: ""
+      mutate:
+        patchStrategicMerge:
+          spec:
+            storageClassName: local-path

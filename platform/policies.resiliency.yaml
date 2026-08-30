@@ -1,0 +1,190 @@
+---
+# Cluster-wide resiliency governance for CNPG Clusters.
+#
+# This is the declarer half of the storage-tier pair. policies.storage.yaml
+# implements the three tiers against pods and PVCs; this file decides what tier
+# a CNPG Cluster's generated objects carry, and governs the rest of a Cluster's
+# resiliency configuration alongside it. It is expected to keep growing -- new
+# CNPG resiliency rules belong here rather than in a new file, so there is one
+# place that answers "what does this cluster require of a database".
+#
+# The tier is mutated in, not required. Requiring it would mean hand-annotating
+# every Cluster manifest and would freeze every existing one: Kyverno matches
+# UPDATE as well as CREATE, so a live object missing a required annotation
+# cannot be updated at all -- including by the CNPG operator itself. Defaulting
+# it through spec.inheritedMetadata instead means the declaration exists on
+# every generated pod and PVC without anyone writing it, and an author who wants
+# a different tier just sets it and the mutation stands aside.
+#
+# spec.inheritedMetadata is CNPG's own propagation mechanism ("metadata that
+# will be inherited by all objects related to the Cluster"). It is the reason
+# this works at all: CNPG does not copy a Cluster's own top-level annotations
+# onto the PVCs and pods it generates, so annotating the Cluster directly would
+# put the declaration somewhere policies.storage.yaml never looks.
+#
+# blips-are-ok is the right default for a database here specifically because
+# resiliency lives at the application layer. Postgres replicates; the filesystem
+# does not have to. A CNPG Cluster losing a pod is a failover, not a data loss
+# -- which is exactly the claim blips-are-ok makes.
+#
+# backup-tier is optional and unset means unstated, not none. It is an attribute
+# of the individual database, not of the cluster: whether a given Postgres
+# instance ships WAL off-box is a property of what that database holds. The only
+# rules here are that a stated value is one of the three known ones, and that
+# `cloud` is not claimed without an actual backup target configured -- an
+# annotation asserting off-site backup with nothing behind it is worse than no
+# annotation, because it will be believed.
+#
+# The instances rule is Audit on purpose. Every CNPG Cluster here runs
+# instances: 1 because there is one node; a second replica would be
+# unschedulable, so enforcing HA now would break the databases to satisfy a
+# policy. Audit means it shows up in PolicyReports as the standing record of
+# what is outstanding. It flips to Enforce, alongside a mutation raising
+# instances and adding anti-affinity, when the second node exists.
+#
+# failurePolicy is Ignore for the same reason as the other policy files here: a
+# Kyverno outage should not block database reconciliation.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: cnpg-resiliency
+  labels:
+    app.kubernetes.io/name: cnpg-resiliency
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: storage
+  annotations:
+    policies.kyverno.io/title: CNPG resiliency governance
+    policies.kyverno.io/category: Resiliency
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Cluster
+    policies.kyverno.io/description: >-
+      Governs resiliency configuration on CloudNativePG Clusters. Defaults
+      spec.inheritedMetadata so every generated pod and PVC declares
+      storage-tier blips-are-ok, validates the optional backup-tier annotation
+      and refuses an unbacked claim of cloud backup, and audits single-instance
+      Clusters pending the second node.
+spec:
+  background: true
+  webhookConfiguration:
+    failurePolicy: Ignore
+  rules:
+    - name: default-storage-tier
+      match:
+        any:
+          - resources:
+              kinds:
+                - postgresql.cnpg.io/v1/Cluster
+              operations:
+                - CREATE
+                - UPDATE
+      mutate:
+        patchStrategicMerge:
+          spec:
+            inheritedMetadata:
+              annotations:
+                +(resiliency.simplesalt.company/storage-tier): blips-are-ok
+
+    - name: reject-replicated-storage-tier
+      match:
+        any:
+          - resources:
+              kinds:
+                - postgresql.cnpg.io/v1/Cluster
+              operations:
+                - CREATE
+                - UPDATE
+      validate:
+        failureAction: Enforce
+        message: >-
+          This Cluster asks for storage-tier replicated, but this cluster has no
+          replicated filesystem -- every StorageClass here is node-local.
+          Postgres provides its own durability through replication, so a CNPG
+          Cluster should declare blips-are-ok and carry the resiliency in the
+          application layer.
+        deny:
+          conditions:
+            all:
+              - key: '{{ request.object.spec.inheritedMetadata.annotations."resiliency.simplesalt.company/storage-tier" || '''' }}'
+                operator: Equals
+                value: replicated
+
+    - name: reject-unknown-backup-tier
+      match:
+        any:
+          - resources:
+              kinds:
+                - postgresql.cnpg.io/v1/Cluster
+              operations:
+                - CREATE
+                - UPDATE
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."resiliency.simplesalt.company/backup-tier" || '''' }}'
+            operator: NotEquals
+            value: ""
+      validate:
+        failureAction: Enforce
+        message: >-
+          resiliency.simplesalt.company/backup-tier must be one of none, local,
+          or cloud. The annotation is optional -- omit it rather than guessing.
+        deny:
+          conditions:
+            all:
+              - key: '{{ request.object.metadata.annotations."resiliency.simplesalt.company/backup-tier" }}'
+                operator: AnyNotIn
+                value:
+                  - none
+                  - local
+                  - cloud
+
+    - name: cloud-backup-tier-needs-a-target
+      match:
+        any:
+          - resources:
+              kinds:
+                - postgresql.cnpg.io/v1/Cluster
+              operations:
+                - CREATE
+                - UPDATE
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."resiliency.simplesalt.company/backup-tier" || '''' }}'
+            operator: Equals
+            value: cloud
+      validate:
+        failureAction: Enforce
+        message: >-
+          This Cluster claims backup-tier cloud but configures no backup target.
+          An annotation asserting off-site backup with nothing behind it is
+          worse than no annotation, because it will be believed. Configure
+          spec.backup, or state the tier this database actually has.
+        deny:
+          conditions:
+            all:
+              - key: '{{ request.object.spec.backup || '''' }}'
+                operator: Equals
+                value: ""
+
+    - name: audit-single-instance
+      match:
+        any:
+          - resources:
+              kinds:
+                - postgresql.cnpg.io/v1/Cluster
+              operations:
+                - CREATE
+                - UPDATE
+      validate:
+        failureAction: Audit
+        message: >-
+          This Cluster runs a single instance, so a node reboot is an outage
+          rather than a failover. Expected while the cluster has one node; this
+          report is the standing record of what the second node unblocks.
+        deny:
+          conditions:
+            all:
+              - key: '{{ request.object.spec.instances || `1` }}'
+                operator: LessThan
+                value: 2

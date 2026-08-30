@@ -10,7 +10,9 @@ resources:
   - logs-pg.yaml
   - mcp-flux.yaml
   - policies.cleanup.yaml
+  - policies.resiliency.yaml
   - policies.secrets.yaml
+  - policies.storage.yaml
 
 # A generator rather than a checked-in ConfigMap manifest, for the name hash:
 # kustomize suffixes the ConfigMap name with a hash of its contents and rewrites
