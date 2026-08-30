@@ -231,15 +231,60 @@ data:
     -- call; those rely on the time predicate to narrow the scan first.
     CREATE INDEX IF NOT EXISTS logs_labels_idx ON public.logs USING gin (labels);
 
+    -- pvc_bytes and size_frac are new parameters, and the output now carries a
+    -- bytes column alongside action/partition_name -- both an argument-list
+    -- and a return-type change, neither of which CREATE OR REPLACE can apply
+    -- to an existing function. The old two-argument signature has to be named
+    -- and dropped explicitly first, exactly as the logs_api functions below
+    -- do it.
+    DROP FUNCTION IF EXISTS logs_maint.rotate(int, int);
+
+    -- Age-based and size-based retention share one function because they
+    -- share one decision (which partition dies next) and one invariant: drop
+    -- whole partitions, never DELETE rows (see the comment above CREATE TABLE
+    -- public.logs). Splitting size eviction into a second function and a
+    -- second CronJob would just race this one over which partition to drop.
+    --
+    -- pvc_bytes is the CNPG-managed PVC's declared capacity in bytes, and is
+    -- deliberately NOT looked up in here. Two ways exist to learn a size from
+    -- inside Postgres, and neither is reachable from this function's
+    -- execution context: pg_stat_file()/pg_ls_dir() over the data directory
+    -- are REVOKEd from PUBLIC by default and grantable only to pg_monitor or
+    -- roles with superuser-adjacent privilege, and COPY ... TO/FROM PROGRAM
+    -- needs pg_execute_server_program -- both are memberships the
+    -- non-superuser `logs` app role does not have, and postInitApplicationSQL
+    -- (the only place that could grant them) runs once at bootstrap and
+    -- cannot be edited into a cluster that has already bootstrapped. The
+    -- CronJob below instead reads status.capacity.storage from the Kubernetes
+    -- API -- the same value CNPG itself manages -- and passes it in as an
+    -- argument. When it is NULL (lookup failed, or a manual
+    -- `SELECT logs_maint.rotate()` call such as the one this file issues
+    -- during schema apply), the size cap is simply skipped and only the
+    -- age-based retention below runs, which is what makes this degrade
+    -- gracefully instead of blocking rotation.
+    --
+    -- The usage measure compared against that budget is pg_database_size(),
+    -- not a filesystem stat: it is reachable from an unprivileged role with
+    -- no grants at all, and it is exactly the quantity partition drops
+    -- shrink. Its one known gap is WAL, which pg_database_size() does not
+    -- count; this cluster has no explicit wal_keep_size override, so that gap
+    -- is bounded only by max_wal_size / checkpoint behaviour -- small next to
+    -- a 3/4 threshold on a multi-GiB PVC, but worth naming rather than
+    -- silently assuming away.
     CREATE OR REPLACE FUNCTION logs_maint.rotate(
-      ahead_days  int DEFAULT 7,
-      retain_days int DEFAULT 14
-    ) RETURNS TABLE (action text, partition_name text)
+      ahead_days  int     DEFAULT 7,
+      retain_days int     DEFAULT 14,
+      pvc_bytes   bigint  DEFAULT NULL,
+      size_frac   numeric DEFAULT 0.75
+    ) RETURNS TABLE (action text, partition_name text, bytes bigint)
     LANGUAGE plpgsql AS $rotate$
     DECLARE
-      d      date;
-      nm     text;
-      cutoff date;
+      d       date;
+      nm      text;
+      cutoff  date;
+      freed   bigint;
+      db_size bigint;
+      budget  bigint;
     BEGIN
       FOR d IN
         SELECT generate_series(current_date, current_date + ahead_days, '1 day')::date
@@ -254,10 +299,14 @@ data:
             nm, d, d + 1);
           action := 'created';
           partition_name := nm;
+          bytes := NULL;
           RETURN NEXT;
         END IF;
       END LOOP;
 
+      -- Oldest first, same as the size-cap loop below, so both mechanisms are
+      -- deterministic about which partition goes first on a run where they
+      -- overlap.
       cutoff := current_date - retain_days;
       FOR nm IN
         SELECT c.relname
@@ -266,12 +315,63 @@ data:
         WHERE i.inhparent = 'public.logs'::regclass
           AND c.relname ~ '^logs_p[0-9]{8}$'
           AND to_date(right(c.relname, 8), 'YYYYMMDD') < cutoff
+        ORDER BY c.relname
       LOOP
+        -- Measured before the DROP: the relation has to still exist to size it.
+        freed := pg_total_relation_size(format('public.%I', nm)::regclass);
         EXECUTE format('DROP TABLE public.%I', nm);
+        RAISE NOTICE 'logs_maint.rotate: dropped % (age retention, % bytes freed)', nm, freed;
         action := 'dropped';
         partition_name := nm;
+        bytes := freed;
         RETURN NEXT;
       END LOOP;
+
+      -- Size-based eviction: keep dropping the single oldest PAST partition
+      -- while the database is still over size_frac of the PVC, re-measuring
+      -- db_size after every drop rather than computing a target count once.
+      -- current_date itself is excluded (to_date(...) < current_date, strict)
+      -- so an ingest burst can never cause today's own partition to be
+      -- dropped out from under fluent-bit. This is still a DROP TABLE, same
+      -- as age-based retention above -- size never demotes that into a
+      -- row-level DELETE.
+      IF pvc_bytes IS NOT NULL THEN
+        budget := (pvc_bytes * size_frac)::bigint;
+        db_size := pg_database_size(current_database());
+
+        WHILE db_size > budget LOOP
+          SELECT c.relname INTO nm
+          FROM pg_class c
+          JOIN pg_inherits i ON i.inhrelid = c.oid
+          WHERE i.inhparent = 'public.logs'::regclass
+            AND c.relname ~ '^logs_p[0-9]{8}$'
+            AND to_date(right(c.relname, 8), 'YYYYMMDD') < current_date
+          ORDER BY c.relname
+          LIMIT 1;
+
+          -- Nothing left to drop: logs_default and/or today's partition are
+          -- the only ones remaining, and both are protected. Warn loudly
+          -- rather than loop forever or fail silently -- an operator needs to
+          -- know retain_days or the PVC size itself need to change.
+          EXIT WHEN nm IS NULL;
+
+          freed := pg_total_relation_size(format('public.%I', nm)::regclass);
+          EXECUTE format('DROP TABLE public.%I', nm);
+          RAISE WARNING 'logs_maint.rotate: % bytes > % byte budget (% bytes PVC x %) -- dropped % early (% bytes freed)',
+            db_size, budget, pvc_bytes, size_frac, nm, freed;
+          action := 'dropped_size_cap';
+          partition_name := nm;
+          bytes := freed;
+          RETURN NEXT;
+
+          db_size := pg_database_size(current_database());
+        END LOOP;
+
+        IF db_size > budget THEN
+          RAISE WARNING 'logs_maint.rotate: still % bytes > % byte budget after dropping every eligible partition -- only logs_default and/or today''s partition remain',
+            db_size, budget;
+        END IF;
+      END IF;
     END;
     $rotate$;
 
@@ -761,6 +861,72 @@ spec:
         - name: tmp
           emptyDir: {}
 ---
+# RBAC for logs-pg-rotate's PVC-capacity lookup only: `get` on exactly the one
+# named PVC CNPG manages for this Cluster's single instance, nothing broader.
+# rotate() needs the PVC's declared capacity to size its 3/4 threshold
+# against, and the alternative -- reading real filesystem usage from inside
+# Postgres -- is not reachable at all from the non-superuser `logs` role (see
+# the comment above logs_maint.rotate() in the ConfigMap above). The
+# Kubernetes API is therefore the only avenue, so this identity trades "no
+# cluster access" for "read one PVC's status field", not for anything wider.
+#
+# resourceNames pins this to logs-pg-1, the PVC name CNPG derives from
+# instances: 1 above. Scaling instances out (see the comment on that field)
+# would add logs-pg-2 etc., which would need adding here too -- but rotate()
+# only ever measures and acts on the primary it is connected to, so a single
+# resourceName matches the current design regardless.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: logs-pg-rotate
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-pg-rotate
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: database
+    entity: cluster
+    env: main
+    capability: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: logs-pg-rotate-pvc-reader
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-pg-rotate
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: database
+    entity: cluster
+    env: main
+    capability: observability
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    resourceNames: ["logs-pg-1"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: logs-pg-rotate-pvc-reader
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-pg-rotate
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: database
+    entity: cluster
+    env: main
+    capability: observability
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: logs-pg-rotate-pvc-reader
+subjects:
+  - kind: ServiceAccount
+    name: logs-pg-rotate
+    namespace: cluster-main-observability
+---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -796,16 +962,132 @@ spec:
             capability: observability
         spec:
           restartPolicy: OnFailure
+          # Scoped to the PVC-capacity read only (see the Role above) --
+          # nothing else in this pod touches the Kubernetes API.
+          serviceAccountName: logs-pg-rotate
+          initContainers:
+            # Never hardcode the PVC size: storage.size above is the request,
+            # not necessarily what CNPG ends up with after a resize, so this
+            # reads status.capacity.storage from the live PVC on every run
+            # instead of trusting a copy of the number kept in two places.
+            - name: pvc-capacity
+              image: ghcr.io/cloudnative-pg/postgresql:17
+              # Non-fatal by design: `|| true` on the python3 invocation and
+              # the trailing `exit 0` mean any failure here -- RBAC denial,
+              # API server unreachable, an unexpected response shape -- leaves
+              # /tmp/pvc_bytes empty rather than failing the Job. The psql
+              # container below treats an empty file as "no size cap this
+              # run", which is exactly the degradation this is designed to
+              # produce: age-based retention still runs unconditionally.
+              command:
+                - sh
+                - -c
+                - |
+                  python3 - <<'PYEOF' >/tmp/pvc_bytes 2>/tmp/pvc_bytes.err || true
+                  # Reads this Cluster's own PVC capacity via the in-cluster
+                  # Kubernetes API, using the ServiceAccount token every pod
+                  # has auto-mounted -- the same access pattern mcp-flux.yaml
+                  # uses to reach the API from inside the cluster. python3 is
+                  # present in this image because the bare `:17` tag used
+                  # throughout this file resolves to the deprecated `system`
+                  # build (see cloudnative-pg/postgres-containers), which
+                  # installs python3-pip/python3-psycopg2 to support
+                  # barman-cloud; the newer minimal/standard image types would
+                  # not carry it, so switching imageName later would need
+                  # revisiting this too.
+                  import json, pathlib, ssl, urllib.request
+
+                  NAMESPACE = "cluster-main-observability"
+                  PVC_NAME = "logs-pg-1"
+
+                  # Binary (Ki/Mi/Gi/...) suffixes only: that is what CNPG
+                  # writes into storage.size and what status.capacity.storage
+                  # echoes back, so decimal (K/M/G) suffixes are deliberately
+                  # not handled.
+                  UNITS = {
+                      "Ki": 1024, "Mi": 1024 ** 2, "Gi": 1024 ** 3,
+                      "Ti": 1024 ** 4, "Pi": 1024 ** 5, "Ei": 1024 ** 6,
+                  }
+
+                  def to_bytes(quantity):
+                      for suffix, mult in UNITS.items():
+                          if quantity.endswith(suffix):
+                              return int(float(quantity[:-len(suffix)]) * mult)
+                      return int(quantity)
+
+                  token = pathlib.Path(
+                      "/var/run/secrets/kubernetes.io/serviceaccount/token"
+                  ).read_text().strip()
+                  ctx = ssl.create_default_context(
+                      cafile="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+                  )
+                  url = (
+                      "https://kubernetes.default.svc/api/v1/namespaces/"
+                      f"{NAMESPACE}/persistentvolumeclaims/{PVC_NAME}"
+                  )
+                  req = urllib.request.Request(
+                      url, headers={"Authorization": f"Bearer {token}"}
+                  )
+                  with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+                      pvc = json.load(resp)
+                  quantity = pvc["status"]["capacity"]["storage"]
+                  print(to_bytes(quantity), end="")
+                  PYEOF
+                  if [ -s /tmp/pvc_bytes.err ]; then
+                    echo "pvc-capacity: lookup failed, rotate() will skip the size cap this run:" >&2
+                    cat /tmp/pvc_bytes.err >&2
+                  fi
+                  exit 0
+              env:
+                - name: HOME
+                  value: /tmp
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  memory: 128Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
           containers:
             - name: psql
               image: ghcr.io/cloudnative-pg/postgresql:17
+              # A shell wrapper rather than a fixed argument list: pvc_bytes
+              # is only known if the initContainer above succeeded, and psql
+              # has no conditional-argument syntax of its own. PVC_BYTES is
+              # re-validated as all-digits here rather than trusted just
+              # because the initContainer wrote it, so a corrupt or truncated
+              # file falls back to the no-size-cap call instead of feeding
+              # anything unexpected into `:pvc_bytes`, which psql substitutes
+              # unquoted into the SQL text.
               command:
-                - psql
-                - -v
-                - ON_ERROR_STOP=1
+                - sh
                 - -c
-                - SELECT * FROM logs_maint.rotate()
-                - $(DATABASE_URL)
+                - |
+                  PVC_BYTES=""
+                  if [ -s /tmp/pvc_bytes ]; then
+                    PVC_BYTES=$(cat /tmp/pvc_bytes)
+                  fi
+                  case "$PVC_BYTES" in
+                    ''|*[!0-9]*) PVC_BYTES="" ;;
+                  esac
+                  if [ -n "$PVC_BYTES" ]; then
+                    exec psql -v ON_ERROR_STOP=1 -v pvc_bytes="$PVC_BYTES" \
+                      -c "SELECT * FROM logs_maint.rotate(pvc_bytes => :pvc_bytes)" \
+                      "$DATABASE_URL"
+                  else
+                    exec psql -v ON_ERROR_STOP=1 \
+                      -c "SELECT * FROM logs_maint.rotate()" \
+                      "$DATABASE_URL"
+                  fi
               env:
                 - name: DATABASE_URL
                   valueFrom:
