@@ -12,10 +12,10 @@
 #
 # So the semantic layer is still authored exactly once, as SQL in git, and no
 # tool description is written by hand anywhere. But the third step is NOT live:
-# it runs at commit time and its output is committed as logs-mcp-openapi.yaml.
-# Adding a stored query in logs-pg.yaml therefore requires regenerating that
-# file in the same commit. Skipping it does not break anything loudly -- the
-# new query simply never appears as a tool.
+# it runs at commit time and its output is committed as
+# logs-openapi.generated.json. Adding a stored query in logs-pg.yaml therefore
+# requires regenerating that file in the same commit. Skipping it does not break
+# anything loudly -- the new query simply never appears as a tool.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -198,7 +198,10 @@ data:
                 # at commit time by scripts/gen-logs-openapi.py. Converting in
                 # the request path instead would mean a sidecar, an image and a
                 # build step; converting at commit time costs a regeneration
-                # step when the semantic layer changes. See logs-mcp-openapi.yaml.
+                # step when the semantic layer changes. The file arrives from
+                # the configMapGenerator in kustomization.yaml, whose name hash
+                # is what rolls this pod when the spec changes; agentgateway
+                # reads the schema once at startup and never re-reads it.
                 openapi:
                   schema:
                     file: /etc/agentgateway/spec/openapi.json

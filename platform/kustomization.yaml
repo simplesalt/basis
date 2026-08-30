@@ -7,8 +7,28 @@ resources:
   - gcp-runtime.yaml
   - human-operator.yaml
   - logs-api.yaml
-  - logs-mcp-openapi.yaml
   - logs-pg.yaml
   - mcp-flux.yaml
   - policies.cleanup.yaml
   - policies.secrets.yaml
+
+# A generator rather than a checked-in ConfigMap manifest, for the name hash:
+# kustomize suffixes the ConfigMap name with a hash of its contents and rewrites
+# the logs-mcp Deployment's volume reference to match, so regenerating the spec
+# rolls the pod. agentgateway reads its schema once at startup, so a stable name
+# would leave a new spec sitting unread in the mounted file until something
+# unrelated restarted the pod -- exactly the silent staleness the generated spec
+# exists to avoid. Flux prunes the superseded hashed ConfigMaps.
+configMapGenerator:
+  - name: logs-mcp-openapi
+    namespace: cluster-main-observability
+    files:
+      - openapi.json=logs-openapi.generated.json
+    options:
+      labels:
+        app.kubernetes.io/name: logs-mcp
+        app.kubernetes.io/part-of: observability
+        app.kubernetes.io/component: mcp-server
+        entity: cluster
+        env: main
+        capability: observability

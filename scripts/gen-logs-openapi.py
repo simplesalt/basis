@@ -13,13 +13,21 @@ the request path is what keeps the design free of an owned image and a build
 step -- agentgateway's schema source accepts a file, so the converted document
 ships in the logs-mcp ConfigMap.
 
+The output is bare JSON rather than a ConfigMap manifest because
+platform/kustomization.yaml feeds it to a configMapGenerator. That appends a
+content hash to the ConfigMap name and rewrites the Deployment's volume
+reference to match, so a regenerated spec rolls the logs-mcp pod. Emitting the
+manifest directly would keep the name stable, and agentgateway reads its schema
+once at startup -- the new spec would land in the mounted file and be ignored
+until something else happened to restart the pod.
+
 The output is a generated artifact, in the sense a lock file is. Regenerate it
 in the same commit as any change to the logs_api semantic layer in
 platform/logs-pg.yaml, or the MCP tool list silently goes stale.
 
     scripts/gen-logs-openapi.py \
         --url http://logs-postgrest.cluster-main-observability.svc.cluster.local:3000/ \
-        --configmap --out platform/logs-mcp-openapi.yaml
+        --out platform/logs-openapi.generated.json
 """
 
 import argparse
@@ -213,51 +221,12 @@ def convert(spec):
     return rewrite_refs(out)
 
 
-CONFIGMAP_HEADER = """---
-# GENERATED FILE -- DO NOT EDIT BY HAND.
-#
-#   scripts/gen-logs-openapi.py \\
-#       --url http://logs-postgrest.cluster-main-observability.svc.cluster.local:3000/ \\
-#       --configmap --out platform/logs-mcp-openapi.yaml
-#
-# PostgREST's own OpenAPI description of the logs_api semantic layer, converted
-# from the Swagger 2.0 it emits to the OpenAPI 3.0 agentgateway can parse. See
-# the script for why the conversion happens here rather than in the request
-# path. Regenerate in the same commit as any change to the logs_api schema in
-# logs-pg.yaml, or the MCP tool list silently goes stale.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: logs-mcp-openapi
-  namespace: cluster-main-observability
-  labels:
-    app.kubernetes.io/name: logs-mcp
-    app.kubernetes.io/part-of: observability
-    app.kubernetes.io/component: mcp-server
-    entity: cluster
-    env: main
-    capability: observability
-data:
-  openapi.json: |
-"""
-
-
-def as_configmap(text):
-    body = "".join(f"    {line}\n" for line in text.splitlines())
-    return CONFIGMAP_HEADER + body
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--url", help="PostgREST root URL to fetch the spec from")
     source.add_argument("--in", dest="infile", help="read a saved spec instead")
     parser.add_argument("--out", help="write here instead of stdout")
-    parser.add_argument(
-        "--configmap",
-        action="store_true",
-        help="wrap the spec in the logs-mcp-openapi ConfigMap manifest",
-    )
     args = parser.parse_args()
 
     if args.url:
@@ -269,8 +238,6 @@ def main():
 
     converted = convert(spec)
     text = json.dumps(converted, indent=2, sort_keys=True) + "\n"
-    if args.configmap:
-        text = as_configmap(text)
 
     if args.out:
         with open(args.out, "w") as handle:
