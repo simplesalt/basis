@@ -75,12 +75,18 @@ spec:
     size: 20Gi
     resizeInUseVolumes: true
 
+  # 2Gi was the original limit and it was not enough: the postgres container was
+  # OOMKilled (exit 137) five times in the first five minutes of real ingest,
+  # which took PostgREST and agentgateway down behind it. The node has 30Gi
+  # allocatable and roughly 28Gi uncommitted, so the tight limit bought nothing.
+  # A write-heavy ingest database wants room for shared_buffers, WAL buffers and
+  # the per-backend allocations of a bursty COPY/INSERT path at the same time.
   resources:
     requests:
       cpu: 100m
-      memory: 512Mi
+      memory: 1Gi
     limits:
-      memory: 2Gi
+      memory: 6Gi
 
   postgresql:
     parameters:
