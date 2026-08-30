@@ -285,6 +285,16 @@ spec:
             Name stdout
             Match host.*
             Format json_lines
+        # Timestamp_Key is deliberately absent, and adding it back breaks all
+        # ingest. The plugin does not read the timestamp from that key -- it
+        # serialises the msgpack event time INTO a JSON key of that name, then
+        # emits SELECT ... to_timestamp(CAST(value->>'<key>' AS FLOAT)) ... .
+        # Naming it "time" collided with the CRI parser's own string-valued
+        # "time" field, which survives in the record; json ->> takes the LAST
+        # duplicate key, so Postgres got an ISO8601 string and every INSERT
+        # failed with "invalid input syntax for type double precision". With
+        # Retry_Limit no_limits that retried forever and no row ever landed.
+        # The default key is "date", which nothing else in the record uses.
         [OUTPUT]
             Name pgsql
             Match kube.*
@@ -294,13 +304,20 @@ spec:
             Password ${LOGS_PG_PASSWORD}
             Database ${LOGS_PG_DATABASE}
             Table logs
-            Timestamp_Key time
             Retry_Limit no_limits
             storage.total_limit_size 5G
     tolerations:
       - effect: NoSchedule
         operator: Exists
-    volumeMounts:
+    # daemonSetVolumeMounts, not volumeMounts. The chart has no volumeMounts
+    # key at all: _pod.tpl renders daemonSetVolumeMounts when kind is DaemonSet
+    # and daemonSetVolumes alongside it. Spelling it volumeMounts silently
+    # dropped every mount below while the volumes above them were still
+    # created, so flbstate existed in the pod spec but was never mounted and
+    # both the tail position DB and the 5G filesystem buffer wrote to the
+    # container's ephemeral filesystem -- i.e. the durability this buffer
+    # exists for was not there.
+    daemonSetVolumeMounts:
       - name: varlog
         mountPath: /var/log
         readOnly: true
