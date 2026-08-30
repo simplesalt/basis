@@ -5,7 +5,7 @@ metadata:
   name: flux
   namespace: flux-system
   annotations:
-    kustomize.toolkit.fluxcd.io/prune: disabled
+    kustomize.toolkit.fluxcd.io/prune: Disabled
 spec:
   cluster:
     domain: k.famevans.win
@@ -20,6 +20,3 @@ spec:
   distribution:
     registry: ghcr.io/fluxcd
     version: 2.x
-  storage:
-    class: local-path
-    size: 10Gi
