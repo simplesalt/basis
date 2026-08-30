@@ -413,12 +413,27 @@ data:
             self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
         def call_tool(self, name, arguments):
+            # agentgateway groups an operation's parameters by their OpenAPI
+            # `in:` location, so every one of these -- they are all `in:
+            # query` in the generated spec -- has to arrive nested under
+            # "query". Sent flat they are silently dropped: the call still
+            # succeeds, isError is still false, and what comes back is an
+            # unfiltered default page. Nothing that checks only isError can
+            # see that, which is the whole reason this suite compares rows
+            # instead.
+            #
+            # None is stripped rather than sent, to match urlencode_params on
+            # the REST side -- otherwise an unset filter reaches PostgREST as
+            # the literal string "null" on one surface and not at all on the
+            # other, and the two disagree for a reason that is purely this
+            # script's doing.
+            query = {key: value for key, value in arguments.items() if value is not None}
             _status, resp_headers, body = self._post(
                 {
                     "jsonrpc": "2.0",
                     "id": self._next_id(),
                     "method": "tools/call",
-                    "params": {"name": name, "arguments": arguments},
+                    "params": {"name": name, "arguments": {"query": query}},
                 }
             )
             message = parse_mcp_body(resp_headers.get("Content-Type", ""), body)
@@ -428,9 +443,19 @@ data:
             if result.get("isError"):
                 raise RuntimeError("MCP tool {} reported isError: {}".format(name, result))
             if "structuredContent" in result:
-                return result["structuredContent"]
-            text_parts = [c["text"] for c in result.get("content", []) if c.get("type") == "text"]
-            return json.loads("".join(text_parts))
+                payload = result["structuredContent"]
+            else:
+                text_parts = [
+                    c["text"] for c in result.get("content", []) if c.get("type") == "text"
+                ]
+                payload = json.loads("".join(text_parts))
+            # MCP requires structuredContent to be a JSON object, so a tool
+            # whose response body is an array -- which is every one of these
+            # -- comes back wrapped in a single-key "data" envelope. Unwrap it
+            # so the comparison is row list against row list.
+            if isinstance(payload, dict) and list(payload) == ["data"]:
+                return payload["data"]
+            return payload
 
 
     def fail(case, reason, **context):
@@ -453,6 +478,20 @@ data:
     def assert_equal_rows(case, query_desc, a_label, a_rows, b_label, b_rows):
         if a_rows == b_rows:
             return True
+        # A surface that answers with something other than a row list has a
+        # shape problem, not a content problem, and the membership test below
+        # would only turn that into an unrelated TypeError naming neither the
+        # case nor the surface.
+        if not isinstance(a_rows, list) or not isinstance(b_rows, list):
+            fail(
+                case,
+                "{} returned {} and {} returned {}; both should be lists of rows".format(
+                    a_label, type(a_rows).__name__, b_label, type(b_rows).__name__
+                ),
+                query=query_desc,
+                **{a_label: a_rows, b_label: b_rows}
+            )
+            return False
         only_a = [row for row in a_rows if row not in b_rows]
         only_b = [row for row in b_rows if row not in a_rows]
         fail(
