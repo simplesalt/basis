@@ -6,6 +6,8 @@ resources:
   - gcp-providers.yaml
   - gcp-runtime.yaml
   - human-operator.yaml
+  - logs-api.yaml
+  - logs-pg.yaml
   - mcp-flux.yaml
   - policies.cleanup.yaml
   - policies.secrets.yaml

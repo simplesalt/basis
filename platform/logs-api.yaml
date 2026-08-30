@@ -1,0 +1,367 @@
+---
+# Read surfaces over the log store in logs-pg.yaml: PostgREST (REST + OpenAPI)
+# and agentgateway (MCP). API and MCP are the only surfaces -- there is no
+# Grafana, no dashboard, and no plan for one.
+#
+# The chain is deliberately one-directional and duplication-free:
+#
+#   COMMENT ON in logs-pg.yaml
+#     -> PostgREST renders it into its auto-generated OpenAPI description
+#       -> agentgateway copies it into MCP tool + parameter descriptions
+#
+# So the semantic layer is authored exactly once, as SQL in git. Adding a
+# stored query in logs-pg.yaml makes it appear as an MCP tool with no change to
+# anything in this file.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: logs-postgrest
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-postgrest
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: api
+    entity: cluster
+    env: main
+    capability: observability
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logs-postgrest
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-postgrest
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: api
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  type: ClusterIP
+  selector:
+    app: logs-postgrest
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logs-postgrest
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-postgrest
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: api
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logs-postgrest
+  template:
+    metadata:
+      labels:
+        app: logs-postgrest
+        app.kubernetes.io/name: logs-postgrest
+        app.kubernetes.io/part-of: observability
+        app.kubernetes.io/component: api
+        entity: cluster
+        env: main
+        capability: observability
+    spec:
+      serviceAccountName: logs-postgrest
+      automountServiceAccountToken: false
+      containers:
+        - name: postgrest
+          image: postgrest/postgrest:v16.2
+          env:
+            # Connects as the CNPG-managed app owner, which is PostgREST's
+            # "authenticator" role. It never executes a query as that role:
+            # with DB_ANON_ROLE set and no JWT secret configured, PostgREST
+            # issues SET LOCAL ROLE logs_read for every single request and
+            # there is no code path to reach any other role. logs_read holds no
+            # write grant anywhere, so a POST/PATCH/DELETE through this surface
+            # is refused by Postgres, not by application logic.
+            - name: PGRST_DB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: logs-pg-app
+                  key: uri
+            - name: PGRST_DB_ANON_ROLE
+              value: logs_read
+            # Pins the exposed surface to the semantic layer. public.logs is
+            # readable by logs_read but is not a REST resource, so agents get
+            # the named stored queries rather than a raw table to improvise on.
+            - name: PGRST_DB_SCHEMAS
+              value: logs_api
+            - name: PGRST_SERVER_PORT
+              value: "3000"
+            # A hard ceiling under the per-function LIMITs, so an unbounded GET
+            # on logs_api.entries cannot try to serialise the whole retention
+            # window into one response.
+            - name: PGRST_DB_MAX_ROWS
+              value: "1000"
+            - name: PGRST_DB_POOL
+              value: "10"
+            # Emit COMMENT ON text as OpenAPI summary/description. This is the
+            # entire mechanism by which the semantic layer reaches MCP.
+            - name: PGRST_OPENAPI_MODE
+              value: follow-privileges
+            - name: PGRST_LOG_LEVEL
+              value: warn
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logs-mcp
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-mcp
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: mcp-server
+    entity: cluster
+    env: main
+    capability: observability
+data:
+  config.yaml: |
+    # yaml-language-server: $schema=https://agentgateway.dev/schema/config
+    binds:
+    - port: 8080
+      listeners:
+      - routes:
+        - backends:
+          - mcp:
+              targets:
+              - name: logs
+                openapi:
+                  schema:
+                    url: http://logs-postgrest.cluster-main-observability.svc.cluster.local:3000/
+                  host: logs-postgrest.cluster-main-observability.svc.cluster.local:3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logs-mcp
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-mcp
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: mcp-server
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  type: ClusterIP
+  selector:
+    app: logs-mcp
+  ports:
+    - name: mcp
+      port: 8080
+      targetPort: mcp
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logs-mcp
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-mcp
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: mcp-server
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logs-mcp
+  template:
+    metadata:
+      labels:
+        app: logs-mcp
+        app.kubernetes.io/name: logs-mcp
+        app.kubernetes.io/part-of: observability
+        app.kubernetes.io/component: mcp-server
+        entity: cluster
+        env: main
+        capability: observability
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: agentgateway
+          # agentgateway ships two deployment models. This is the standalone
+          # static-config binary, NOT the oci://ghcr.io/kgateway-dev/charts
+          # Helm path -- that one requires the Kubernetes Gateway API CRDs plus
+          # the kgateway control plane, and this cluster has zero
+          # gateway.networking.k8s.io CRDs registered. Adopting Gateway API and
+          # a control plane to serve one MCP endpoint is not proportionate.
+          image: ghcr.io/agentgateway/agentgateway:v1.5.0
+          # Not optional. If neither --file nor --config is given while
+          # KUBERNETES_SERVICE_HOST is set, the binary refuses to start rather
+          # than falling back to a default config.
+          args:
+            - -f
+            - /etc/agentgateway/config.yaml
+          ports:
+            - name: mcp
+              containerPort: 8080
+            - name: metrics
+              containerPort: 15020
+            - name: readiness
+              containerPort: 15021
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: readiness
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/agentgateway
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            # The image declares nonroot 65532 itself; restated so the pod spec
+            # is self-describing and survives an image that later drops USER.
+            runAsUser: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: config
+          configMap:
+            name: logs-mcp
+        - name: tmp
+          emptyDir: {}
+---
+# Both read surfaces are entirely unauthenticated: PostgREST has no JWT secret
+# configured and agentgateway fronts it with no auth policy. That is a
+# deliberate simplification -- authorisation is the database's job, and
+# logs_read cannot write -- but it means reachability IS the access control,
+# and these two policies are the whole of it.
+#
+# Same shape as mcp-flux-allow-internal in mcp-flux.yaml. There are ZERO
+# Ingress objects in this cluster and these do not add one; if these ever need
+# to be reachable from outside, that is Cloudflare Tunnel plus Zero Trust
+# Access, not an Ingress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: logs-mcp-allow-internal
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-mcp
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: mcp-server
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  podSelector:
+    matchLabels:
+      app: logs-mcp
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values:
+                  - ssint-main-coding
+                  - ssint-main-ai
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: logs-postgrest-allow-internal
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-postgrest
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: api
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  podSelector:
+    matchLabels:
+      app: logs-postgrest
+  policyTypes:
+    - Ingress
+  ingress:
+    # agentgateway, in this namespace. It fetches the OpenAPI description from
+    # / on a 24h TTL and proxies every tool call back through this same port,
+    # so losing this rule breaks MCP entirely, not just discovery.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: logs-mcp
+      ports:
+        - protocol: TCP
+          port: 3000
+    # Direct REST access for agents that have plain HTTP but no MCP client.
+    # This is the documented interim surface if the MCP bridge is ever pulled.
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values:
+                  - ssint-main-coding
+                  - ssint-main-ai
+      ports:
+        - protocol: TCP
+          port: 3000

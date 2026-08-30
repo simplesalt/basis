@@ -1,0 +1,526 @@
+---
+# Durable container-log store: the CNPG Cluster, its schema, and partition
+# maintenance. The read surfaces that sit on top of it are in logs-api.yaml.
+#
+# This replaces reliance on `kubectl logs` / mcp-flux get_kubernetes_logs, both
+# of which read kubelet's on-disk rotation and therefore lose everything a pod
+# emitted before its last rotation -- and everything it emitted at all, once the
+# pod is gone. Pods here are ephemeral by design, so that loss is routine.
+#
+# Lives in `platform/` rather than `operators/` because it is workload, not
+# cluster machinery: the platform Kustomization dependsOn ss-basis-operators and
+# health-checks the cnpg HelmRelease, so the CNPG CRDs are guaranteed registered
+# before any of this reconciles.
+#
+# Note the deliberate ordering inversion: fluent-bit (the writer) lives in
+# operators/ and so reconciles BEFORE logs-pg exists. That is benign. The pgsql
+# output returns FLB_RETRY on a failed connection and the filesystem buffer
+# holds the backlog, which is exactly the designed behaviour for a database
+# that is down -- it is not a special case worth restructuring the layering for.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: logs-pg
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-pg
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: database
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  # A dedicated Cluster rather than a schema inside an existing one. Log growth
+  # has a completely different shape from OLTP app data, and a bad maintenance
+  # job or an ingest burst must not be able to starve gbrain-pg / hindsight-pg /
+  # cal-pg on a shared node. CNPG Clusters are cheap; blast-radius isn't.
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:17
+
+  # Scaling out later is an integer bump here plus raising minSyncReplicas /
+  # maxSyncReplicas -- no redesign, which is the whole reason for choosing CNPG
+  # over a log store whose replication is not a knob.
+  minSyncReplicas: 0
+  maxSyncReplicas: 0
+  replicationSlots:
+    highAvailability:
+      enabled: true
+
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: restart
+  enablePDB: true
+  affinity:
+    podAntiAffinityType: preferred
+
+  storage:
+    size: 20Gi
+    resizeInUseVolumes: true
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+
+  postgresql:
+    parameters:
+      # Ingest is append-only and bursty, and every row is discarded within the
+      # retention window. Durability of the last few hundred milliseconds of log
+      # lines is worth far less than not fsync-stalling the write path, so the
+      # commit path is deliberately relaxed. Crash-safety of the DATABASE is
+      # unaffected -- only the tail of already-acknowledged commits is at risk,
+      # and fluent-bit's filesystem buffer replays that anyway.
+      synchronous_commit: "off"
+      # Partition pruning across a 21-partition parent (14 days retained + 7
+      # pre-created) needs the planner to actually attempt it at execution time.
+      enable_partitionwise_aggregate: "on"
+      max_connections: "100"
+
+  bootstrap:
+    initdb:
+      database: logs
+      owner: logs
+      # Only the genuinely privileged statements live here. postInitApplicationSQL
+      # runs exactly once, at bootstrap, as superuser -- it can never be edited
+      # into an existing cluster, so anything that needs to evolve belongs in the
+      # logs-schema Job instead. Role creation is the one thing that Job cannot
+      # do, because the CNPG-managed app owner has no CREATEROLE.
+      postInitApplicationSQL:
+        # logs_read is PostgREST's anonymous role. NOLOGIN: it is never
+        # connected to directly, only switched into via SET LOCAL ROLE. It is
+        # granted no write privilege anywhere, ever -- which is what makes a
+        # write through the read surfaces fail at the database, not at the app.
+        - CREATE ROLE logs_read NOLOGIN
+        # Lets the `logs` app role (PostgREST's authenticator) SET ROLE into it.
+        - GRANT logs_read TO logs
+        # A runaway query from an agent-authored filter must not pin a backend
+        # forever on a single-node cluster.
+        - ALTER ROLE logs_read SET statement_timeout = '30s'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logs-schema
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-schema
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: database
+    entity: cluster
+    env: main
+    capability: observability
+data:
+  # Every statement below is idempotent (IF NOT EXISTS / OR REPLACE) because the
+  # Job that applies it re-runs on every change to this file. This is the whole
+  # semantic layer: the storage shape, the retention mechanism, and the
+  # domain-specific query surface, as declarative SQL in git.
+  schema.sql: |
+    BEGIN;
+
+    CREATE SCHEMA IF NOT EXISTS logs_api;
+    CREATE SCHEMA IF NOT EXISTS logs_maint;
+
+    -- The first three columns are NOT a design choice. fluent-bit's pgsql
+    -- output runs `CREATE TABLE IF NOT EXISTS <t> (tag varchar, time timestamp,
+    -- data jsonb)` on startup and then INSERTs positionally into it. Deviate
+    -- from that shape and fluent-bit either errors on every flush or silently
+    -- creates a second, non-partitioned table alongside this one.
+    --
+    -- The generated columns are appended AFTER those three deliberately: a
+    -- positional INSERT supplying three values leaves the rest to be computed,
+    -- which is exactly what generated columns do. Putting one earlier in the
+    -- column order would break ingest.
+    CREATE TABLE IF NOT EXISTS public.logs (
+      tag       varchar,
+      "time"    timestamp,
+      data      jsonb,
+      namespace text GENERATED ALWAYS AS (data #>> '{kubernetes,namespace_name}') STORED,
+      pod       text GENERATED ALWAYS AS (data #>> '{kubernetes,pod_name}') STORED,
+      container text GENERATED ALWAYS AS (data #>> '{kubernetes,container_name}') STORED,
+      stream    text GENERATED ALWAYS AS (data ->> 'stream') STORED,
+      message   text GENERATED ALWAYS AS (data ->> 'log') STORED
+    ) PARTITION BY RANGE ("time");
+
+    -- Retention is DROP TABLE on a whole day's partition: an O(1) unlink, no
+    -- row scan, no dead tuples, no vacuum debt. A DELETE ... WHERE time < x on
+    -- a table at this write rate would generate more work than the ingest.
+    --
+    -- The default partition is a backstop so a missing daily partition can
+    -- never hard-stop ingest. It should always be empty; if rotate() has been
+    -- broken long enough for rows to land here, the next CREATE ... PARTITION OF
+    -- for that range fails loudly in the CronJob rather than losing data
+    -- quietly.
+    CREATE TABLE IF NOT EXISTS public.logs_default PARTITION OF public.logs DEFAULT;
+
+    CREATE INDEX IF NOT EXISTS logs_time_idx ON public.logs ("time" DESC);
+    CREATE INDEX IF NOT EXISTS logs_ns_time_idx ON public.logs (namespace, "time" DESC);
+    CREATE INDEX IF NOT EXISTS logs_pod_time_idx ON public.logs (pod, "time" DESC);
+
+    CREATE OR REPLACE FUNCTION logs_maint.rotate(
+      ahead_days  int DEFAULT 7,
+      retain_days int DEFAULT 14
+    ) RETURNS TABLE (action text, partition_name text)
+    LANGUAGE plpgsql AS $rotate$
+    DECLARE
+      d      date;
+      nm     text;
+      cutoff date;
+    BEGIN
+      FOR d IN
+        SELECT generate_series(current_date, current_date + ahead_days, '1 day')::date
+      LOOP
+        nm := 'logs_p' || to_char(d, 'YYYYMMDD');
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_class
+          WHERE relname = nm AND relnamespace = 'public'::regnamespace
+        ) THEN
+          EXECUTE format(
+            'CREATE TABLE public.%I PARTITION OF public.logs FOR VALUES FROM (%L) TO (%L)',
+            nm, d, d + 1);
+          action := 'created';
+          partition_name := nm;
+          RETURN NEXT;
+        END IF;
+      END LOOP;
+
+      cutoff := current_date - retain_days;
+      FOR nm IN
+        SELECT c.relname
+        FROM pg_class c
+        JOIN pg_inherits i ON i.inhrelid = c.oid
+        WHERE i.inhparent = 'public.logs'::regclass
+          AND c.relname ~ '^logs_p[0-9]{8}$'
+          AND to_date(right(c.relname, 8), 'YYYYMMDD') < cutoff
+      LOOP
+        EXECUTE format('DROP TABLE public.%I', nm);
+        action := 'dropped';
+        partition_name := nm;
+        RETURN NEXT;
+      END LOOP;
+    END;
+    $rotate$;
+
+    SELECT logs_maint.rotate();
+
+    -- ------------------------------------------------------------------
+    -- Semantic layer.
+    --
+    -- This is the part that makes an MCP surface here worth having. Postgres
+    -- is not the interesting bit -- any generic SQL-over-Postgres MCP could
+    -- hand a model raw table access and leave it to rediscover what these
+    -- columns mean and how to phrase a useful question every single time.
+    --
+    -- What follows instead is log-domain vocabulary: stored queries named for
+    -- the real-world question they answer, with COMMENT ON text that PostgREST
+    -- renders into its OpenAPI description and agentgateway then copies
+    -- verbatim into MCP tool and parameter descriptions. Editing a COMMENT
+    -- here changes what an agent reads in tools/list. There is no second copy
+    -- of these definitions anywhere.
+    --
+    -- Views are SECURITY DEFINER by default in Postgres, but the functions are
+    -- not, so logs_read is granted SELECT on public.logs directly. That is not
+    -- a widening: logs_read has no write privilege anywhere, and PGRST_DB_SCHEMAS
+    -- pins the exposed surface to logs_api, so the raw table is never a REST
+    -- resource regardless.
+    -- ------------------------------------------------------------------
+
+    CREATE OR REPLACE VIEW logs_api.entries AS
+    SELECT
+      l."time"    AS at,
+      l.namespace AS namespace,
+      l.pod       AS pod,
+      l.container AS container,
+      l.stream    AS stream,
+      l.message   AS message
+    FROM public.logs l;
+
+    COMMENT ON VIEW logs_api.entries IS
+      'Every captured container log line, newest first when ordered by "at". This is the raw feed: prefer the purpose-built endpoints (recent, errors, search, pod_tail) unless you need an arbitrary filter combination. Retention is 14 days; anything older has been dropped.';
+    COMMENT ON COLUMN logs_api.entries.at IS
+      'UTC timestamp the line was emitted, as recorded by the container runtime.';
+    COMMENT ON COLUMN logs_api.entries.namespace IS
+      'Kubernetes namespace of the pod that emitted the line, e.g. cluster-main-observability.';
+    COMMENT ON COLUMN logs_api.entries.pod IS
+      'Full pod name including the ReplicaSet/StatefulSet suffix, e.g. logs-postgrest-6d9f7c8b4-x2k9p.';
+    COMMENT ON COLUMN logs_api.entries.container IS
+      'Container name within the pod. Pods with sidecars emit interleaved lines that are only separable by this column.';
+    COMMENT ON COLUMN logs_api.entries.stream IS
+      'Either stdout or stderr. Many workloads log normal operation to stderr, so stderr alone is not an error signal.';
+    COMMENT ON COLUMN logs_api.entries.message IS
+      'The log line itself, with the container-runtime framing already stripped.';
+
+    CREATE OR REPLACE FUNCTION logs_api.recent(
+      since_minutes    int  DEFAULT 15,
+      namespace_filter text DEFAULT NULL,
+      pod_filter       text DEFAULT NULL,
+      container_filter text DEFAULT NULL,
+      max_rows         int  DEFAULT 200
+    ) RETURNS TABLE (
+      at timestamp, namespace text, pod text, container text, stream text, message text
+    ) LANGUAGE sql STABLE AS $recent$
+      SELECT l."time", l.namespace, l.pod, l.container, l.stream, l.message
+      FROM public.logs l
+      WHERE l."time" >= (now() AT TIME ZONE 'utc') - make_interval(mins => since_minutes)
+        AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
+        AND (pod_filter       IS NULL OR l.pod LIKE pod_filter || '%')
+        AND (container_filter IS NULL OR l.container = container_filter)
+      ORDER BY l."time" DESC
+      LIMIT LEAST(max_rows, 1000);
+    $recent$;
+
+    COMMENT ON FUNCTION logs_api.recent(int, text, text, text, int) IS
+      'Most recent log lines across the cluster, newest first. The general-purpose replacement for `kubectl logs` when you want a live look at what is happening right now. Unlike kubectl logs this reads durable storage, so it still works for pods that have already been deleted.';
+
+    CREATE OR REPLACE FUNCTION logs_api.errors(
+      since_minutes    int  DEFAULT 60,
+      namespace_filter text DEFAULT NULL,
+      max_rows         int  DEFAULT 200
+    ) RETURNS TABLE (
+      at timestamp, namespace text, pod text, container text, message text
+    ) LANGUAGE sql STABLE AS $errors$
+      SELECT l."time", l.namespace, l.pod, l.container, l.message
+      FROM public.logs l
+      WHERE l."time" >= (now() AT TIME ZONE 'utc') - make_interval(mins => since_minutes)
+        AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
+        AND l.message ~* '(error|fatal|panic|exception|traceback|segfault|fail(ed|ure)?)'
+      ORDER BY l."time" DESC
+      LIMIT LEAST(max_rows, 1000);
+    $errors$;
+
+    COMMENT ON FUNCTION logs_api.errors(int, text, int) IS
+      'Log lines that look like failures, newest first. Start here when triaging "something is broken" without yet knowing which workload. Matching is a case-insensitive regex over the message text (error, fatal, panic, exception, traceback, segfault, fail/failed/failure), so it over-matches on lines that merely discuss errors and misses failures phrased in other words. Treat the result as a lead, not a verdict.';
+
+    CREATE OR REPLACE FUNCTION logs_api.search(
+      pattern          text,
+      since_hours      int  DEFAULT 24,
+      namespace_filter text DEFAULT NULL,
+      max_rows         int  DEFAULT 200
+    ) RETURNS TABLE (
+      at timestamp, namespace text, pod text, container text, message text
+    ) LANGUAGE sql STABLE AS $search$
+      SELECT l."time", l.namespace, l.pod, l.container, l.message
+      FROM public.logs l
+      WHERE l."time" >= (now() AT TIME ZONE 'utc') - make_interval(hours => since_hours)
+        AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
+        AND l.message ILIKE '%' || pattern || '%'
+      ORDER BY l."time" DESC
+      LIMIT LEAST(max_rows, 1000);
+    $search$;
+
+    COMMENT ON FUNCTION logs_api.search(text, int, text, int) IS
+      'Full-text substring search across all captured log lines, newest first. Use this to trace a specific identifier -- a request id, a hostname, an error string, a git SHA -- across every workload at once, which is the thing kubectl logs fundamentally cannot do. Matching is case-insensitive substring, not regex or word-boundary.';
+
+    CREATE OR REPLACE FUNCTION logs_api.pod_tail(
+      pod_name         text,
+      max_rows         int  DEFAULT 100,
+      container_filter text DEFAULT NULL
+    ) RETURNS TABLE (
+      at timestamp, container text, stream text, message text
+    ) LANGUAGE sql STABLE AS $pod_tail$
+      SELECT l."time", l.container, l.stream, l.message
+      FROM public.logs l
+      WHERE l.pod LIKE pod_name || '%'
+        AND (container_filter IS NULL OR l.container = container_filter)
+      ORDER BY l."time" DESC
+      LIMIT LEAST(max_rows, 1000);
+    $pod_tail$;
+
+    COMMENT ON FUNCTION logs_api.pod_tail(text, int, text) IS
+      'The last N lines from one pod, newest first -- the direct equivalent of `kubectl logs --tail`, but it still returns output for pods that no longer exist. pod_name is matched as a prefix, so passing a Deployment name such as "logs-postgrest" returns lines from every replica and every past generation of it.';
+
+    CREATE OR REPLACE FUNCTION logs_api.volume(
+      since_hours int DEFAULT 24
+    ) RETURNS TABLE (
+      namespace text, container text, lines bigint, bytes bigint
+    ) LANGUAGE sql STABLE AS $volume$
+      SELECT l.namespace, l.container, count(*), sum(length(l.message))::bigint
+      FROM public.logs l
+      WHERE l."time" >= (now() AT TIME ZONE 'utc') - make_interval(hours => since_hours)
+      GROUP BY l.namespace, l.container
+      ORDER BY 3 DESC;
+    $volume$;
+
+    COMMENT ON FUNCTION logs_api.volume(int) IS
+      'Log line and byte counts grouped by namespace and container, noisiest first. Answers "what is filling the log store" -- use it to decide what to add to the collector exclude list before growing the volume, and to sanity-check retention against disk.';
+
+    CREATE OR REPLACE FUNCTION logs_api.workloads(
+      since_hours int DEFAULT 1
+    ) RETURNS TABLE (
+      namespace text, pod text, container text, last_seen timestamp
+    ) LANGUAGE sql STABLE AS $workloads$
+      SELECT l.namespace, l.pod, l.container, max(l."time")
+      FROM public.logs l
+      WHERE l."time" >= (now() AT TIME ZONE 'utc') - make_interval(hours => since_hours)
+      GROUP BY l.namespace, l.pod, l.container
+      ORDER BY 4 DESC;
+    $workloads$;
+
+    COMMENT ON FUNCTION logs_api.workloads(int) IS
+      'Every namespace/pod/container that has logged in the window, most recently active first. Call this first to discover exact pod and container names to pass to the other endpoints, rather than guessing at them.';
+
+    GRANT USAGE ON SCHEMA public   TO logs_read;
+    GRANT USAGE ON SCHEMA logs_api TO logs_read;
+    GRANT SELECT ON public.logs    TO logs_read;
+    GRANT SELECT ON ALL TABLES     IN SCHEMA logs_api TO logs_read;
+    GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA logs_api TO logs_read;
+
+    COMMIT;
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: logs-schema
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-schema
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: database
+    entity: cluster
+    env: main
+    capability: observability
+  annotations:
+    # A Job's spec is immutable, so an edit to schema.sql above would otherwise
+    # be silently ignored forever. This tells Flux to delete and recreate the
+    # Job on any change, which is what makes the semantic layer editable in git.
+    # The debris that leaves behind is what policies.cleanup.yaml's
+    # reap-orphaned-job-pods rule already exists to sweep up.
+    kustomize.toolkit.fluxcd.io/force: "enabled"
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: logs-schema
+        entity: cluster
+        env: main
+        capability: observability
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-for-db
+          image: ghcr.io/cloudnative-pg/postgresql:17
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -d "$DATABASE_URL"; do
+                echo "waiting for logs-pg"
+                sleep 3
+              done
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: logs-pg-app
+                  key: uri
+      containers:
+        - name: psql
+          image: ghcr.io/cloudnative-pg/postgresql:17
+          command:
+            - psql
+            - -v
+            - ON_ERROR_STOP=1
+            - -f
+            - /sql/schema.sql
+            - $(DATABASE_URL)
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: logs-pg-app
+                  key: uri
+            - name: HOME
+              value: /tmp
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: sql
+          configMap:
+            name: logs-schema
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: logs-pg-rotate
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: logs-pg-rotate
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: database
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  # Vanilla Postgres has no scheduler and pg_cron is an extension this cluster
+  # does not carry, so the clock lives in Kubernetes. Daily is ample: rotate()
+  # creates 7 days of partitions ahead, so ingest survives a week of this
+  # CronJob being broken before it can hit the default partition.
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: logs-pg-rotate
+            entity: cluster
+            env: main
+            capability: observability
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: psql
+              image: ghcr.io/cloudnative-pg/postgresql:17
+              command:
+                - psql
+                - -v
+                - ON_ERROR_STOP=1
+                - -c
+                - SELECT * FROM logs_maint.rotate()
+                - $(DATABASE_URL)
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: logs-pg-app
+                      key: uri
+                - name: HOME
+                  value: /tmp
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  memory: 128Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+          volumes:
+            - name: tmp
+              emptyDir: {}
