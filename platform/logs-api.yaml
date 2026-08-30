@@ -7,11 +7,15 @@
 #
 #   COMMENT ON in logs-pg.yaml
 #     -> PostgREST renders it into its auto-generated OpenAPI description
-#       -> agentgateway copies it into MCP tool + parameter descriptions
+#       -> gen-logs-openapi.py converts Swagger 2.0 to OpenAPI 3.0
+#         -> agentgateway copies it into MCP tool + parameter descriptions
 #
-# So the semantic layer is authored exactly once, as SQL in git. Adding a
-# stored query in logs-pg.yaml makes it appear as an MCP tool with no change to
-# anything in this file.
+# So the semantic layer is still authored exactly once, as SQL in git, and no
+# tool description is written by hand anywhere. But the third step is NOT live:
+# it runs at commit time and its output is committed as logs-mcp-openapi.yaml.
+# Adding a stored query in logs-pg.yaml therefore requires regenerating that
+# file in the same commit. Skipping it does not break anything loudly -- the
+# new query simply never appears as a tool.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -185,9 +189,21 @@ data:
           - mcp:
               targets:
               - name: logs
+                # Reads the spec from disk, not from PostgREST. PostgREST emits
+                # Swagger 2.0 and agentgateway parses with the openapiv3 crate,
+                # which reads 3.0 only -- pointing this at the live root made
+                # the pod exit with "paths: no variant of enum
+                # ParameterSchemaOrContent found in flattened data". The file
+                # mounted here is that same PostgREST output converted to 3.0
+                # at commit time by scripts/gen-logs-openapi.py. Converting in
+                # the request path instead would mean a sidecar, an image and a
+                # build step; converting at commit time costs a regeneration
+                # step when the semantic layer changes. See logs-mcp-openapi.yaml.
                 openapi:
                   schema:
-                    url: http://logs-postgrest.cluster-main-observability.svc.cluster.local:3000/
+                    file: /etc/agentgateway/spec/openapi.json
+                  # Still required: the converted document declares a relative
+                  # server URL, so this is what tool calls are actually sent to.
                   host: logs-postgrest.cluster-main-observability.svc.cluster.local:3000
 ---
 apiVersion: v1
@@ -271,6 +287,11 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/agentgateway
+            # A separate mount, not another key in the config ConfigMap: two
+            # ConfigMaps cannot both project into /etc/agentgateway, and the
+            # spec is generated while config.yaml above is hand-authored.
+            - name: spec
+              mountPath: /etc/agentgateway/spec
             - name: tmp
               mountPath: /tmp
           resources:
@@ -295,6 +316,9 @@ spec:
         - name: config
           configMap:
             name: logs-mcp
+        - name: spec
+          configMap:
+            name: logs-mcp-openapi
         - name: tmp
           emptyDir: {}
 ---
@@ -358,9 +382,10 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # agentgateway, in this namespace. It fetches the OpenAPI description from
-    # / on a 24h TTL and proxies every tool call back through this same port,
-    # so losing this rule breaks MCP entirely, not just discovery.
+    # agentgateway, in this namespace. It no longer fetches the spec over the
+    # network -- that is mounted from logs-mcp-openapi -- but it proxies every
+    # tool call back through this port, so losing this rule breaks every tool
+    # while leaving discovery working, which is the more confusing failure.
     - from:
         - podSelector:
             matchLabels:
