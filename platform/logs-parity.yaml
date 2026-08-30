@@ -914,6 +914,127 @@ data:
         )
 
 
+    def case_stream_filter(w_start, w_end, namespace):
+        # kubectl logs has no stream flag, but stdout-vs-stderr is the
+        # distinction this whole store was built to preserve, and until now
+        # nothing exercised stream_filter at all.
+        ok = True
+        cap = 1000
+        base_args = {
+            "since_time": pg_ts(w_start),
+            "until_time": pg_ts(w_end),
+            "namespace_filter": namespace,
+            "max_rows": cap,
+            "oldest_first": True,
+        }
+        base = rest_rpc("recent", **base_args)
+        per_stream = {}
+        for stream in ("stdout", "stderr"):
+            args = dict(base_args, stream_filter=stream)
+            rest_rows = rest_rpc("recent", **args)
+            mcp_rows = mcp.call_tool("recent", args)
+            if not assert_equal_rows(
+                "stream-filter-" + stream,
+                "recent(stream_filter={!r})".format(stream),
+                "REST",
+                rest_rows,
+                "MCP",
+                mcp_rows,
+            ):
+                ok = False
+            leaked = [row for row in rest_rows if row.get("stream") != stream]
+            if leaked:
+                fail(
+                    "stream-filter-{}-purity".format(stream),
+                    "stream_filter={!r} returned {} row(s) carrying the other "
+                    "stream".format(stream, len(leaked)),
+                    query=str(args),
+                    leaked=leaked[:20],
+                )
+                ok = False
+            per_stream[stream] = rest_rows
+
+        # stdout and stderr are the only two values fluent-bit records, so
+        # the two filtered sets have to partition the unfiltered one exactly.
+        # A filter that quietly drops rows satisfies both checks above and
+        # fails only here. A saturated page cannot be summed, so say so
+        # rather than assert something the row cap already invalidated.
+        total = len(per_stream["stdout"]) + len(per_stream["stderr"])
+        if max(len(base), total) >= cap:
+            print("  (stream partition not asserted: a page hit the {}-row cap)".format(cap))
+        elif total != len(base):
+            fail(
+                "stream-filter-partition",
+                "stdout ({}) + stderr ({}) = {}, but the same window "
+                "unfiltered returned {}".format(
+                    len(per_stream["stdout"]), len(per_stream["stderr"]), total, len(base)
+                ),
+                query=str(base_args),
+            )
+            ok = False
+        return ok
+
+
+    def case_cross_namespace(w_start, w_end, namespace):
+        # Every other case is pinned to this Job's own namespace, because the
+        # kubectl-logs ground truth needs pods/log and the Role granting it is
+        # deliberately namespace-scoped. The REST and MCP surfaces carry no
+        # such limit, and the busiest containers in the cluster -- where
+        # ordering and paging defects would actually show themselves -- are
+        # all somewhere else. This reaches them without asking for
+        # cluster-wide log read.
+        ok = True
+        args = {"since_time": pg_ts(w_start), "until_time": pg_ts(w_end)}
+        rest_vol = rest_rpc("volume", **args)
+        mcp_vol = mcp.call_tool("volume", args)
+        if not assert_equal_rows(
+            "volume-rest-vs-mcp", "volume({})".format(args), "REST", rest_vol, "MCP", mcp_vol
+        ):
+            ok = False
+
+        elsewhere = [row for row in rest_vol if row.get("namespace") != namespace]
+        if not elsewhere:
+            return ok
+        busiest = max(elsewhere, key=lambda row: row.get("lines") or 0)
+        busy_args = {
+            "since_time": pg_ts(w_start),
+            "until_time": pg_ts(w_end),
+            "namespace_filter": busiest["namespace"],
+            "container_filter": busiest["container"],
+            "max_rows": 1000,
+            "oldest_first": False,
+        }
+        rest_rows = rest_rpc("recent", **busy_args)
+        mcp_rows = mcp.call_tool("recent", busy_args)
+        if not assert_equal_rows(
+            "cross-namespace-busiest",
+            "recent({})".format(busy_args),
+            "REST",
+            rest_rows,
+            "MCP",
+            mcp_rows,
+        ):
+            ok = False
+        leaked = [
+            row
+            for row in rest_rows
+            if row.get("namespace") != busiest["namespace"]
+            or row.get("container") != busiest["container"]
+        ]
+        if leaked:
+            fail(
+                "cross-namespace-purity",
+                "namespace_filter={!r} container_filter={!r} returned {} row(s) "
+                "matching neither".format(
+                    busiest["namespace"], busiest["container"], len(leaked)
+                ),
+                query=str(busy_args),
+                leaked=leaked[:20],
+            )
+            ok = False
+        return ok
+
+
     def main():
         global mcp
 
@@ -957,6 +1078,8 @@ data:
             case_oldest_first(w_start, w_end, NAMESPACE, fixture),
             case_limit_boundaries(w_start, w_end, NAMESPACE),
             case_entries(NAMESPACE, fixture),
+            case_stream_filter(w_start, w_end, NAMESPACE),
+            case_cross_namespace(w_start, w_end, NAMESPACE),
         ]
 
         per_case = {}
