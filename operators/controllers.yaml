@@ -278,7 +278,16 @@ spec:
             Keep_Log On
             K8S-Logging.Parser On
             K8S-Logging.Exclude On
-            Labels Off
+            # Labels are what makes `-l app=foo` possible against the log store,
+            # so they are worth their weight on every record: without them a
+            # workload can only be addressed by the pod-name prefix, which
+            # changes on every ReplicaSet roll. public.logs promotes them to a
+            # generated jsonb column with a GIN index over it.
+            #
+            # Annotations stay off. They carry
+            # kubectl.kubernetes.io/last-applied-configuration, which is an
+            # entire serialised manifest attached to every single log line.
+            Labels On
             Annotations Off
       outputs: |
         [OUTPUT]

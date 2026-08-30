@@ -188,8 +188,23 @@ data:
       pod       text GENERATED ALWAYS AS (data #>> '{kubernetes,pod_name}') STORED,
       container text GENERATED ALWAYS AS (data #>> '{kubernetes,container_name}') STORED,
       stream    text GENERATED ALWAYS AS (data ->> 'stream') STORED,
-      message   text GENERATED ALWAYS AS (data ->> 'log') STORED
+      message   text GENERATED ALWAYS AS (data ->> 'log') STORED,
+      labels    jsonb GENERATED ALWAYS AS (data #> '{kubernetes,labels}') STORED
     ) PARTITION BY RANGE ("time");
+
+    -- labels arrived after the table did, and CREATE TABLE IF NOT EXISTS above
+    -- no-ops on an existing cluster, so the column has to be added explicitly
+    -- as well. Adding a STORED generated column rewrites every partition; at 14
+    -- days of retention that is a bounded one-time cost, and it is why this is
+    -- guarded rather than run unconditionally on every schema Job.
+    --
+    -- Rows written before fluent-bit had Labels On evaluate to NULL here.
+    -- Nothing backfills them -- the label set was never captured, and a pod's
+    -- labels at query time are not what they were at write time. label_match()
+    -- treats NULL as the empty label set, so old rows simply match no selector.
+    ALTER TABLE public.logs
+      ADD COLUMN IF NOT EXISTS labels jsonb
+      GENERATED ALWAYS AS (data #> '{kubernetes,labels}') STORED;
 
     -- Retention is DROP TABLE on a whole day's partition: an O(1) unlink, no
     -- row scan, no dead tuples, no vacuum debt. A DELETE ... WHERE time < x on
@@ -205,6 +220,16 @@ data:
     CREATE INDEX IF NOT EXISTS logs_time_idx ON public.logs ("time" DESC);
     CREATE INDEX IF NOT EXISTS logs_ns_time_idx ON public.logs (namespace, "time" DESC);
     CREATE INDEX IF NOT EXISTS logs_pod_time_idx ON public.logs (pod, "time" DESC);
+
+    -- Default jsonb_ops rather than the smaller jsonb_path_ops, because that
+    -- variant indexes only containment (@>) and the `key` / `!key` existence
+    -- forms of a label selector need `?`.
+    --
+    -- This index serves containment filters against logs_api.entries, where
+    -- PostgREST turns ?labels=cs.{"app":"x"} into an indexable @>. It does NOT
+    -- serve the RPC endpoints' label_selector, which is a per-row function
+    -- call; those rely on the time predicate to narrow the scan first.
+    CREATE INDEX IF NOT EXISTS logs_labels_idx ON public.logs USING gin (labels);
 
     CREATE OR REPLACE FUNCTION logs_maint.rotate(
       ahead_days  int DEFAULT 7,
@@ -274,6 +299,88 @@ data:
     -- resource regardless.
     -- ------------------------------------------------------------------
 
+    -- Evaluates a kubectl-grammar label selector against one row's label set,
+    -- so `-l app=nginx,tier!=canary` means here exactly what it means to
+    -- kubectl. The alternative -- exposing jsonb containment and telling
+    -- callers to translate -- covers only the key=value third of the grammar
+    -- and puts the translation burden on every caller.
+    --
+    -- Evaluated per row rather than compiled into a WHERE clause: building SQL
+    -- from a caller-supplied string is the one shape that would put an
+    -- injection vector behind an unauthenticated endpoint. The cost is that
+    -- this cannot use logs_labels_idx, which is why every endpoint applies its
+    -- time predicate first.
+    --
+    -- Absent-key semantics follow kubectl, where they are deliberately not
+    -- symmetric: `k!=v` and `k notin (v)` both MATCH a row with no k at all,
+    -- while `k=v` and `k in (v)` do not.
+    -- In logs_maint, not logs_api: PGRST_DB_SCHEMAS exposes everything in
+    -- logs_api as a REST resource, so defining it there would publish
+    -- /rpc/label_match and mint a meaningless MCP tool beside the seven real
+    -- ones. It is a predicate, not an endpoint.
+    CREATE OR REPLACE FUNCTION logs_maint.label_match(labels jsonb, selector text)
+    RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $label_match$
+    DECLARE
+      term text;
+      key  text;
+      val  text;
+      vals text[];
+    BEGIN
+      IF selector IS NULL OR btrim(selector) = '' THEN
+        RETURN true;
+      END IF;
+      IF labels IS NULL THEN
+        labels := '{}'::jsonb;
+      END IF;
+
+      -- Split on commas that are not inside a set literal's parentheses, so
+      -- `a in (x,y),b=c` is two terms and not three.
+      FOREACH term IN ARRAY regexp_split_to_array(selector, ',(?![^()]*\))') LOOP
+        term := btrim(term);
+        CONTINUE WHEN term = '';
+
+        IF term LIKE '!%' THEN
+          IF labels ? btrim(substring(term FROM 2)) THEN RETURN false; END IF;
+
+        ELSIF term ~* '\Wnotin\s*\(' THEN
+          key := btrim(regexp_replace(term, '(?i)\s*notin\s*\(.*$', ''));
+          SELECT array_agg(btrim(s.v)) INTO vals
+          FROM unnest(string_to_array(substring(term FROM '\((.*)\)'), ',')) AS s(v);
+          IF COALESCE(labels ->> key = ANY(vals), false) THEN RETURN false; END IF;
+
+        ELSIF term ~* '\Win\s*\(' THEN
+          key := btrim(regexp_replace(term, '(?i)\s*in\s*\(.*$', ''));
+          SELECT array_agg(btrim(s.v)) INTO vals
+          FROM unnest(string_to_array(substring(term FROM '\((.*)\)'), ',')) AS s(v);
+          IF NOT COALESCE(labels ->> key = ANY(vals), false) THEN RETURN false; END IF;
+
+        ELSIF term LIKE '%!=%' THEN
+          key := btrim(split_part(term, '!=', 1));
+          val := btrim(split_part(term, '!=', 2));
+          IF labels ->> key IS NOT DISTINCT FROM val THEN RETURN false; END IF;
+
+        ELSIF term LIKE '%==%' THEN
+          key := btrim(split_part(term, '==', 1));
+          val := btrim(split_part(term, '==', 2));
+          IF labels ->> key IS DISTINCT FROM val THEN RETURN false; END IF;
+
+        ELSIF term LIKE '%=%' THEN
+          key := btrim(split_part(term, '=', 1));
+          val := btrim(split_part(term, '=', 2));
+          IF labels ->> key IS DISTINCT FROM val THEN RETURN false; END IF;
+
+        ELSE
+          IF NOT (labels ? term) THEN RETURN false; END IF;
+        END IF;
+      END LOOP;
+
+      RETURN true;
+    END
+    $label_match$;
+
+    COMMENT ON FUNCTION logs_maint.label_match(jsonb, text) IS
+      'Internal predicate: evaluates a kubectl label selector against one label set.';
+
     CREATE OR REPLACE VIEW logs_api.entries AS
     SELECT
       l."time"    AS at,
@@ -281,7 +388,11 @@ data:
       l.pod       AS pod,
       l.container AS container,
       l.stream    AS stream,
-      l.message   AS message
+      l.message   AS message,
+      -- Appended, not slotted in next to the other kubernetes.* columns:
+      -- CREATE OR REPLACE VIEW may only add columns at the end, and inserting
+      -- one earlier fails with "cannot change name of view column".
+      l.labels    AS labels
     FROM public.logs l;
 
     COMMENT ON VIEW logs_api.entries IS
@@ -298,115 +409,245 @@ data:
       'Either stdout or stderr. Many workloads log normal operation to stderr, so stderr alone is not an error signal.';
     COMMENT ON COLUMN logs_api.entries.message IS
       'The log line itself, with the container-runtime framing already stripped.';
+    COMMENT ON COLUMN logs_api.entries.labels IS
+      'The pod''s Kubernetes labels as captured at write time, e.g. {"app":"logs-mcp","entity":"cluster"}. Filter with PostgREST containment, ?labels=cs.{"app":"logs-mcp"}, which is index-backed. Null for lines written before label capture was enabled, and never backfilled: a pod''s labels today are not necessarily what they were when the line was emitted.';
+
+    -- Every signature below changed when label selection and absolute time
+    -- bounds were added. CREATE OR REPLACE cannot alter a function's argument
+    -- list: a different list is a different function, so the old ones would
+    -- survive as overloads and PostgREST would refuse the ambiguous call. They
+    -- are dropped by their full old argument list, which is what names a
+    -- function in Postgres.
+    DROP FUNCTION IF EXISTS logs_api.recent(int, text, text, text, int);
+    DROP FUNCTION IF EXISTS logs_api.errors(int, text, int);
+    DROP FUNCTION IF EXISTS logs_api.search(text, int, text, int);
+    DROP FUNCTION IF EXISTS logs_api.pod_tail(text, int, text);
+    DROP FUNCTION IF EXISTS logs_api.volume(int);
+    DROP FUNCTION IF EXISTS logs_api.workloads(int);
+
+    -- The time window on every endpoint resolves the same way, and the
+    -- precedence is deliberate: since_time wins over since_minutes, and when
+    -- only until_time is given the relative window is measured back from it
+    -- rather than from now. That is what makes "the 15 minutes before 03:15
+    -- last night" expressible. With no bound of any kind it degrades to
+    -- -infinity rather than to NULL, which would have matched no rows at all.
 
     CREATE OR REPLACE FUNCTION logs_api.recent(
-      since_minutes    int  DEFAULT 15,
-      namespace_filter text DEFAULT NULL,
-      pod_filter       text DEFAULT NULL,
-      container_filter text DEFAULT NULL,
-      max_rows         int  DEFAULT 200
+      since_minutes    int       DEFAULT 15,
+      namespace_filter text      DEFAULT NULL,
+      pod_filter       text      DEFAULT NULL,
+      container_filter text      DEFAULT NULL,
+      stream_filter    text      DEFAULT NULL,
+      label_selector   text      DEFAULT NULL,
+      since_time       timestamp DEFAULT NULL,
+      until_time       timestamp DEFAULT NULL,
+      max_rows         int       DEFAULT 200,
+      oldest_first     boolean   DEFAULT false
     ) RETURNS TABLE (
-      at timestamp, namespace text, pod text, container text, stream text, message text
+      at timestamp, namespace text, pod text, container text,
+      stream text, message text, labels jsonb
     ) LANGUAGE sql STABLE AS $recent$
-      SELECT l."time", l.namespace, l.pod, l.container, l.stream, l.message
-      FROM public.logs l
-      WHERE l."time" >= (now() AT TIME ZONE 'utc') - make_interval(mins => since_minutes)
-        AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
-        AND (pod_filter       IS NULL OR l.pod LIKE pod_filter || '%')
-        AND (container_filter IS NULL OR l.container = container_filter)
-      ORDER BY l."time" DESC
-      LIMIT LEAST(max_rows, 1000);
+      SELECT t.* FROM (
+        SELECT l."time", l.namespace, l.pod, l.container, l.stream, l.message, l.labels
+        FROM public.logs l
+        WHERE l."time" >= COALESCE(
+                since_time,
+                COALESCE(until_time, now() AT TIME ZONE 'utc')
+                  - make_interval(mins => since_minutes),
+                '-infinity'::timestamp)
+          AND l."time" <= COALESCE(until_time, 'infinity'::timestamp)
+          AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
+          AND (pod_filter       IS NULL OR l.pod LIKE pod_filter || '%')
+          AND (container_filter IS NULL OR l.container = container_filter)
+          AND (stream_filter    IS NULL OR l.stream = stream_filter)
+          AND logs_maint.label_match(l.labels, label_selector)
+        ORDER BY l."time" DESC
+        LIMIT LEAST(max_rows, 1000)
+      ) t (t_at, t_ns, t_pod, t_container, t_stream, t_message, t_labels)
+      -- Newest-first is what selects the rows, always, so that the time index
+      -- serves the LIMIT; oldest_first only re-sorts the page that survived it.
+      -- Reversing the inner ORDER BY instead would return the oldest N rows in
+      -- the window, which is a different query.
+      ORDER BY CASE WHEN oldest_first THEN t.t_at END ASC,
+               CASE WHEN NOT oldest_first THEN t.t_at END DESC;
     $recent$;
 
-    COMMENT ON FUNCTION logs_api.recent(int, text, text, text, int) IS
-      'Most recent log lines across the cluster, newest first. The general-purpose replacement for `kubectl logs` when you want a live look at what is happening right now. Unlike kubectl logs this reads durable storage, so it still works for pods that have already been deleted.';
+    COMMENT ON FUNCTION logs_api.recent(int, text, text, text, text, text, timestamp, timestamp, int, boolean) IS
+      'Most recent log lines across the cluster, newest first. The general-purpose replacement for `kubectl logs` when you want a live look at what is happening right now. Unlike kubectl logs this reads durable storage, so it still works for pods that have already been deleted. Time window: since_minutes counts back from now, or pass since_time/until_time as UTC timestamps ("2026-08-30T03:00:00") for an absolute window -- use those to re-examine a past incident, and as a cursor when polling. pod_filter matches as a prefix, so a Deployment name catches every replica. label_selector takes kubectl syntax: "app=nginx,tier!=canary", "app in (web,api)", "!debug". Set oldest_first to read the result in chronological order.';
 
     CREATE OR REPLACE FUNCTION logs_api.errors(
-      since_minutes    int  DEFAULT 60,
-      namespace_filter text DEFAULT NULL,
-      max_rows         int  DEFAULT 200
+      since_minutes    int       DEFAULT 60,
+      namespace_filter text      DEFAULT NULL,
+      pod_filter       text      DEFAULT NULL,
+      container_filter text      DEFAULT NULL,
+      label_selector   text      DEFAULT NULL,
+      since_time       timestamp DEFAULT NULL,
+      until_time       timestamp DEFAULT NULL,
+      max_rows         int       DEFAULT 200,
+      oldest_first     boolean   DEFAULT false
     ) RETURNS TABLE (
-      at timestamp, namespace text, pod text, container text, message text
+      at timestamp, namespace text, pod text, container text,
+      stream text, message text, labels jsonb
     ) LANGUAGE sql STABLE AS $errors$
-      SELECT l."time", l.namespace, l.pod, l.container, l.message
-      FROM public.logs l
-      WHERE l."time" >= (now() AT TIME ZONE 'utc') - make_interval(mins => since_minutes)
-        AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
-        AND l.message ~* '(error|fatal|panic|exception|traceback|segfault|fail(ed|ure)?)'
-      ORDER BY l."time" DESC
-      LIMIT LEAST(max_rows, 1000);
+      SELECT t.* FROM (
+        SELECT l."time", l.namespace, l.pod, l.container, l.stream, l.message, l.labels
+        FROM public.logs l
+        WHERE l."time" >= COALESCE(
+                since_time,
+                COALESCE(until_time, now() AT TIME ZONE 'utc')
+                  - make_interval(mins => since_minutes),
+                '-infinity'::timestamp)
+          AND l."time" <= COALESCE(until_time, 'infinity'::timestamp)
+          AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
+          AND (pod_filter       IS NULL OR l.pod LIKE pod_filter || '%')
+          AND (container_filter IS NULL OR l.container = container_filter)
+          AND logs_maint.label_match(l.labels, label_selector)
+          AND l.message ~* '(error|fatal|panic|exception|traceback|segfault|fail(ed|ure)?)'
+        ORDER BY l."time" DESC
+        LIMIT LEAST(max_rows, 1000)
+      ) t (t_at, t_ns, t_pod, t_container, t_stream, t_message, t_labels)
+      ORDER BY CASE WHEN oldest_first THEN t.t_at END ASC,
+               CASE WHEN NOT oldest_first THEN t.t_at END DESC;
     $errors$;
 
-    COMMENT ON FUNCTION logs_api.errors(int, text, int) IS
-      'Log lines that look like failures, newest first. Start here when triaging "something is broken" without yet knowing which workload. Matching is a case-insensitive regex over the message text (error, fatal, panic, exception, traceback, segfault, fail/failed/failure), so it over-matches on lines that merely discuss errors and misses failures phrased in other words. Treat the result as a lead, not a verdict.';
+    COMMENT ON FUNCTION logs_api.errors(int, text, text, text, text, timestamp, timestamp, int, boolean) IS
+      'Log lines that look like failures, newest first. Start here when triaging "something is broken" without yet knowing which workload. Matching is a case-insensitive regex over the message text (error, fatal, panic, exception, traceback, segfault, fail/failed/failure), so it over-matches on lines that merely discuss errors and misses failures phrased in other words. Treat the result as a lead, not a verdict. Scope it with namespace_filter, pod_filter (prefix), container_filter or label_selector ("app=nginx,tier!=canary"); bound it with since_minutes, or since_time/until_time for an absolute UTC window.';
 
     CREATE OR REPLACE FUNCTION logs_api.search(
       pattern          text,
-      since_hours      int  DEFAULT 24,
-      namespace_filter text DEFAULT NULL,
-      max_rows         int  DEFAULT 200
+      since_hours      int       DEFAULT 24,
+      namespace_filter text      DEFAULT NULL,
+      pod_filter       text      DEFAULT NULL,
+      container_filter text      DEFAULT NULL,
+      label_selector   text      DEFAULT NULL,
+      since_time       timestamp DEFAULT NULL,
+      until_time       timestamp DEFAULT NULL,
+      max_rows         int       DEFAULT 200,
+      oldest_first     boolean   DEFAULT false
     ) RETURNS TABLE (
-      at timestamp, namespace text, pod text, container text, message text
+      at timestamp, namespace text, pod text, container text,
+      stream text, message text, labels jsonb
     ) LANGUAGE sql STABLE AS $search$
-      SELECT l."time", l.namespace, l.pod, l.container, l.message
-      FROM public.logs l
-      WHERE l."time" >= (now() AT TIME ZONE 'utc') - make_interval(hours => since_hours)
-        AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
-        AND l.message ILIKE '%' || pattern || '%'
-      ORDER BY l."time" DESC
-      LIMIT LEAST(max_rows, 1000);
+      SELECT t.* FROM (
+        SELECT l."time", l.namespace, l.pod, l.container, l.stream, l.message, l.labels
+        FROM public.logs l
+        WHERE l."time" >= COALESCE(
+                since_time,
+                COALESCE(until_time, now() AT TIME ZONE 'utc')
+                  - make_interval(hours => since_hours),
+                '-infinity'::timestamp)
+          AND l."time" <= COALESCE(until_time, 'infinity'::timestamp)
+          AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
+          AND (pod_filter       IS NULL OR l.pod LIKE pod_filter || '%')
+          AND (container_filter IS NULL OR l.container = container_filter)
+          AND logs_maint.label_match(l.labels, label_selector)
+          AND l.message ILIKE '%' || pattern || '%'
+        ORDER BY l."time" DESC
+        LIMIT LEAST(max_rows, 1000)
+      ) t (t_at, t_ns, t_pod, t_container, t_stream, t_message, t_labels)
+      ORDER BY CASE WHEN oldest_first THEN t.t_at END ASC,
+               CASE WHEN NOT oldest_first THEN t.t_at END DESC;
     $search$;
 
-    COMMENT ON FUNCTION logs_api.search(text, int, text, int) IS
-      'Full-text substring search across all captured log lines, newest first. Use this to trace a specific identifier -- a request id, a hostname, an error string, a git SHA -- across every workload at once, which is the thing kubectl logs fundamentally cannot do. Matching is case-insensitive substring, not regex or word-boundary.';
+    COMMENT ON FUNCTION logs_api.search(text, int, text, text, text, text, timestamp, timestamp, int, boolean) IS
+      'Full-text substring search across all captured log lines, newest first. Use this to trace a specific identifier -- a request id, a hostname, an error string, a git SHA -- across every workload at once, which is the thing kubectl logs fundamentally cannot do. Matching is case-insensitive substring, not regex or word-boundary. Narrow with namespace_filter, pod_filter (prefix), container_filter or label_selector ("app=nginx,tier!=canary"); bound with since_hours, or since_time/until_time for an absolute UTC window.';
 
+    -- pod_name is optional because `kubectl logs -l app=foo --tail=10` is, so
+    -- a label selector alone has to be a sufficient target here too.
     CREATE OR REPLACE FUNCTION logs_api.pod_tail(
-      pod_name         text,
-      max_rows         int  DEFAULT 100,
-      container_filter text DEFAULT NULL
+      pod_name         text      DEFAULT NULL,
+      namespace_filter text      DEFAULT NULL,
+      container_filter text      DEFAULT NULL,
+      stream_filter    text      DEFAULT NULL,
+      label_selector   text      DEFAULT NULL,
+      since_minutes    int       DEFAULT NULL,
+      since_time       timestamp DEFAULT NULL,
+      until_time       timestamp DEFAULT NULL,
+      max_rows         int       DEFAULT 100,
+      oldest_first     boolean   DEFAULT true
     ) RETURNS TABLE (
-      at timestamp, container text, stream text, message text
+      at timestamp, namespace text, pod text, container text,
+      stream text, message text, labels jsonb
     ) LANGUAGE sql STABLE AS $pod_tail$
-      SELECT l."time", l.container, l.stream, l.message
-      FROM public.logs l
-      WHERE l.pod LIKE pod_name || '%'
-        AND (container_filter IS NULL OR l.container = container_filter)
-      ORDER BY l."time" DESC
-      LIMIT LEAST(max_rows, 1000);
+      SELECT t.* FROM (
+        SELECT l."time", l.namespace, l.pod, l.container, l.stream, l.message, l.labels
+        FROM public.logs l
+        WHERE l."time" >= COALESCE(
+                since_time,
+                COALESCE(until_time, now() AT TIME ZONE 'utc')
+                  - make_interval(mins => since_minutes),
+                '-infinity'::timestamp)
+          AND l."time" <= COALESCE(until_time, 'infinity'::timestamp)
+          AND (pod_name         IS NULL OR l.pod LIKE pod_name || '%')
+          AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
+          AND (container_filter IS NULL OR l.container = container_filter)
+          AND (stream_filter    IS NULL OR l.stream = stream_filter)
+          AND logs_maint.label_match(l.labels, label_selector)
+        ORDER BY l."time" DESC
+        LIMIT LEAST(max_rows, 1000)
+      ) t (t_at, t_ns, t_pod, t_container, t_stream, t_message, t_labels)
+      ORDER BY CASE WHEN oldest_first THEN t.t_at END ASC,
+               CASE WHEN NOT oldest_first THEN t.t_at END DESC;
     $pod_tail$;
 
-    COMMENT ON FUNCTION logs_api.pod_tail(text, int, text) IS
-      'The last N lines from one pod, newest first -- the direct equivalent of `kubectl logs --tail`, but it still returns output for pods that no longer exist. pod_name is matched as a prefix, so passing a Deployment name such as "logs-postgrest" returns lines from every replica and every past generation of it.';
+    COMMENT ON FUNCTION logs_api.pod_tail(text, text, text, text, text, int, timestamp, timestamp, int, boolean) IS
+      'The last N lines from one pod, in chronological order -- the direct equivalent of `kubectl logs --tail`, but it still returns output for pods that no longer exist. Selection always takes the NEWEST max_rows lines; oldest_first only controls the order they are returned in, and defaults to true so a stack trace reads top to bottom as it would from kubectl. pod_name is matched as a prefix, so passing a Deployment name such as "logs-postgrest" returns lines from every replica and every past generation of it -- scope with namespace_filter when a name prefix is ambiguous across namespaces. pod_name may be omitted entirely if label_selector is given ("app=nginx,tier!=canary"), matching `kubectl logs -l`. Bound the window with since_minutes, or since_time/until_time as absolute UTC timestamps.';
 
     CREATE OR REPLACE FUNCTION logs_api.volume(
-      since_hours int DEFAULT 24
+      since_hours      int       DEFAULT 24,
+      namespace_filter text      DEFAULT NULL,
+      label_selector   text      DEFAULT NULL,
+      since_time       timestamp DEFAULT NULL,
+      until_time       timestamp DEFAULT NULL
     ) RETURNS TABLE (
       namespace text, container text, lines bigint, bytes bigint
     ) LANGUAGE sql STABLE AS $volume$
       SELECT l.namespace, l.container, count(*), sum(length(l.message))::bigint
       FROM public.logs l
-      WHERE l."time" >= (now() AT TIME ZONE 'utc') - make_interval(hours => since_hours)
+      WHERE l."time" >= COALESCE(
+              since_time,
+              COALESCE(until_time, now() AT TIME ZONE 'utc')
+                - make_interval(hours => since_hours),
+              '-infinity'::timestamp)
+        AND l."time" <= COALESCE(until_time, 'infinity'::timestamp)
+        AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
+        AND logs_maint.label_match(l.labels, label_selector)
       GROUP BY l.namespace, l.container
       ORDER BY 3 DESC;
     $volume$;
 
-    COMMENT ON FUNCTION logs_api.volume(int) IS
-      'Log line and byte counts grouped by namespace and container, noisiest first. Answers "what is filling the log store" -- use it to decide what to add to the collector exclude list before growing the volume, and to sanity-check retention against disk.';
+    COMMENT ON FUNCTION logs_api.volume(int, text, text, timestamp, timestamp) IS
+      'Log line and byte counts grouped by namespace and container, noisiest first. Answers "what is filling the log store" -- use it to decide what to add to the collector exclude list before growing the volume, and to sanity-check retention against disk. Narrow with namespace_filter or label_selector ("app=nginx"); bound with since_hours, or since_time/until_time for an absolute UTC window to compare a spike against a quiet baseline.';
 
     CREATE OR REPLACE FUNCTION logs_api.workloads(
-      since_hours int DEFAULT 1
+      since_hours      int       DEFAULT 1,
+      namespace_filter text      DEFAULT NULL,
+      label_selector   text      DEFAULT NULL,
+      since_time       timestamp DEFAULT NULL,
+      until_time       timestamp DEFAULT NULL
     ) RETURNS TABLE (
-      namespace text, pod text, container text, last_seen timestamp
+      namespace text, pod text, container text, last_seen timestamp, labels jsonb
     ) LANGUAGE sql STABLE AS $workloads$
-      SELECT l.namespace, l.pod, l.container, max(l."time")
+      SELECT l.namespace, l.pod, l.container, max(l."time"),
+             -- The label set as of the pod's most recent line. Labels are
+             -- captured per line and a pod's can be edited in place, so this
+             -- picks one rather than asserting they never varied.
+             (array_agg(l.labels ORDER BY l."time" DESC))[1]
       FROM public.logs l
-      WHERE l."time" >= (now() AT TIME ZONE 'utc') - make_interval(hours => since_hours)
+      WHERE l."time" >= COALESCE(
+              since_time,
+              COALESCE(until_time, now() AT TIME ZONE 'utc')
+                - make_interval(hours => since_hours),
+              '-infinity'::timestamp)
+        AND l."time" <= COALESCE(until_time, 'infinity'::timestamp)
+        AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
+        AND logs_maint.label_match(l.labels, label_selector)
       GROUP BY l.namespace, l.pod, l.container
       ORDER BY 4 DESC;
     $workloads$;
 
-    COMMENT ON FUNCTION logs_api.workloads(int) IS
-      'Every namespace/pod/container that has logged in the window, most recently active first. Call this first to discover exact pod and container names to pass to the other endpoints, rather than guessing at them.';
+    COMMENT ON FUNCTION logs_api.workloads(int, text, text, timestamp, timestamp) IS
+      'Every namespace/pod/container that has logged in the window, most recently active first, with the labels each was carrying. Call this first to discover exact pod and container names -- and the label keys worth selecting on -- rather than guessing at them. Narrow with namespace_filter or label_selector ("app=nginx"); bound with since_hours, or since_time/until_time for an absolute UTC window to find what was running during a past incident.';
 
     GRANT USAGE ON SCHEMA public   TO logs_read;
     GRANT USAGE ON SCHEMA logs_api TO logs_read;
@@ -414,7 +655,26 @@ data:
     GRANT SELECT ON ALL TABLES     IN SCHEMA logs_api TO logs_read;
     GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA logs_api TO logs_read;
 
+    -- The label_selector predicate lives in logs_maint, and these functions are
+    -- not SECURITY DEFINER, so logs_read needs to reach it. Postgres grants
+    -- EXECUTE on new functions to PUBLIC by default; until now that was inert
+    -- because nobody held USAGE on this schema. Granting USAGE below makes it
+    -- live, and logs_maint.rotate() DROPs partitions -- so the default is
+    -- revoked first and only the predicate is granted back. Without the REVOKE
+    -- this change would hand an unauthenticated endpoint's role the ability to
+    -- delete the log store.
+    REVOKE ALL ON ALL FUNCTIONS IN SCHEMA logs_maint FROM PUBLIC;
+    GRANT USAGE ON SCHEMA logs_maint TO logs_read;
+    GRANT EXECUTE ON FUNCTION logs_maint.label_match(jsonb, text) TO logs_read;
+
     COMMIT;
+
+    -- PostgREST caches the schema and would otherwise keep serving the old
+    -- signatures until its pod restarted. It LISTENs on this channel by
+    -- default (PGRST_DB_CHANNEL_ENABLED), so the reload rides along with the
+    -- migration instead of needing a rollout. Outside the transaction because
+    -- a NOTIFY inside one is held until commit and lost if it rolls back.
+    NOTIFY pgrst, 'reload schema';
 ---
 apiVersion: batch/v1
 kind: Job
