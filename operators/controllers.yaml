@@ -253,10 +253,16 @@ spec:
             Tag host.*
             Read_From_Tail On
             Strip_Underscores On
+        # The log pipeline must not tail its own components. Without this
+        # exclusion a logs-pg wobble makes PostgREST emit error lines at several
+        # per second, which are tailed, which load logs-pg further — a spiral
+        # that gets worse exactly when the database is least able to absorb it.
+        # Container log filenames are <pod>_<namespace>_<container>-<id>.log.
         [INPUT]
             Name tail
             Tag kube.*
             Path /var/log/containers/*.log
+            Exclude_Path /var/log/containers/fluent-bit-*_cluster-main-observability_*.log,/var/log/containers/logs-pg-*_cluster-main-observability_*.log,/var/log/containers/logs-postgrest-*_cluster-main-observability_*.log,/var/log/containers/logs-mcp-*_cluster-main-observability_*.log
             multiline.parser cri
             Skip_Long_Lines On
             Refresh_Interval 10
