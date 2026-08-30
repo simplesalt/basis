@@ -115,19 +115,35 @@ spec:
               value: follow-privileges
             - name: PGRST_LOG_LEVEL
               value: warn
+            # PostgREST's dedicated admin server, separate from the API port so
+            # it is never exposed through the Service. It is what makes the
+            # probes below able to distinguish "this process is broken" from
+            # "the database it talks to is down".
+            - name: PGRST_ADMIN_SERVER_PORT
+              value: "3001"
           ports:
             - name: http
               containerPort: 3000
+            - name: admin
+              containerPort: 3001
+          # Probing GET / on the API port was a defect: PostgREST answers 503
+          # there whenever the schema cache cannot load, so every logs-pg
+          # outage killed this pod as well and turned a recoverable database
+          # blip into a restart loop on top of it. The admin server splits the
+          # two signals — /live checks only that the process is up, /ready also
+          # checks the database connection and schema cache. A logs-pg outage
+          # now pulls the pod out of the Service and leaves it running to
+          # reconnect on its own.
           readinessProbe:
             httpGet:
-              path: /
-              port: http
+              path: /ready
+              port: admin
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             httpGet:
-              path: /
-              port: http
+              path: /live
+              port: admin
             initialDelaySeconds: 15
             periodSeconds: 30
           resources:
