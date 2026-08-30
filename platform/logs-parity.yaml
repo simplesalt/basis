@@ -640,12 +640,36 @@ data:
 
 
     def case_pod_absent(w_start, w_end):
-        args = {"since_time": pg_ts(w_start), "until_time": pg_ts(w_end), "max_rows": 500}
+        # A pod name no workload can hold. Parity alone would not test
+        # anything here: if pod_filter were ignored outright, both surfaces
+        # would ignore it identically and REST-vs-MCP would agree happily on
+        # a full unfiltered page -- which is exactly what this case did
+        # before, having never passed the filter at all. So the absolute
+        # answer, nothing, is asserted alongside the agreement.
+        absent = "logs-parity-no-such-pod-000000000"
+        args = {
+            "since_time": pg_ts(w_start),
+            "until_time": pg_ts(w_end),
+            "pod_filter": absent,
+            "max_rows": 500,
+        }
         rest_rows = rest_rpc("recent", **args)
         mcp_rows = mcp.call_tool("recent", args)
-        return assert_equal_rows(
+        ok = assert_equal_rows(
             "pod-name-absent", "recent({})".format(args), "REST", rest_rows, "MCP", mcp_rows
         )
+        if rest_rows or mcp_rows:
+            fail(
+                "pod-name-absent-semantics",
+                "pod_filter={!r} matches no pod in the cluster, so both "
+                "surfaces should return nothing; REST returned {} and MCP "
+                "returned {}".format(absent, len(rest_rows), len(mcp_rows)),
+                query=str(args),
+                REST=rest_rows,
+                MCP=mcp_rows,
+            )
+            ok = False
+        return ok
 
 
     def case_namespace_filter(w_start, w_end, namespace):
