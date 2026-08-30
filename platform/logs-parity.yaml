@@ -913,7 +913,9 @@ metadata:
     env: main
     capability: observability
 spec:
-  schedule: "0 */4 * * *"
+  # Temporarily every 5 minutes while simplesalt/projects#385 drives the suite
+  # to a first clean pass. Restore to "0 */4 * * *" once it is green.
+  schedule: "*/5 * * * *"
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 900
   successfulJobsHistoryLimit: 2
