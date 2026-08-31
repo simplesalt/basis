@@ -200,7 +200,12 @@ spec:
   tail:
     tag: kube.*
     path: /var/log/containers/*.log
-    excludePath: /var/log/containers/fluent-bit-*_cluster-main-observability_*.log,/var/log/containers/logs-pg-[0-9]*_cluster-main-observability_*.log,/var/log/containers/logs-postgrest-*_cluster-main-observability_*.log,/var/log/containers/logs-mcp-*_cluster-main-observability_*.log
+    # ssint-main-coding is claude-rc agent chatter: 77% of all ingested bytes
+    # and, sampled, zero error-signal matches. Excluding it at the tail is a
+    # bigger and safer win than the grep filter below -- it never enters the
+    # pipeline to be filtered, rather than being filtered out record by
+    # record. simplesalt/projects#390.
+    excludePath: /var/log/containers/fluent-bit-*_cluster-main-observability_*.log,/var/log/containers/logs-pg-[0-9]*_cluster-main-observability_*.log,/var/log/containers/logs-postgrest-*_cluster-main-observability_*.log,/var/log/containers/logs-mcp-*_cluster-main-observability_*.log,/var/log/containers/*_ssint-main-coding_*.log
     multilineParser: cri
     skipLongLines: true
     refreshIntervalSeconds: 10
@@ -240,6 +245,62 @@ spec:
         # serialised manifest attached to every single log line.
         labels: true
         annotations: false
+---
+# Ingest-time error filter, simplesalt/projects#390. This was a general log
+# backend (#362 grew it past #299's original purpose); at 1.84M lines/day
+# it does not fit the 20Gi PVC at 14-day retention. Sampling put error-signal
+# lines (error, fail, fatal, panic, exception, traceback, refused, denied,
+# timeout, oom) at a 7.28% match rate -- a ~13.6x cut.
+#
+# This must run after the kubernetes filter (ordinal 0, unset) so labels are
+# already attached when it runs -- hence the explicit ordinal here. Without
+# it, FilterByOrdinalAndName's tie-break falls back to name, and
+# "grep-errors" < "kubernetes" alphabetically would run this first.
+#
+# Two stages, because the typed Grep CRD exposes exactly one Regex and one
+# Exclude, and this needs an OR of two independent Regex conditions on two
+# different keys:
+#
+#   1. customPlugin, since the operator's typed Grep has no way to combine
+#      two Regex clauses. Merge_Log On (the kubernetes filter above) puts
+#      parsed fields of JSON-emitting workloads at the record root, so a
+#      level match is checked as a second, more precise condition alongside
+#      the substring match, catching structured errors (e.g. {"level":"error"}
+#      with no keyword in the message) that the substring alone would miss.
+#   2. A plain typed Grep exclude, chained immediately after. Sampling turned
+#      up kyverno's admission webhook logging "http: TLS handshake error"
+#      at info level on every client TLS probe/reset -- a golang net/http
+#      boilerplate message, not a kyverno failure -- which the broad
+#      substring in stage 1 would otherwise keep. This is the "kyverno
+#      INF/TRC lines" false-positive case the issue's sampling found; TRC
+#      itself is already gone (kyverno runs --v=0, see operators/
+#      controllers.yaml). Do not filter on stream (stdout/stderr) here --
+#      only 0.43% of rows are both stderr and error-matching, so it is not a
+#      usable signal for this.
+apiVersion: fluentbit.fluent.io/v1alpha2
+kind: ClusterFilter
+metadata:
+  name: grep-errors
+  labels:
+    fluentbit.fluent.io/enabled: "true"
+    app.kubernetes.io/name: fluent-bit
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: logging
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  match: kube.*
+  ordinal: 10
+  filters:
+    - customPlugin:
+        config: |
+          Name grep
+          Regex log (?i)(error|fail|fatal|panic|exception|traceback|refused|denied|timeout|\boom\b)
+          Regex level (?i)^(error|fatal|warn|warning)$
+          Logical_Op Or
+    - grep:
+        exclude: "log http: TLS handshake error"
 ---
 apiVersion: fluentbit.fluent.io/v1alpha2
 kind: ClusterOutput
