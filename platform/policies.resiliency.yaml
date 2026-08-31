@@ -35,12 +35,19 @@
 # annotation asserting off-site backup with nothing behind it is worse than no
 # annotation, because it will be believed.
 #
-# The instances rule is Audit on purpose. Every CNPG Cluster here runs
-# instances: 1 because there is one node; a second replica would be
-# unschedulable, so enforcing HA now would break the databases to satisfy a
-# policy. Audit means it shows up in PolicyReports as the standing record of
-# what is outstanding. It flips to Enforce, alongside a mutation raising
-# instances and adding anti-affinity, when the second node exists.
+# Every rule here is Enforce and runs at admission only. There is deliberately
+# no Audit rule reporting that these Clusters run instances: 1 -- an audit whose
+# criteria duplicate an enforcing rule tells nobody anything, and the fact that
+# HA waits on a second node is not a finding, it is the plan. Audit rules are
+# worth writing to test whether a new Enforce rule matches what was intended,
+# and are worth deleting once that is answered.
+#
+# background is false as a consequence. Background scanning makes Kyverno's
+# report controller open a watch on every kind a policy matches, and its
+# ServiceAccount has no read access to postgresql.cnpg.io, so leaving it on
+# produces a permanently failing watch and a stream of forbidden errors in
+# exchange for reports nothing reads. Granting that access would only be worth
+# doing for reports worth having.
 #
 # failurePolicy is Ignore for the same reason as the other policy files here: a
 # Kyverno outage should not block database reconciliation.
@@ -62,11 +69,10 @@ metadata:
     policies.kyverno.io/description: >-
       Governs resiliency configuration on CloudNativePG Clusters. Defaults
       spec.inheritedMetadata so every generated pod and PVC declares
-      storage-tier blips-are-ok, validates the optional backup-tier annotation
-      and refuses an unbacked claim of cloud backup, and audits single-instance
-      Clusters pending the second node.
+      storage-tier blips-are-ok, and validates the optional backup-tier
+      annotation, refusing an unbacked claim of cloud backup.
 spec:
-  background: true
+  background: false
   webhookConfiguration:
     failurePolicy: Ignore
   rules:
@@ -166,25 +172,3 @@ spec:
               - key: '{{ request.object.spec.backup || '''' }}'
                 operator: Equals
                 value: ""
-
-    - name: audit-single-instance
-      match:
-        any:
-          - resources:
-              kinds:
-                - postgresql.cnpg.io/v1/Cluster
-              operations:
-                - CREATE
-                - UPDATE
-      validate:
-        failureAction: Audit
-        message: >-
-          This Cluster runs a single instance, so a node reboot is an outage
-          rather than a failover. Expected while the cluster has one node; this
-          report is the standing record of what the second node unblocks.
-        deny:
-          conditions:
-            all:
-              - key: '{{ request.object.spec.instances || `1` }}'
-                operator: LessThan
-                value: 2

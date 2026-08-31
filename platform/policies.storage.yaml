@@ -40,6 +40,16 @@
 # failure mode would be a workload silently getting durable disk when the author
 # asked for memory.
 #
+# The deny rules are written against Pod alone. Kyverno autogen derives the
+# controller-level equivalents -- Deployment, StatefulSet, DaemonSet, Job,
+# CronJob and the rest -- rewriting the annotation path to the pod template, so
+# a workload declaring `replicated` is rejected at apply time rather than
+# admitting cleanly and then failing to produce pods. Hand-writing that second
+# set is not just duplication: an unqualified `Deployment` in a match block
+# resolves across every API group, which here would silently capture
+# Crossplane's Cloudflare Workers Deployment. The generated rules are group
+# qualified and are the only ones that should exist.
+#
 # This is a no-op against everything currently running. The mutate rules fire
 # only on pods that opt in, and nothing does yet; the deny rules fire only on
 # values nothing currently sets. The one unconditional rule sets the
@@ -128,35 +138,6 @@ spec:
           conditions:
             all:
               - key: '{{ request.object.metadata.annotations."resiliency.simplesalt.company/storage-tier" || '''' }}'
-                operator: Equals
-                value: replicated
-
-    - name: reject-replicated-workloads
-      match:
-        any:
-          - resources:
-              kinds:
-                - Deployment
-                - StatefulSet
-                - DaemonSet
-                - Job
-                - CronJob
-              operations:
-                - CREATE
-                - UPDATE
-      validate:
-        failureAction: Enforce
-        message: >-
-          This workload's pod template declares storage-tier replicated, but
-          this cluster has no replicated filesystem. Every StorageClass here is
-          node-local, so a volume does not survive losing the node that holds
-          it. Either move the durability requirement into the application layer
-          (as the CNPG clusters do) and declare blips-are-ok, or do not schedule
-          this workload here.
-        deny:
-          conditions:
-            all:
-              - key: '{{ request.object.spec.template.metadata.annotations."resiliency.simplesalt.company/storage-tier" || request.object.spec.jobTemplate.spec.template.metadata.annotations."resiliency.simplesalt.company/storage-tier" || '''' }}'
                 operator: Equals
                 value: replicated
 
