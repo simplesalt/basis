@@ -96,3 +96,48 @@ spec:
       - key: "{{ target.metadata.ownerReferences || `[]` | length(@) }}"
         operator: GreaterThan
         value: 0
+---
+apiVersion: kyverno.io/v2
+kind: ClusterCleanupPolicy
+metadata:
+  name: reap-node-shutdown-pods
+  labels:
+    app.kubernetes.io/name: reap-node-shutdown-pods
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: basis
+  annotations:
+    policies.kyverno.io/title: Reap Node-Shutdown Pods
+    policies.kyverno.io/category: Housekeeping
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Deletes Pods stamped with a DisruptionTarget condition whose reason is
+      TerminationByKubelet - kubelet's marker for "terminated because the
+      node was shutting down". On expected node shutdown/reboot, every
+      kubelet-managed pod on that node gets this treatment, landing in
+      either phase Succeeded (clean exit) or Failed (exitCode 137, reason
+      Terminated) depending on how the container exited; neither is caught
+      by reap-oom-evicted-pods, which only matches reason OutOfmemory.
+      These terminal pods are never replaced in place (the owning
+      controller already reconciles a fresh pod) and podgc's default
+      terminated-pod-gc-threshold is far too high to reap them in practice,
+      so each expected reboot leaves one debris pod per workload behind.
+      Scoped to controller-owned Pods only, matching the safety scope of
+      reap-oom-evicted-pods. Reuses the kyverno-cleanup-controller-pods
+      ClusterRole defined above in this file.
+spec:
+  schedule: "*/15 * * * *"
+  match:
+    any:
+      - resources:
+          kinds:
+            - Pod
+  conditions:
+    all:
+      - key: "{{ target.status.conditions[?type=='DisruptionTarget'].reason | [0] }}"
+        operator: Equals
+        value: TerminationByKubelet
+      - key: "{{ target.metadata.ownerReferences || `[]` | length(@) }}"
+        operator: GreaterThan
+        value: 0
