@@ -73,6 +73,18 @@ spec:
         kind: HelmRepository
         name: kyverno
         namespace: flux-system
+  values:
+    # Chart defaults are --loggingFormat=text --v=2, and kyverno maps --v>=2 to
+    # TRACE. That made kyverno the single largest log producer in the cluster:
+    # 54.5 MB/day, 27% of all bytes, at ~1350 bytes per line, almost all of it
+    # "validation passed" TRC records carrying the full clusterroles array.
+    # --v=0 keeps INF/WRN/ERR/FTL and drops 96% of the volume. json also removes
+    # the ANSI SGR wrapper that text format puts around every line, which made
+    # the records unparseable downstream.
+    features:
+      logging:
+        format: json
+        verbosity: 0
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
