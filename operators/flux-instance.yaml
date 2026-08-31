@@ -20,3 +20,26 @@ spec:
   distribution:
     registry: ghcr.io/fluxcd
     version: 2.x
+  kustomize:
+    patches:
+      # kustomize-controller at --log-level=info logs every server-side apply of
+      # every object on every 1m reconcile: 23.4 MB/day, 12% of all cluster log
+      # bytes. Nothing is lost at error level -- reconcile outcomes are also
+      # published as Kubernetes Events and as Kustomization status conditions,
+      # which is where tooling reads them from anyway.
+      #
+      # JSON6902 rather than strategic merge: args is an atomic list, so a merge
+      # patch replaces it whole and would silently drop --events-addr and the
+      # feature gates that flux-operator generates. The test op pins the index
+      # we are rewriting, so if flux-operator ever reorders the args the
+      # FluxInstance fails loudly instead of quietly rewriting a different flag.
+      - target:
+          kind: Deployment
+          name: kustomize-controller
+        patch: |
+          - op: test
+            path: /spec/template/spec/containers/0/args/2
+            value: --log-level=info
+          - op: replace
+            path: /spec/template/spec/containers/0/args/2
+            value: --log-level=error
