@@ -47,10 +47,72 @@
 # ServiceAccount has no read access to postgresql.cnpg.io, so leaving it on
 # produces a permanently failing watch and a stream of forbidden errors in
 # exchange for reports nothing reads. Granting that access would only be worth
-# doing for reports worth having.
+# doing for reports worth having. The HA rules below match and mutate/validate
+# at admission only, same as the storage/backup-tier rules; there is nothing
+# for a background scan to add and the same forbidden-watch problem would
+# apply to it too.
 #
 # failurePolicy is Ignore for the same reason as the other policy files here: a
-# Kyverno outage should not block database reconciliation.
+# Kyverno outage should not block database reconciliation. This is a deliberate
+# departure from the project issue's lean toward Fail for the HA rules
+# specifically: failurePolicy is policy-scoped, not rule-scoped, so splitting it
+# would mean a second ClusterPolicy for HA alone, which contradicts this file's
+# own "one place" mandate above. Ignore stays cluster-wide.
+#
+# Part 1 -- HA replica on another node. default-ha-instances and
+# required-pod-anti-affinity mutate every Cluster to instances: 2 and required,
+# node-scoped pod anti-affinity; reject-ha-revert denies a subsequent write that
+# undoes either. required, not CNPG's default preferred, is the deliberate
+# choice: this cluster has exactly one node today. preferred would schedule the
+# second instance onto that same node, where it just doubles memory pressure
+# (gbrain-pg, hindsight-pg and cal-pg all run with empty spec.resources, i.e.
+# unbounded) for zero drain-safety benefit -- both replicas would still die
+# together. required instead leaves the second instance Pending until a second
+# node joins: a Pending pod costs no CPU or memory, and the local-path
+# StorageClass is WaitForFirstConsumer, so its PVC stays Pending too -- no disk
+# provisioned, no premature node pinning. When node 2 joins, the replica and its
+# PV land there automatically with no follow-up commit. required is therefore
+# not "wait for node 2 before enabling HA", it is the mechanism that makes node
+# 2 joining the activation trigger.
+#
+# The four live Clusters (gbrain-pg, hindsight-pg, cal-pg, logs-pg) currently
+# set podAntiAffinityType: preferred explicitly. required-pod-anti-affinity
+# overrides that -- the mutate patch is unconditional on the three affinity
+# fields, not a fill-in-if-absent (contrast default-storage-tier's `+()`
+# conditional-add above), because an explicit preferred left standing would
+# quietly keep every live Cluster in the colocated, unbounded-memory
+# configuration this rule exists to prevent. There is nothing to preserve by
+# respecting an existing preferred: it was never a deliberate per-database
+# choice, just CNPG's own default landing in the manifest.
+#
+# Nothing here gates on Cluster health. order.yaml's healthChecks cover only
+# HelmReleases and crossplane Providers, and there are no PrometheusRules in
+# this repo, so a Cluster sitting at readyInstances: 1/2 while its second
+# instance is Pending is expected and does not block reconciliation of anything
+# else. The CNPG-generated PDB is scoped to cnpg.io/instanceRole: primary, so
+# its expectedPods is 1 regardless of instance count -- bumping instances does
+# not relax that PDB, and safe drain does not depend on it: CNPG fails over to
+# a replica on another node and deletes the old primary directly, bypassing the
+# eviction API, which is exactly why the replica has to be on a different node.
+#
+# Escape hatch: a Cluster carrying the label or annotation
+# resiliency.simplesalt.company/ha: exempt is skipped by all three HA rules --
+# mutate, override, and revert-denial alike. This is for a genuinely throwaway
+# database, and it has to say so in git the way every other escape hatch in
+# this repo does.
+#
+# A mutation on spec.instances only works where git does not already own that
+# field. Flux applies server-side, so a manifest that states instances: 1 makes
+# kustomize-controller the field owner: it would re-apply 1 on every reconcile,
+# Kyverno would re-mutate to 2, and CNPG would build and tear down the second
+# instance in a loop. logs-pg.yaml in this directory therefore states neither
+# instances nor affinity and lets these rules supply both.
+#
+# gbrain-pg, hindsight-pg and cal-pg are defined in simplesalt/brain
+# (manifests/ai.yaml, manifests/cal.yaml) and still declare instances: 1, so
+# they are excluded below until that repo drops the field. The exclusion is the
+# alternative to knowingly starting that loop in three production databases --
+# it is temporary, and simplesalt/projects#402 removes it.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -70,7 +132,11 @@ metadata:
       Governs resiliency configuration on CloudNativePG Clusters. Defaults
       spec.inheritedMetadata so every generated pod and PVC declares
       storage-tier blips-are-ok, and validates the optional backup-tier
-      annotation, refusing an unbacked claim of cloud backup.
+      annotation, refusing an unbacked claim of cloud backup. Also mutates
+      every Cluster to instances: 2 with required, node-scoped pod
+      anti-affinity, and denies a subsequent write that reverts either.
+      Exempt a genuinely single-instance Cluster with the label or annotation
+      resiliency.simplesalt.company/ha: exempt.
 spec:
   background: false
   webhookConfiguration:
@@ -172,3 +238,131 @@ spec:
               - key: '{{ request.object.spec.backup || '''' }}'
                 operator: Equals
                 value: ""
+
+    - name: default-ha-instances
+      match:
+        any:
+          - resources:
+              kinds:
+                - postgresql.cnpg.io/v1/Cluster
+              operations:
+                - CREATE
+                - UPDATE
+      # Temporary: these three still declare instances: 1 in simplesalt/brain.
+      # Mutating a Flux-owned field starts a re-apply loop. Removed by
+      # simplesalt/projects#402, together in one commit with the brain change.
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - ssint-main-ai
+                - ssint-main-cal
+              names:
+                - gbrain-pg
+                - hindsight-pg
+                - cal-pg
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.labels."resiliency.simplesalt.company/ha" || request.object.metadata.annotations."resiliency.simplesalt.company/ha" || '''' }}'
+            operator: NotEquals
+            value: exempt
+          - key: '{{ request.object.spec.instances || `0` }}'
+            operator: LessThan
+            value: 2
+      mutate:
+        patchStrategicMerge:
+          spec:
+            instances: 2
+
+    - name: required-pod-anti-affinity
+      match:
+        any:
+          - resources:
+              kinds:
+                - postgresql.cnpg.io/v1/Cluster
+              operations:
+                - CREATE
+                - UPDATE
+      # Same exclusion as default-ha-instances above, and it has to stay in
+      # step with it: anti-affinity on a Cluster still pinned to instances: 1
+      # constrains a replica that does not exist.
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - ssint-main-ai
+                - ssint-main-cal
+              names:
+                - gbrain-pg
+                - hindsight-pg
+                - cal-pg
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.labels."resiliency.simplesalt.company/ha" || request.object.metadata.annotations."resiliency.simplesalt.company/ha" || '''' }}'
+            operator: NotEquals
+            value: exempt
+      # Unconditional, not a `+()` fill-in-if-absent: this overrides an
+      # explicit podAntiAffinityType: preferred (which all four live Clusters
+      # currently set) to required. See the header comment for why -- required
+      # is the correct end state on a single-node cluster, not merely the
+      # default CNPG would have picked.
+      mutate:
+        patchStrategicMerge:
+          spec:
+            affinity:
+              enablePodAntiAffinity: true
+              podAntiAffinityType: required
+              topologyKey: kubernetes.io/hostname
+
+    - name: reject-ha-revert
+      match:
+        any:
+          - resources:
+              kinds:
+                - postgresql.cnpg.io/v1/Cluster
+              operations:
+                - CREATE
+                - UPDATE
+      # Excluded for the same reason, and here it is not merely consistency:
+      # without it this rule would reject every Flux apply of the three brain
+      # Clusters outright, since nothing has mutated them up to 2.
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - ssint-main-ai
+                - ssint-main-cal
+              names:
+                - gbrain-pg
+                - hindsight-pg
+                - cal-pg
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.labels."resiliency.simplesalt.company/ha" || request.object.metadata.annotations."resiliency.simplesalt.company/ha" || '''' }}'
+            operator: NotEquals
+            value: exempt
+      validate:
+        failureAction: Enforce
+        message: >-
+          This Cluster resolves to fewer than 2 instances, or to pod
+          anti-affinity that is not required and node-scoped. The mutate rules
+          above (default-ha-instances, required-pod-anti-affinity) set this
+          automatically and unconditionally, so the only way to reach this
+          state is a request that also disables the mutation -- which this
+          rule exists to refuse. Add resiliency.simplesalt.company/ha: exempt
+          if this Cluster genuinely does not need a standby.
+        deny:
+          conditions:
+            any:
+              - key: '{{ request.object.spec.instances || `0` }}'
+                operator: LessThan
+                value: 2
+              - key: '{{ request.object.spec.affinity.enablePodAntiAffinity || `false` }}'
+                operator: NotEquals
+                value: true
+              - key: '{{ request.object.spec.affinity.podAntiAffinityType || '''' }}'
+                operator: NotEquals
+                value: required
+              - key: '{{ request.object.spec.affinity.topologyKey || '''' }}'
+                operator: NotEquals
+                value: kubernetes.io/hostname

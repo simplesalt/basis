@@ -55,12 +55,23 @@ spec:
   # has a completely different shape from OLTP app data, and a bad maintenance
   # job or an ingest burst must not be able to starve gbrain-pg / hindsight-pg /
   # cal-pg on a shared node. CNPG Clusters are cheap; blast-radius isn't.
-  instances: 1
+  #
+  # instances and affinity are deliberately absent: policies.resiliency.yaml's
+  # default-ha-instances and required-pod-anti-affinity rules supply
+  # instances: 2 with required, node-scoped anti-affinity at admission. Setting
+  # either here would make Flux the field owner and put kustomize-controller in
+  # a re-apply fight with the Kyverno mutation on every reconcile, which is the
+  # one thing that arrangement cannot survive. The replica sits Pending until a
+  # second node exists; see that file's header for why that is the design and
+  # not a deferral.
   imageName: ghcr.io/cloudnative-pg/postgresql:17
 
-  # Scaling out later is an integer bump here plus raising minSyncReplicas /
-  # maxSyncReplicas -- no redesign, which is the whole reason for choosing CNPG
-  # over a log store whose replication is not a knob.
+  # Replication stays asynchronous, and that is load-bearing now rather than
+  # merely adequate: the second instance is unschedulable until a second node
+  # joins, and a non-zero minSyncReplicas would make every commit block waiting
+  # for a synchronous standby that cannot exist yet -- turning the parked
+  # replica from free into a total ingest outage. Raise these only alongside a
+  # real second node.
   minSyncReplicas: 0
   maxSyncReplicas: 0
   replicationSlots:
@@ -70,8 +81,6 @@ spec:
   primaryUpdateStrategy: unsupervised
   primaryUpdateMethod: restart
   enablePDB: true
-  affinity:
-    podAntiAffinityType: preferred
 
   storage:
     size: 20Gi
@@ -872,11 +881,15 @@ spec:
 # Kubernetes API is therefore the only avenue, so this identity trades "no
 # cluster access" for "read one PVC's status field", not for anything wider.
 #
-# resourceNames pins this to logs-pg-1, the PVC name CNPG derives from
-# instances: 1 above. Scaling instances out (see the comment on that field)
-# would add logs-pg-2 etc., which would need adding here too -- but rotate()
-# only ever measures and acts on the primary it is connected to, so a single
-# resourceName matches the current design regardless.
+# resourceNames pins this to logs-pg-1, the PVC CNPG derives for the first
+# instance. The Kyverno HA mutation makes this Cluster instances: 2, so
+# logs-pg-2 appears as soon as a second node can host it -- deliberately not
+# added here. rotate() wants one number, the PVC's declared capacity, and both
+# PVCs are provisioned from the same storage.size, so logs-pg-1 answers that
+# question correctly even on a run where logs-pg-2 is the primary. Should
+# logs-pg-1 ever go away entirely, the lookup fails non-fatally and rotate()
+# skips only its size cap, which is the degradation the initContainer is
+# already built around.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
