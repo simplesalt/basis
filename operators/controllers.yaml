@@ -157,11 +157,7 @@ spec:
     kubeEtcd:
       enabled: false
     grafana:
-      adminPassword: admin
-      persistence:
-        enabled: false
-      ingress:
-        enabled: false
+      enabled: false
     alertmanager:
       alertmanagerSpec:
         storage:
