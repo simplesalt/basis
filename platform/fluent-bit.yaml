@@ -177,6 +177,13 @@ spec:
 # are tailed, which load logs-pg further — a spiral that gets worse exactly
 # when the database is least able to absorb it. Container log filenames are
 # <pod>_<namespace>_<container>-<id>.log.
+#
+# logs-pg-[0-9]* matches the CNPG instance pods and nothing else. A bare
+# logs-pg-* also swallowed logs-pg-rotate-<ts>-<hash>, the daily retention
+# CronJob, which is not part of the spiral: its output is fixed and tiny and
+# does not grow when logs-pg degrades. That exclusion discarded the psql
+# stderr from a failing rotate run, and a suppressed channel is
+# indistinguishable from a job that emitted nothing.
 apiVersion: fluentbit.fluent.io/v1alpha2
 kind: ClusterInput
 metadata:
@@ -193,7 +200,7 @@ spec:
   tail:
     tag: kube.*
     path: /var/log/containers/*.log
-    excludePath: /var/log/containers/fluent-bit-*_cluster-main-observability_*.log,/var/log/containers/logs-pg-*_cluster-main-observability_*.log,/var/log/containers/logs-postgrest-*_cluster-main-observability_*.log,/var/log/containers/logs-mcp-*_cluster-main-observability_*.log
+    excludePath: /var/log/containers/fluent-bit-*_cluster-main-observability_*.log,/var/log/containers/logs-pg-[0-9]*_cluster-main-observability_*.log,/var/log/containers/logs-postgrest-*_cluster-main-observability_*.log,/var/log/containers/logs-mcp-*_cluster-main-observability_*.log
     multilineParser: cri
     skipLongLines: true
     refreshIntervalSeconds: 10
