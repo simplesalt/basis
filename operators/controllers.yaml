@@ -235,3 +235,15 @@ spec:
       enable: false
     fluentd:
       enable: false
+    operator:
+      # The chart caps the operator at 60Mi. An OOMKill here is a quiet
+      # failure: the DaemonSet keeps shipping on its last rendered config
+      # while newly added Filter CRs appear to simply do nothing. Headroom is
+      # cheaper than diagnosing that.
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 200m
+          memory: 192Mi
