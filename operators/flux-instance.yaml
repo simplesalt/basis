@@ -43,3 +43,54 @@ spec:
           - op: replace
             path: /spec/template/spec/containers/0/args/2
             value: --log-level=error
+
+      # source-controller at --log-level=info logs "no changes since last
+      # reconcilation" for every GitRepository on every poll: 331 lines / 140 KB
+      # per 2h window, almost entirely this one no-op message. Reconcile outcomes
+      # remain visible as GitRepository status conditions and as Events when
+      # something actually changes.
+      - target:
+          kind: Deployment
+          name: source-controller
+        patch: |
+          - op: test
+            path: /spec/template/spec/containers/0/args/2
+            value: --log-level=info
+          - op: replace
+            path: /spec/template/spec/containers/0/args/2
+            value: --log-level=error
+
+      # helm-controller at --log-level=info logs "release in-sync with desired
+      # state" and "HelmChart/... is in-sync" on every reconcile of every
+      # HelmRelease: 285 lines / 114 KB per 2h window, almost entirely these two
+      # no-op messages. Sync state remains visible via HelmRelease status
+      # conditions and as Events when a release actually changes.
+      - target:
+          kind: Deployment
+          name: helm-controller
+        patch: |
+          - op: test
+            path: /spec/template/spec/containers/0/args/2
+            value: --log-level=info
+          - op: replace
+            path: /spec/template/spec/containers/0/args/2
+            value: --log-level=error
+
+      # notification-controller at --log-level=info logs "discarding event, no
+      # alerts found for the involved object" from the event-server for every
+      # event with no matching Alert: 249 lines / 89 KB per 2h window. This
+      # controller has no --events-addr arg (it is the sink, not a sender), so
+      # --log-level sits at args index 1, not 2 like the other controllers --
+      # verified against the live Deployment rather than assumed. Events that do
+      # match an Alert are still delivered and visible at the provider; nothing
+      # about alert delivery depends on this log line.
+      - target:
+          kind: Deployment
+          name: notification-controller
+        patch: |
+          - op: test
+            path: /spec/template/spec/containers/0/args/1
+            value: --log-level=info
+          - op: replace
+            path: /spec/template/spec/containers/0/args/1
+            value: --log-level=error
