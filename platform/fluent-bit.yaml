@@ -20,6 +20,12 @@ metadata:
     env: main
     capability: observability
 spec:
+  # Bumped to force a rolling restart when the mounted config changes --
+  # fluent-bit has no sidecar watching the Secret volume for edits, so a
+  # config-only push (no image/spec change) would otherwise sit unapplied
+  # until the DaemonSet's pods happen to cycle for an unrelated reason.
+  annotations:
+    restart-epoch: "2026-08-31-390"
   image: ghcr.io/fluent/fluent-operator/fluent-bit:5.1.0
   fluentBitConfigName: fluent-bit-config
   # An empty selector matches every namespace, which is the point: a workload
