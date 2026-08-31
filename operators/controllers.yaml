@@ -180,189 +180,58 @@ spec:
         namespace: flux-system
   interval: 5m
 ---
+# fluent-operator, not the fluent-bit chart. The chart can only express one
+# central pipeline, so every filter rule for a misbehaving workload had to be
+# written here, in a file that workload's owner does not touch. The operator
+# turns the pipeline into CRs, and adds a namespaced Filter kind: a workload
+# ships its own noise rule alongside its own Deployment.
+#
+# The DaemonSet is still fluent-bit and the sink is still out_pgsql. The
+# operator's image is FROM fluent/fluent-bit and only swaps the entrypoint for
+# a config watcher, so the plugin set -- including pgsql, which is not in the
+# CMake defaults and only exists because Fluent's own Dockerfile turns it on --
+# is the same binary we run today.
+#
+# The pipeline itself lives in platform/fluent-bit.yaml, next to logs-pg, and
+# is applied by the platform Kustomization, which dependsOn this one so the
+# CRDs exist before the CRs referencing them.
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
-  name: fluent-bit
+  name: fluent-operator
   namespace: cluster-main-observability
   labels:
-    app.kubernetes.io/name: fluent-bit
+    app.kubernetes.io/name: fluent-operator
     app.kubernetes.io/part-of: observability
     app.kubernetes.io/component: logging
     entity: cluster
     env: main
     capability: observability
 spec:
-  releaseName: fluent-bit
+  releaseName: fluent-operator
   install:
     createNamespace: true
+    crds: Create
+  upgrade:
+    crds: CreateReplace
   chart:
     spec:
-      chart: fluent-bit
+      chart: fluent-operator
       sourceRef:
         kind: HelmRepository
         name: fluent
         namespace: flux-system
   interval: 5m
   values:
-    kind: DaemonSet
-    # Credentials for the pgsql output below. fluent-bit interpolates ${VAR}
-    # from the process environment, so the CNPG-managed Secret never appears in
-    # git or in the rendered config. logs-pg-app lives in this namespace and is
-    # created by the logs-pg Cluster in platform/logs-pg.yaml.
-    env:
-      - name: LOGS_PG_HOST
-        valueFrom:
-          secretKeyRef:
-            name: logs-pg-app
-            key: host
-      - name: LOGS_PG_USER
-        valueFrom:
-          secretKeyRef:
-            name: logs-pg-app
-            key: username
-      - name: LOGS_PG_PASSWORD
-        valueFrom:
-          secretKeyRef:
-            name: logs-pg-app
-            key: password
-      - name: LOGS_PG_DATABASE
-        valueFrom:
-          secretKeyRef:
-            name: logs-pg-app
-            key: dbname
-    config:
-      service: |
-        [SERVICE]
-            Daemon Off
-            Flush 1
-            Log_Level info
-            Parsers_File /fluent-bit/etc/parsers.conf
-            Parsers_File /fluent-bit/etc/conf/custom_parsers.conf
-            HTTP_Server On
-            HTTP_Listen 0.0.0.0
-            HTTP_Port 2020
-            Health_Check On
-            storage.path /var/lib/fluent-bit/storage/
-            storage.sync normal
-            storage.checksum off
-            storage.backlog.mem_limit 64M
-      inputs: |
-        [INPUT]
-            Name systemd
-            Tag host.*
-            Read_From_Tail On
-            Strip_Underscores On
-        # The log pipeline must not tail its own components. Without this
-        # exclusion a logs-pg wobble makes PostgREST emit error lines at several
-        # per second, which are tailed, which load logs-pg further — a spiral
-        # that gets worse exactly when the database is least able to absorb it.
-        # Container log filenames are <pod>_<namespace>_<container>-<id>.log.
-        [INPUT]
-            Name tail
-            Tag kube.*
-            Path /var/log/containers/*.log
-            Exclude_Path /var/log/containers/fluent-bit-*_cluster-main-observability_*.log,/var/log/containers/logs-pg-*_cluster-main-observability_*.log,/var/log/containers/logs-postgrest-*_cluster-main-observability_*.log,/var/log/containers/logs-mcp-*_cluster-main-observability_*.log
-            multiline.parser cri
-            Skip_Long_Lines On
-            Refresh_Interval 10
-            Mem_Buf_Limit 32M
-            DB /var/lib/fluent-bit/tail-containers.db
-            storage.type filesystem
-      filters: |
-        [FILTER]
-            Name kubernetes
-            Match kube.*
-            Kube_Tag_Prefix kube.var.log.containers.
-            Merge_Log On
-            Keep_Log On
-            K8S-Logging.Parser On
-            K8S-Logging.Exclude On
-            # Labels are what makes `-l app=foo` possible against the log store,
-            # so they are worth their weight on every record: without them a
-            # workload can only be addressed by the pod-name prefix, which
-            # changes on every ReplicaSet roll. public.logs promotes them to a
-            # generated jsonb column with a GIN index over it.
-            #
-            # Annotations stay off. They carry
-            # kubectl.kubernetes.io/last-applied-configuration, which is an
-            # entire serialised manifest attached to every single log line.
-            Labels On
-            Annotations Off
-      outputs: |
-        [OUTPUT]
-            Name stdout
-            Match host.*
-            Format json_lines
-        # Timestamp_Key is deliberately absent, and adding it back breaks all
-        # ingest. The plugin does not read the timestamp from that key -- it
-        # serialises the msgpack event time INTO a JSON key of that name, then
-        # emits SELECT ... to_timestamp(CAST(value->>'<key>' AS FLOAT)) ... .
-        # Naming it "time" collided with the CRI parser's own string-valued
-        # "time" field, which survives in the record; json ->> takes the LAST
-        # duplicate key, so Postgres got an ISO8601 string and every INSERT
-        # failed with "invalid input syntax for type double precision". With
-        # Retry_Limit no_limits that retried forever and no row ever landed.
-        # The default key is "date", which nothing else in the record uses.
-        [OUTPUT]
-            Name pgsql
-            Match kube.*
-            Host ${LOGS_PG_HOST}
-            Port 5432
-            User ${LOGS_PG_USER}
-            Password ${LOGS_PG_PASSWORD}
-            Database ${LOGS_PG_DATABASE}
-            Table logs
-            Retry_Limit no_limits
-            storage.total_limit_size 5G
-    tolerations:
-      - effect: NoSchedule
-        operator: Exists
-    # daemonSetVolumeMounts, not volumeMounts. The chart has no volumeMounts
-    # key at all: _pod.tpl renders daemonSetVolumeMounts when kind is DaemonSet
-    # and daemonSetVolumes alongside it. Spelling it volumeMounts silently
-    # dropped every mount below while the volumes above them were still
-    # created, so flbstate existed in the pod spec but was never mounted and
-    # both the tail position DB and the 5G filesystem buffer wrote to the
-    # container's ephemeral filesystem -- i.e. the durability this buffer
-    # exists for was not there.
-    daemonSetVolumeMounts:
-      - name: varlog
-        mountPath: /var/log
-        readOnly: true
-      - name: varlibdockercontainers
-        mountPath: /var/lib/docker/containers
-        readOnly: true
-      - name: etcmachineid
-        mountPath: /etc/machine-id
-        readOnly: true
-      - name: systemd
-        mountPath: /run/systemd
-        readOnly: true
-      - name: flbstate
-        mountPath: /var/lib/fluent-bit
-    daemonSetVolumes:
-      - name: varlog
-        hostPath:
-          path: /var/log
-      - name: varlibdockercontainers
-        hostPath:
-          path: /var/lib/docker/containers
-      - name: etcmachineid
-        hostPath:
-          path: /etc/machine-id
-          type: File
-      - name: systemd
-        hostPath:
-          path: /run/systemd
-      # The tail input's position DB and the output's filesystem buffer both
-      # need a writable, node-local, restart-surviving path. /var/log is mounted
-      # read-only above and must stay that way, hence a separate volume.
-      #
-      # This buffer, not kubelet's 200Mi-per-container rotation, is the real
-      # replay mechanism: it is what makes a multi-hour logs-pg outage a delay
-      # rather than a hole in the record.
-      - name: flbstate
-        hostPath:
-          path: /var/lib/fluent-bit
-          type: DirectoryOrCreate
+    # containerd, so the operator mounts /var/log/containers rather than the
+    # docker path; the tail input's Path is resolved against the host either
+    # way, but the wrong value gives fluent-bit an empty directory.
+    containerRuntime: containerd
+    # The chart ships a starter Kubernetes pipeline -- its own ClusterInput,
+    # ClusterFilter and stdout ClusterOutput -- which would sit alongside ours
+    # and duplicate every record. Ours is checked in as CRs; the chart is asked
+    # for the operator and the CRDs only.
+    fluentbit:
+      enable: false
+    fluentd:
+      enable: false

@@ -12,8 +12,10 @@
 # health-checks the cnpg HelmRelease, so the CNPG CRDs are guaranteed registered
 # before any of this reconciles.
 #
-# Note the ordering inversion: fluent-bit (the writer) lives in operators/ and
-# so reconciles BEFORE logs-pg exists. It is tolerable, but not free, and the
+# fluent-bit (the writer) is fluent-bit.yaml in this same directory, so it and
+# logs-pg reconcile together with no ordering between them. Flux does not gate
+# one resource in a Kustomization on another, so the writer can and does come
+# up before the database exists. That is tolerable, but not free, and the
 # distinction matters:
 #
 #   At RUNTIME, out_pgsql returns FLB_RETRY on a failed flush and the

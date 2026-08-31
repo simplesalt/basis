@@ -29,6 +29,12 @@ spec:
       kind: HelmRelease
       name: cnpg
       namespace: cnpg-system
+    # Gates the platform Kustomization on the fluent-bit CRDs existing, since
+    # platform/fluent-bit.yaml is nothing but CRs against them.
+    - apiVersion: helm.toolkit.fluxcd.io/v2
+      kind: HelmRelease
+      name: fluent-operator
+      namespace: cluster-main-observability
 ---
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization

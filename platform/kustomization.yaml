@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - cf-providers.yaml
   - cf-runtime.yaml
+  - fluent-bit.yaml
   - gcp-providers.yaml
   - gcp-runtime.yaml
   - human-operator.yaml
