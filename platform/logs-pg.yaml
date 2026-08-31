@@ -1067,9 +1067,15 @@ spec:
               # has no conditional-argument syntax of its own. PVC_BYTES is
               # re-validated as all-digits here rather than trusted just
               # because the initContainer wrote it, so a corrupt or truncated
-              # file falls back to the no-size-cap call instead of feeding
-              # anything unexpected into `:pvc_bytes`, which psql substitutes
-              # unquoted into the SQL text.
+              # file falls back to the no-size-cap call instead of being
+              # pasted unquoted into the SQL text.
+              #
+              # The value is interpolated by the shell, not by psql -v. A -c
+              # string is handed to the server as-is: psql documents it as
+              # needing to be "completely parsable by the server (i.e. it
+              # contains no psql-specific features)", and :pvc_bytes is such a
+              # feature. It reached the server literally and every run with a
+              # PVC reading errored out.
               command:
                 - sh
                 - -c
@@ -1082,8 +1088,8 @@ spec:
                     ''|*[!0-9]*) PVC_BYTES="" ;;
                   esac
                   if [ -n "$PVC_BYTES" ]; then
-                    exec psql -v ON_ERROR_STOP=1 -v pvc_bytes="$PVC_BYTES" \
-                      -c "SELECT * FROM logs_maint.rotate(pvc_bytes => :pvc_bytes)" \
+                    exec psql -v ON_ERROR_STOP=1 \
+                      -c "SELECT * FROM logs_maint.rotate(pvc_bytes => $PVC_BYTES)" \
                       "$DATABASE_URL"
                   else
                     exec psql -v ON_ERROR_STOP=1 \
