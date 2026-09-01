@@ -61,8 +61,9 @@
 #
 # Part 1 -- HA replica on another node. default-ha-instances and
 # required-pod-anti-affinity mutate every Cluster to instances: 2 and required,
-# node-scoped pod anti-affinity; reject-ha-revert denies a subsequent write that
-# undoes either. required, not CNPG's default preferred, is the deliberate
+# node-scoped pod anti-affinity; reject-ha-revert backstops the affinity half.
+# It deliberately does not police instances -- see the note on that rule for
+# why no admission rule can. required, not CNPG's default preferred, is the
 # choice: this cluster has exactly one node today. preferred would schedule the
 # second instance onto that same node, where it just doubles memory pressure
 # (gbrain-pg, hindsight-pg and cal-pg all run with empty spec.resources, i.e.
@@ -75,25 +76,49 @@
 # not "wait for node 2 before enabling HA", it is the mechanism that makes node
 # 2 joining the activation trigger.
 #
-# The four live Clusters (gbrain-pg, hindsight-pg, cal-pg, logs-pg) currently
-# set podAntiAffinityType: preferred explicitly. required-pod-anti-affinity
-# overrides that -- the mutate patch is unconditional on the three affinity
-# fields, not a fill-in-if-absent (contrast default-storage-tier's `+()`
-# conditional-add above), because an explicit preferred left standing would
-# quietly keep every live Cluster in the colocated, unbounded-memory
-# configuration this rule exists to prevent. There is nothing to preserve by
-# respecting an existing preferred: it was never a deliberate per-database
-# choice, just CNPG's own default landing in the manifest.
+# gbrain-pg, hindsight-pg and cal-pg all carry podAntiAffinityType: preferred
+# in their live spec, and none of them declares it in git. podAntiAffinityType
+# has no default in the CRD schema; the value is written by CNPG's own
+# defaulting webhook. required-pod-anti-affinity overrides it -- the mutate
+# patch is unconditional on the three affinity fields, not a fill-in-if-absent
+# (contrast default-storage-tier's `+()` conditional-add above), because a
+# preferred left standing would quietly keep those Clusters in the colocated,
+# unbounded-memory configuration this rule exists to prevent. There is nothing
+# to preserve by respecting it: it was never a per-database choice, just the
+# operator's default. Being a webhook default rather than a schema default also
+# means the two webhooks race in principle; the unconditional patch is what
+# makes the outcome independent of who runs last.
 #
 # Nothing here gates on Cluster health. order.yaml's healthChecks cover only
-# HelmReleases and crossplane Providers, and there are no PrometheusRules in
-# this repo, so a Cluster sitting at readyInstances: 1/2 while its second
-# instance is Pending is expected and does not block reconciliation of anything
-# else. The CNPG-generated PDB is scoped to cnpg.io/instanceRole: primary, so
-# its expectedPods is 1 regardless of instance count -- bumping instances does
-# not relax that PDB, and safe drain does not depend on it: CNPG fails over to
-# a replica on another node and deletes the old primary directly, bypassing the
-# eviction API, which is exactly why the replica has to be on a different node.
+# the two crossplane Providers, and there are no PrometheusRules in this repo,
+# so a Cluster sitting at readyInstances: 1/2 while its second instance is
+# Pending does not block reconciliation of anything else -- confirmed live,
+# ss-basis-platform stays Ready and drift-free with logs-pg in exactly that
+# state. The CNPG-generated PDB is scoped to cnpg.io/instanceRole: primary, so
+# its expectedPods is 1 regardless of instance count: bumping instances does
+# not relax it, and CNPG only builds a second, replica-scoped PDB above
+# instances: 3.
+#
+# What that parked state does block is the Cluster's own reconciliation, and
+# this is the real cost of the mechanism above. CNPG's reconcile returns early
+# while any instance Job is running, and the join Job for a Pending replica
+# never completes and never fails, so the operator never reaches its
+# rolling-update path. A Cluster parked waiting for node 2 will accept a spec
+# change -- Flux applies it, Flux reports Ready -- and never act on it: no pod
+# roll, no image bump, no postgresql parameter change, no operator upgrade,
+# indefinitely and with no timeout. Config changes to a parked Cluster are
+# silently deferred, not applied. The same guard is what stops the operator
+# doing anything destructive to the healthy primary, so the state is stable
+# rather than degrading, but it is not free and it is not cosmetic.
+#
+# Drain safety is likewise deferred rather than delivered while parked. The
+# primary PDB blocks eviction at the Kubernetes API layer, and CNPG's
+# pre-drain switchover declines to act whenever spec.instances does not equal
+# status.readyInstances -- which is precisely the parked condition. Draining
+# the sole node today still hangs, exactly as it did at instances: 1. Node 2
+# joining is what converts this from deferred to delivered: the replica
+# schedules, readyInstances reaches 2, and both the rolling-update path and
+# the pre-drain switchover unblock on their own.
 #
 # Escape hatch: a Cluster carrying the label or annotation
 # resiliency.simplesalt.company/ha: exempt is skipped by all three HA rules --
@@ -101,18 +126,26 @@
 # database, and it has to say so in git the way every other escape hatch in
 # this repo does.
 #
-# A mutation on spec.instances only works where git does not already own that
+# A mutation on spec.instances is cleanest where git does not also own that
 # field. Flux applies server-side, so a manifest that states instances: 1 makes
-# kustomize-controller the field owner: it would re-apply 1 on every reconcile,
-# Kyverno would re-mutate to 2, and CNPG would build and tear down the second
-# instance in a loop. logs-pg.yaml in this directory therefore states neither
-# instances nor affinity and lets these rules supply both.
+# kustomize-controller the field owner and re-applies 1 on every reconcile
+# while Kyverno re-mutates to 2. The stored value stays 2 throughout, so CNPG
+# never observes a decrease and there is no build/teardown loop -- the cost is
+# that git permanently disagrees with the cluster about a number git does not
+# control. logs-pg.yaml in this directory therefore states neither instances
+# nor affinity and lets these rules supply both.
 #
 # gbrain-pg, hindsight-pg and cal-pg are defined in simplesalt/brain
-# (manifests/ai.yaml, manifests/cal.yaml) and still declare instances: 1, so
-# they are excluded below until that repo drops the field. The exclusion is the
-# alternative to knowingly starting that loop in three production databases --
-# it is temporary, and simplesalt/projects#402 removes it.
+# (manifests/ai.yaml, manifests/cal.yaml). They no longer declare instances --
+# simplesalt/brain@639bb1ad dropped the field -- so the original reason for
+# excluding them is gone. They stay excluded for a different and larger reason:
+# removing the exclusion would park all three in the waiting-for-node-2 state
+# described above, and a parked Cluster silently ignores every subsequent spec
+# change. That is an acceptable trade for logs-pg, which stores logs. It is not
+# an acceptable trade for three production databases that would then be unable
+# to take an image bump or a parameter change until a second node exists.
+# simplesalt/projects#402 removes the exclusion once node 2 is up, at which
+# point the state is entered and left in one step rather than camped in.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -325,7 +358,8 @@ spec:
                 - UPDATE
       # Excluded for the same reason, and here it is not merely consistency:
       # without it this rule would reject every Flux apply of the three brain
-      # Clusters outright, since nothing has mutated them up to 2.
+      # Clusters outright, since required-pod-anti-affinity is excluded too and
+      # so their affinity is still the operator-defaulted preferred.
       exclude:
         any:
           - resources:
@@ -341,22 +375,41 @@ spec:
           - key: '{{ request.object.metadata.labels."resiliency.simplesalt.company/ha" || request.object.metadata.annotations."resiliency.simplesalt.company/ha" || '''' }}'
             operator: NotEquals
             value: exempt
+      # There is deliberately no spec.instances condition here, and none can be
+      # written. The CNPG CRD declares spec.instances required with default: 1,
+      # and CRD structural defaulting runs during request decode -- before any
+      # webhook. By the time Kyverno sees the object, a manifest that wrote
+      # instances: 1 and a manifest that wrote nothing are byte-identical, so no
+      # admission rule can tell an author's mistake from an omission. A
+      # condition here would also be unreachable regardless: default-ha-instances
+      # is a mutation, Kyverno's mutating webhook runs before its validating
+      # webhook, so instances is already >= 2 by the time this rule evaluates.
+      #
+      # The consequence is accepted, not worked around: a Cluster manifest that
+      # states instances: 1 is silently corrected to 2 and stays there, so the
+      # cluster is right and only git is wrong. That divergence is real -- Flux
+      # owns the field and re-applies 1 on every reconcile while Kyverno
+      # re-mutates to 2 -- but it is a git hygiene problem, not an availability
+      # one, and the only place the information needed to catch it survives is
+      # the manifest text itself. Catching it belongs in a repo-side lint, not
+      # here. Do not add an instances condition back believing it protects
+      # anything.
+      #
+      # The affinity conditions below are unreachable for the same
+      # mutate-before-validate reason. They are kept only as a backstop for a
+      # mutation that errors while Kyverno is otherwise serving.
       validate:
         failureAction: Enforce
         message: >-
-          This Cluster resolves to fewer than 2 instances, or to pod
-          anti-affinity that is not required and node-scoped. The mutate rules
-          above (default-ha-instances, required-pod-anti-affinity) set this
-          automatically and unconditionally, so the only way to reach this
-          state is a request that also disables the mutation -- which this
-          rule exists to refuse. Add resiliency.simplesalt.company/ha: exempt
-          if this Cluster genuinely does not need a standby.
+          This Cluster resolves to pod anti-affinity that is not required and
+          node-scoped. required-pod-anti-affinity sets this automatically and
+          unconditionally, so the only way to reach this state is a request
+          that also defeats the mutation -- which this rule exists to refuse.
+          Add resiliency.simplesalt.company/ha: exempt if this Cluster
+          genuinely does not need a standby.
         deny:
           conditions:
             any:
-              - key: '{{ request.object.spec.instances || `0` }}'
-                operator: LessThan
-                value: 2
               - key: '{{ request.object.spec.affinity.enablePodAntiAffinity || `false` }}'
                 operator: NotEquals
                 value: true
