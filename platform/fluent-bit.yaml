@@ -25,7 +25,7 @@ spec:
   # config-only push (no image/spec change) would otherwise sit unapplied
   # until the DaemonSet's pods happen to cycle for an unrelated reason.
   annotations:
-    restart-epoch: "2026-08-31-390"
+    restart-epoch: "2026-09-01-390"
   image: ghcr.io/fluent/fluent-operator/fluent-bit:5.1.0
   fluentBitConfigName: fluent-bit-config
   # An empty selector matches every namespace, which is the point: a workload
@@ -206,12 +206,14 @@ spec:
   tail:
     tag: kube.*
     path: /var/log/containers/*.log
-    # ssint-main-coding is claude-rc agent chatter: 77% of all ingested bytes
+    # claude-rc (the coding-pod agent container) is 77% of all ingested bytes
     # and, sampled, zero error-signal matches. Excluding it at the tail is a
     # bigger and safer win than the grep filter below -- it never enters the
     # pipeline to be filtered, rather than being filtered out record by
-    # record. simplesalt/projects#390.
-    excludePath: /var/log/containers/fluent-bit-*_cluster-main-observability_*.log,/var/log/containers/logs-pg-[0-9]*_cluster-main-observability_*.log,/var/log/containers/logs-postgrest-*_cluster-main-observability_*.log,/var/log/containers/logs-mcp-*_cluster-main-observability_*.log,/var/log/containers/*_ssint-main-coding_*.log
+    # record. Scoped to the claude-rc container specifically, not the whole
+    # ssint-main-coding namespace, so sidecars (e.g. cred-rotator) still
+    # reach logs_api.errors. simplesalt/projects#390.
+    excludePath: /var/log/containers/fluent-bit-*_cluster-main-observability_*.log,/var/log/containers/logs-pg-[0-9]*_cluster-main-observability_*.log,/var/log/containers/logs-postgrest-*_cluster-main-observability_*.log,/var/log/containers/logs-mcp-*_cluster-main-observability_*.log,/var/log/containers/*_ssint-main-coding_claude-rc-*.log
     multilineParser: cri
     skipLongLines: true
     refreshIntervalSeconds: 10
