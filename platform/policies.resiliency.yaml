@@ -135,17 +135,12 @@
 # control. logs-pg.yaml in this directory therefore states neither instances
 # nor affinity and lets these rules supply both.
 #
-# gbrain-pg, hindsight-pg and cal-pg are defined in simplesalt/brain
-# (manifests/ai.yaml, manifests/cal.yaml). They no longer declare instances --
-# simplesalt/brain@639bb1ad dropped the field -- so the original reason for
-# excluding them is gone. They stay excluded for a different and larger reason:
-# removing the exclusion would park all three in the waiting-for-node-2 state
-# described above, and a parked Cluster silently ignores every subsequent spec
-# change. That is an acceptable trade for logs-pg, which stores logs. It is not
-# an acceptable trade for three production databases that would then be unable
-# to take an image bump or a parameter change until a second node exists.
-# simplesalt/projects#402 removes the exclusion once node 2 is up, at which
-# point the state is entered and left in one step rather than camped in.
+# gbrain-pg, hindsight-pg and cal-pg (simplesalt/brain, manifests/ai.yaml and
+# manifests/cal.yaml) no longer declare instances -- simplesalt/brain@639bb1ad
+# dropped the field -- so all three now take the same mutation as logs-pg. A
+# second node has not joined yet, so all four Clusters park in the
+# waiting-for-node-2 state described above until one does; simplesalt/projects#98
+# tracks bringing that node up.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -281,19 +276,6 @@ spec:
               operations:
                 - CREATE
                 - UPDATE
-      # Temporary: these three still declare instances: 1 in simplesalt/brain.
-      # Mutating a Flux-owned field starts a re-apply loop. Removed by
-      # simplesalt/projects#402, together in one commit with the brain change.
-      exclude:
-        any:
-          - resources:
-              namespaces:
-                - ssint-main-ai
-                - ssint-main-cal
-              names:
-                - gbrain-pg
-                - hindsight-pg
-                - cal-pg
       preconditions:
         all:
           - key: '{{ request.object.metadata.labels."resiliency.simplesalt.company/ha" || request.object.metadata.annotations."resiliency.simplesalt.company/ha" || '''' }}'
@@ -316,19 +298,6 @@ spec:
               operations:
                 - CREATE
                 - UPDATE
-      # Same exclusion as default-ha-instances above, and it has to stay in
-      # step with it: anti-affinity on a Cluster still pinned to instances: 1
-      # constrains a replica that does not exist.
-      exclude:
-        any:
-          - resources:
-              namespaces:
-                - ssint-main-ai
-                - ssint-main-cal
-              names:
-                - gbrain-pg
-                - hindsight-pg
-                - cal-pg
       preconditions:
         all:
           - key: '{{ request.object.metadata.labels."resiliency.simplesalt.company/ha" || request.object.metadata.annotations."resiliency.simplesalt.company/ha" || '''' }}'
@@ -356,20 +325,6 @@ spec:
               operations:
                 - CREATE
                 - UPDATE
-      # Excluded for the same reason, and here it is not merely consistency:
-      # without it this rule would reject every Flux apply of the three brain
-      # Clusters outright, since required-pod-anti-affinity is excluded too and
-      # so their affinity is still the operator-defaulted preferred.
-      exclude:
-        any:
-          - resources:
-              namespaces:
-                - ssint-main-ai
-                - ssint-main-cal
-              names:
-                - gbrain-pg
-                - hindsight-pg
-                - cal-pg
       preconditions:
         all:
           - key: '{{ request.object.metadata.labels."resiliency.simplesalt.company/ha" || request.object.metadata.annotations."resiliency.simplesalt.company/ha" || '''' }}'
