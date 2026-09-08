@@ -309,6 +309,60 @@ spec:
     - grep:
         exclude: "log http: TLS handshake error"
 ---
+# Scopes the host journal to the units that can actually explain a node
+# problem, and puts the row in a shape public.logs can store meaningfully.
+# Two stages in one CR, same layout as grep-errors above: filters run in list
+# order, so the allowlist drops everything else before the rename does any
+# work on it.
+#
+# The allowlist exists because the alternative is piping the whole journal
+# in, and logs-pg has no room for that (see grep-errors' own note on the
+# 20Gi PVC / 14-day retention). bootc-update, k3s, kcluster-node-network,
+# kcluster-provision and greenboot are the units that can answer "why did
+# this node not update" and "why did this node not come back" -- the
+# concrete gap that motivated this: neither k-0ad0ff18's missing
+# /var/run/reboot-required sentinel nor k-e7488b70's having one could be
+# explained, because the only record of it was bootc-update.service's
+# 03:00 journal entries, and journal content was write-only until now.
+#
+# The rename is not cosmetic. public.logs.message is `GENERATED ALWAYS AS
+# (data ->> 'log') STORED` -- that key is what the container pipeline's tail
+# parser produces, but journald keeps its own field names, so an unrenamed
+# row would insert cleanly and read back with message NULL, which is worse
+# than not capturing the line at all.
+#
+# This also reshapes what host-stdout below prints, since filters run once
+# against the tagged stream and every output sharing that tag sees the
+# result: host-stdout's live view narrows to the same five units, and its
+# MESSAGE key becomes log. That is accepted rather than avoided -- host-stdout
+# was never durable (see the tail input's excludePath note), so nothing
+# queryable is lost, and a quieter debug stream is arguably an improvement.
+# Keeping it byte-for-byte identical would mean cloning the tag with
+# rewrite_tag before filtering, which trades this one paragraph for an
+# emitter, a second tag namespace and doubled event volume through the
+# filter chain -- not justified for a stdout stream nobody retains.
+apiVersion: fluentbit.fluent.io/v1alpha2
+kind: ClusterFilter
+metadata:
+  name: host-allowlist
+  labels:
+    fluentbit.fluent.io/enabled: "true"
+    app.kubernetes.io/name: fluent-bit
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: logging
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  match: host.*
+  filters:
+    - grep:
+        regex: SYSTEMD_UNIT ^(bootc-update|k3s|kcluster-node-network|kcluster-provision|greenboot)
+    - modify:
+        rules:
+          - rename:
+              MESSAGE: log
+---
 apiVersion: fluentbit.fluent.io/v1alpha2
 kind: ClusterOutput
 metadata:
@@ -357,7 +411,13 @@ metadata:
     env: main
     capability: observability
 spec:
-  match: kube.*
+  # host.* rows reaching here have already been through host-allowlist above
+  # -- unit-scoped and MESSAGE renamed to log -- so widening the match to
+  # include them is routing, not a second filtering decision. A single Match
+  # cannot express both prefixes: Fluent Bit's glob syntax has no OR, only a
+  # trailing wildcard. Match_Regex is the field that can, hence that instead
+  # of Match here.
+  matchRegex: ^(kube|host)\..*$
   retry_limit: no_limits
   customPlugin:
     config: |

@@ -46,7 +46,17 @@ CREATE TABLE IF NOT EXISTS public.logs (
   container text GENERATED ALWAYS AS (data #>> '{kubernetes,container_name}') STORED,
   stream    text GENERATED ALWAYS AS (data ->> 'stream') STORED,
   message   text GENERATED ALWAYS AS (data ->> 'log') STORED,
-  labels    jsonb GENERATED ALWAYS AS (data #> '{kubernetes,labels}') STORED
+  labels    jsonb GENERATED ALWAYS AS (data #> '{kubernetes,labels}') STORED,
+  -- Host journal rows only. SYSTEMD_UNIT and HOSTNAME rather than
+  -- _SYSTEMD_UNIT/_HOSTNAME because the systemd ClusterInput runs with
+  -- stripUnderscores on. NULL for every kube.* row, same as namespace/pod/
+  -- container are NULL for every host.* row -- the two tag families each
+  -- populate their own half of this table's columns and leave the other
+  -- half NULL, which is why logs_api.entries and the container-oriented
+  -- endpoints below now exclude tag LIKE 'host.%' explicitly rather than
+  -- relying on these being absent by convention.
+  unit      text GENERATED ALWAYS AS (data ->> 'SYSTEMD_UNIT') STORED,
+  node      text GENERATED ALWAYS AS (data ->> 'HOSTNAME') STORED
 ) PARTITION BY RANGE ("time");
 
 -- labels arrived after the table did, and CREATE TABLE IF NOT EXISTS above
@@ -63,6 +73,24 @@ ALTER TABLE public.logs
   ADD COLUMN IF NOT EXISTS labels jsonb
   GENERATED ALWAYS AS (data #> '{kubernetes,labels}') STORED;
 
+-- unit and node arrived later still, for the same reason as labels above:
+-- host journal capture was added after this table existed on live clusters,
+-- so the columns need the same guarded ALTER as well as their place in the
+-- CREATE TABLE for a fresh install. Rows written before host capture, and
+-- every kube.* row regardless of when it was written, evaluate both to
+-- NULL here.
+--
+-- Both columns in one ALTER, unlike labels above, because adding a STORED
+-- generated column rewrites every partition under ACCESS EXCLUSIVE and
+-- ingest blocks for the duration. Two statements pay that twice over the
+-- same rows; one statement adds both in a single pass. IF NOT EXISTS is
+-- per-action, so a partially-applied earlier run still converges.
+ALTER TABLE public.logs
+  ADD COLUMN IF NOT EXISTS unit text
+  GENERATED ALWAYS AS (data ->> 'SYSTEMD_UNIT') STORED,
+  ADD COLUMN IF NOT EXISTS node text
+  GENERATED ALWAYS AS (data ->> 'HOSTNAME') STORED;
+
 -- Retention is DROP TABLE on a whole day's partition: an O(1) unlink, no
 -- row scan, no dead tuples, no vacuum debt. A DELETE ... WHERE time < x on
 -- a table at this write rate would generate more work than the ingest.
@@ -77,6 +105,12 @@ CREATE TABLE IF NOT EXISTS public.logs_default PARTITION OF public.logs DEFAULT;
 CREATE INDEX IF NOT EXISTS logs_time_idx ON public.logs ("time" DESC);
 CREATE INDEX IF NOT EXISTS logs_ns_time_idx ON public.logs (namespace, "time" DESC);
 CREATE INDEX IF NOT EXISTS logs_pod_time_idx ON public.logs (pod, "time" DESC);
+-- Same treatment as namespace/pod above, for the host-journal equivalents.
+-- The allowlist keeps this side of the table small, but the index is cheap
+-- at that volume and "which node" / "which unit" are exactly the two
+-- questions logs_api.host exists to answer quickly.
+CREATE INDEX IF NOT EXISTS logs_unit_time_idx ON public.logs (unit, "time" DESC);
+CREATE INDEX IF NOT EXISTS logs_node_time_idx ON public.logs (node, "time" DESC);
 
 -- Default jsonb_ops rather than the smaller jsonb_path_ops, because that
 -- variant indexes only containment (@>) and the `key` / `!key` existence
@@ -350,10 +384,17 @@ SELECT
   -- CREATE OR REPLACE VIEW may only add columns at the end, and inserting
   -- one earlier fails with "cannot change name of view column".
   l.labels    AS labels
-FROM public.logs l;
+FROM public.logs l
+-- Host journal rows share this table (see logs-pg's matchRegex in
+-- fluent-bit.yaml) and populate message via the same generated column, so
+-- without this exclusion they would silently start appearing here --
+-- namespace/pod/container/stream all NULL -- the moment host capture
+-- shipped, contradicting the view's own "every container log line" comment
+-- below. logs_api.host is the sibling view for that data.
+WHERE l.tag NOT LIKE 'host.%';
 
 COMMENT ON VIEW logs_api.entries IS
-  'Every captured container log line, newest first when ordered by "at". This is the raw feed: prefer the purpose-built endpoints (recent, errors, search, pod_tail) unless you need an arbitrary filter combination. Retention is 14 days; anything older has been dropped. This store retains error-signal lines only, not all container output. An empty result means no matching error-signal lines were recorded -- it does not mean the workload was silent, and it does not mean the pipeline is broken. To tell those apart, call workloads or volume: if they return rows, ingest is healthy. For a workload''s normal, unfiltered output use the flux MCP''s `get_kubernetes_logs` tool, which reads the live kubelet tail. The log pipeline''s own components -- fluent-bit, logs-pg, logs-postgrest and logs-mcp -- are excluded at ingest and never appear here at all. Every other namespace, including ssint-main-coding, is tailed in full and then cut down by the error filter.';
+  'Every captured container log line, newest first when ordered by "at". This is the raw feed: prefer the purpose-built endpoints (recent, errors, search, pod_tail) unless you need an arbitrary filter combination. Retention is 14 days; anything older has been dropped. This store retains error-signal lines only, not all container output. An empty result means no matching error-signal lines were recorded -- it does not mean the workload was silent, and it does not mean the pipeline is broken. To tell those apart, call workloads or volume: if they return rows, ingest is healthy. For a workload''s normal, unfiltered output use the flux MCP''s `get_kubernetes_logs` tool, which reads the live kubelet tail. The log pipeline''s own components -- fluent-bit, logs-pg, logs-postgrest and logs-mcp -- are excluded at ingest and never appear here at all. Every other namespace, including ssint-main-coding, is tailed in full and then cut down by the error filter. Host (node/systemd journal) records are not container log lines and never appear here; see logs_api.host.';
 COMMENT ON COLUMN logs_api.entries.at IS
   'UTC timestamp the line was emitted, as recorded by the container runtime.';
 COMMENT ON COLUMN logs_api.entries.namespace IS
@@ -368,6 +409,33 @@ COMMENT ON COLUMN logs_api.entries.message IS
   'The log line itself, with the container-runtime framing already stripped.';
 COMMENT ON COLUMN logs_api.entries.labels IS
   'The pod''s Kubernetes labels as captured at write time, e.g. {"app":"logs-mcp","entity":"cluster"}. Filter with PostgREST containment, ?labels=cs.{"app":"logs-mcp"}, which is index-backed. Null for lines written before label capture was enabled, and never backfilled: a pod''s labels today are not necessarily what they were when the line was emitted.';
+
+-- A separate view rather than folding this into entries above: entries'
+-- own COMMENT calls it "every captured container log line", and host
+-- journal rows are not that -- they carry no namespace/pod/container, and
+-- a consumer already relying on entries meaning "container" should not
+-- silently start seeing node/systemd data mixed in. PostgREST exposes this
+-- as its own /host resource (and agentgateway as its own MCP tool), which
+-- entries could not be made to do without breaking that contract.
+CREATE OR REPLACE VIEW logs_api.host AS
+SELECT
+  l."time" AS at,
+  l.node   AS node,
+  l.unit   AS unit,
+  l.message AS message
+FROM public.logs l
+WHERE l.tag LIKE 'host.%';
+
+COMMENT ON VIEW logs_api.host IS
+  'Host (node) journal lines, newest first when ordered by "at". This is not container output -- it is systemd journal entries read directly off each node, scoped at ingest to a small allowlist of units (bootc-update, k3s, kcluster-node-network, kcluster-provision, greenboot) chosen because they can explain a node failing to update or failing to come back afterward. Every other unit on the host journal is discarded before it reaches storage and was never captured -- an empty result here can mean either that an allowlisted unit was quiet, or that the question is about a unit outside the allowlist, which this store cannot answer regardless of the time window. Retention is 14 days, shared with the rest of public.logs. For a node''s current, unfiltered journal use the flux MCP against the node directly; this store has no shell-on-node equivalent and only ever holds what fluent-bit''s systemd input captured.';
+COMMENT ON COLUMN logs_api.host.at IS
+  'UTC timestamp the journal entry was written, per journald.';
+COMMENT ON COLUMN logs_api.host.node IS
+  'The node hostname the entry was read from, e.g. k-e7488b70. From journald''s HOSTNAME field.';
+COMMENT ON COLUMN logs_api.host.unit IS
+  'The systemd unit that logged the entry, e.g. bootc-update.service. From journald''s _SYSTEMD_UNIT field; always one of the allowlisted units, since anything else was dropped at ingest.';
+COMMENT ON COLUMN logs_api.host.message IS
+  'The journal entry text, from journald''s MESSAGE field.';
 
 -- Every signature below changed when label selection and absolute time
 -- bounds were added. CREATE OR REPLACE cannot alter a function's argument
@@ -418,6 +486,10 @@ CREATE OR REPLACE FUNCTION logs_api.recent(
       AND (container_filter IS NULL OR l.container = container_filter)
       AND (stream_filter    IS NULL OR l.stream = stream_filter)
       AND logs_maint.label_match(l.labels, label_selector)
+      -- Host journal rows share this table (see the entries view's comment
+      -- on this same exclusion) and would otherwise surface here with
+      -- every other column NULL.
+      AND l.tag NOT LIKE 'host.%'
     ORDER BY l."time" DESC
     LIMIT LEAST(max_rows, 1000)
   ) t (t_at, t_ns, t_pod, t_container, t_stream, t_message, t_labels)
@@ -460,6 +532,9 @@ CREATE OR REPLACE FUNCTION logs_api.errors(
       AND (container_filter IS NULL OR l.container = container_filter)
       AND logs_maint.label_match(l.labels, label_selector)
       AND l.message ~* '(error|fatal|panic|exception|traceback|segfault|fail(ed|ure)?)'
+      -- Host journal rows share this table and would otherwise surface here
+      -- with every other column NULL; see the entries view's comment.
+      AND l.tag NOT LIKE 'host.%'
     ORDER BY l."time" DESC
     LIMIT LEAST(max_rows, 1000)
   ) t (t_at, t_ns, t_pod, t_container, t_stream, t_message, t_labels)
@@ -499,6 +574,9 @@ CREATE OR REPLACE FUNCTION logs_api.search(
       AND (container_filter IS NULL OR l.container = container_filter)
       AND logs_maint.label_match(l.labels, label_selector)
       AND l.message ILIKE '%' || pattern || '%'
+      -- Host journal rows share this table and would otherwise surface here
+      -- with every other column NULL; see the entries view's comment.
+      AND l.tag NOT LIKE 'host.%'
     ORDER BY l."time" DESC
     LIMIT LEAST(max_rows, 1000)
   ) t (t_at, t_ns, t_pod, t_container, t_stream, t_message, t_labels)
@@ -540,6 +618,9 @@ CREATE OR REPLACE FUNCTION logs_api.pod_tail(
       AND (container_filter IS NULL OR l.container = container_filter)
       AND (stream_filter    IS NULL OR l.stream = stream_filter)
       AND logs_maint.label_match(l.labels, label_selector)
+      -- Host journal rows share this table and would otherwise surface here
+      -- with every other column NULL; see the entries view's comment.
+      AND l.tag NOT LIKE 'host.%'
     ORDER BY l."time" DESC
     LIMIT LEAST(max_rows, 1000)
   ) t (t_at, t_ns, t_pod, t_container, t_stream, t_message, t_labels)
@@ -569,6 +650,10 @@ CREATE OR REPLACE FUNCTION logs_api.volume(
     AND l."time" <= COALESCE(until_time, 'infinity'::timestamp)
     AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
     AND logs_maint.label_match(l.labels, label_selector)
+    -- Host journal rows share this table and would otherwise show up as a
+    -- phantom namespace=NULL/container=NULL group; see the entries view's
+    -- comment.
+    AND l.tag NOT LIKE 'host.%'
   GROUP BY l.namespace, l.container
   ORDER BY 3 DESC;
 $volume$;
@@ -599,6 +684,10 @@ CREATE OR REPLACE FUNCTION logs_api.workloads(
     AND l."time" <= COALESCE(until_time, 'infinity'::timestamp)
     AND (namespace_filter IS NULL OR l.namespace = namespace_filter)
     AND logs_maint.label_match(l.labels, label_selector)
+    -- Host journal rows share this table and would otherwise show up as a
+    -- phantom namespace=NULL/pod=NULL/container=NULL group; see the entries
+    -- view's comment.
+    AND l.tag NOT LIKE 'host.%'
   GROUP BY l.namespace, l.pod, l.container
   ORDER BY 4 DESC;
 $workloads$;
