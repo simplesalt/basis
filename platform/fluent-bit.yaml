@@ -362,6 +362,35 @@ spec:
         rules:
           - rename:
               MESSAGE: log
+    # k3s.service was 100% of captured host volume on first measurement:
+    # 1583 rows in 14 minutes, ~164k/day, which would have roughly doubled
+    # public.logs against the 2.84M rows the container pipeline holds over
+    # the same 14-day retention. The three stages below cut the measured
+    # noise, sampled at 1000 consecutive lines.
+    #
+    # They exclude by source, never by severity, and that distinction is
+    # load-bearing. Severity would be the obvious filter and would destroy
+    # the reason this capture exists: bootc-update.sh writes plain
+    # info-level text, so anything that drops info drops the one unit the
+    # allowlist was built for. Every rule here is therefore pinned to a
+    # k3s or etcd signature that cannot appear in a kcluster-* or
+    # bootc-update line.
+    #
+    # What survives: all klog W/E/F, all etcd warnings, and every line from
+    # a unit other than k3s. Deliberately NOT excluded are etcd's three
+    # chronic warnings -- etcdserver/util "apply request took too long",
+    # v3rpc/interceptor "request stats", rafthttp/peer "dropped" -- which
+    # were 171 of that 1000-line sample and are the next obvious cut if
+    # volume is still too high. They stay because they are not noise: the
+    # sampled applies were taking 486ms and 581ms, which is a real etcd
+    # latency problem, and silencing the evidence before diagnosing it is
+    # how a slow cluster becomes a quiet mystery.
+    - grep:
+        exclude: 'log "level":"info".*"caller":"(traceutil|mvcc|rafthttp)'
+    - grep:
+        exclude: 'log ^I[0-9]{4} .*(job_controller|reconciler_common|operation_generator|kubelet_volumes|pod_container_deletor|pod_startup_latency_tracker|cpu_manager|memory_manager)\.go:'
+    - grep:
+        exclude: 'log msg="Writing manifest: /var/lib/rancher'
 ---
 apiVersion: fluentbit.fluent.io/v1alpha2
 kind: ClusterOutput
