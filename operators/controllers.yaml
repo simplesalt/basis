@@ -268,7 +268,6 @@ metadata:
     entity: cluster
     capability: lifecycle
 spec:
-  suspend: true
   releaseName: kured
   chart:
     spec:
