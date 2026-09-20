@@ -112,6 +112,9 @@ spec:
       # pre-created) needs the planner to actually attempt it at execution time.
       enable_partitionwise_aggregate: "on"
       max_connections: "100"
+      wal_compression: "zstd"
+      max_wal_size: "2GB"
+      checkpoint_timeout: "15min"
 
   bootstrap:
     initdb:
