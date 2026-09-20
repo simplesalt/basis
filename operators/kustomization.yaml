@@ -6,3 +6,4 @@ resources:
   - helmrepos.yaml
   - controllers.yaml
   - bootc-switch-k-95509ca9.yaml
+  - bootc-switch-k-0ad0ff18.yaml
