@@ -5,3 +5,4 @@ resources:
   - ns.yaml
   - helmrepos.yaml
   - controllers.yaml
+  - bootc-switch-k-95509ca9.yaml
