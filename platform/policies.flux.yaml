@@ -1,0 +1,41 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: flux-governance
+  labels:
+    app.kubernetes.io/name: flux-governance
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: governance
+  annotations:
+    policies.kyverno.io/title: Flux governance
+    policies.kyverno.io/category: GitOps
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: HelmRelease
+    policies.kyverno.io/description: >-
+      Defaults spec.driftDetection.mode to enabled on every HelmRelease so that
+      helm-controller re-checks chart-applied objects against the stored release
+      manifest each interval. The dry-run in that check passes through Kyverno's
+      admission webhook, so a changed admission mutation reaches Helm-shipped
+      objects without a mutate-existing pass. The patch is add-if-absent, so a
+      HelmRelease that states a mode keeps it.
+spec:
+  background: false
+  webhookConfiguration:
+    failurePolicy: Ignore
+  rules:
+    - name: helmrelease-drift-detection
+      match:
+        any:
+          - resources:
+              kinds:
+                - helm.toolkit.fluxcd.io/v2/HelmRelease
+              operations:
+                - CREATE
+                - UPDATE
+      mutate:
+        patchStrategicMerge:
+          spec:
+            driftDetection:
+              +(mode): enabled

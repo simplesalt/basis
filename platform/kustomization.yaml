@@ -13,6 +13,7 @@ resources:
   - mcp-flux.yaml
   - policies.batch.yaml
   - policies.cleanup.yaml
+  - policies.flux.yaml
   - policies.resiliency.yaml
   - policies.secrets.yaml
   - policies.storage.yaml

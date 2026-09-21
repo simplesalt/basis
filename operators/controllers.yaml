@@ -74,6 +74,8 @@ spec:
         name: kyverno
         namespace: flux-system
   values:
+    backgroundController:
+      enabled: false
     # Chart defaults are --loggingFormat=text --v=2, and kyverno maps --v>=2 to
     # TRACE. That made kyverno the single largest log producer in the cluster:
     # 54.5 MB/day, 27% of all bytes, at ~1350 bytes per line, almost all of it
