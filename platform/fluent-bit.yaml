@@ -1,12 +1,4 @@
 ---
-# The log pipeline, as fluent-operator CRs. The operator itself is a
-# HelmRelease in operators/controllers.yaml; the platform Kustomization
-# dependsOn the operators one, so the CRDs are installed before this file is
-# applied.
-#
-# Every piece below carries fluentbit.fluent.io/enabled: "true", which is what
-# the ClusterFluentBitConfig selects on. A CR without that label is inert --
-# that is the intended way to take one out of the pipeline without deleting it.
 apiVersion: fluentbit.fluent.io/v1alpha2
 kind: FluentBit
 metadata:
@@ -20,22 +12,11 @@ metadata:
     env: main
     capability: observability
 spec:
-  # Bumped to force a rolling restart when the mounted config changes --
-  # fluent-bit has no sidecar watching the Secret volume for edits, so a
-  # config-only push (no image/spec change) would otherwise sit unapplied
-  # until the DaemonSet's pods happen to cycle for an unrelated reason.
   annotations:
     restart-epoch: "2026-09-01-390b"
   image: ghcr.io/fluent/fluent-operator/fluent-bit:5.1.0
   fluentBitConfigName: fluent-bit-config
-  # An empty selector matches every namespace, which is the point: a workload
-  # that emits predictable noise fixes it in its own manifests, by shipping a
-  # FluentBitConfig plus a Filter next to its Deployment, without an edit here.
   namespaceFluentBitCfgSelector: {}
-  # Measured steady state on this node is 9m CPU and 30Mi. The memory request
-  # is set well above that because the number that matters is not steady state
-  # -- it is a logs-pg outage, where storage.backlog.mem_limit alone is allowed
-  # 64M of replayed chunks on top of the tail buffers.
   resources:
     requests:
       cpu: 50m
@@ -54,11 +35,6 @@ spec:
     periodSeconds: 10
     timeoutSeconds: 15
     failureThreshold: 8
-  # The operator already mounts /var/log, /var/log/journal and
-  # /var/log/containers read-only, so only what it does not provide is listed
-  # here. positionDB is deliberately unused: it mounts a host path at
-  # /fluent-bit/tail, which would cover the tail DB but not the filesystem
-  # buffer, and the two have to share one durable directory.
   volumesMounts:
     - name: etcmachineid
       mountPath: /etc/machine-id
@@ -76,26 +52,10 @@ spec:
     - name: runsystemd
       hostPath:
         path: /run/systemd
-    # The tail input's position DB and the output's filesystem buffer both
-    # need a writable, node-local, restart-surviving path. /var/log is mounted
-    # read-only by the operator and must stay that way, hence a separate
-    # volume. Keeping the host path unchanged across the operator migration is
-    # what lets the existing tail offsets and buffered chunks be picked up
-    # rather than re-read or dropped.
-    #
-    # This buffer, not kubelet's 200Mi-per-container rotation, is the real
-    # replay mechanism: it is what makes a multi-hour logs-pg outage a delay
-    # rather than a hole in the record.
     - name: flbstate
       hostPath:
         path: /var/lib/fluent-bit
         type: DirectoryOrCreate
-  # Credentials for the pgsql output. fluent-bit interpolates ${VAR} from the
-  # process environment, so the CNPG-managed Secret never appears in git or in
-  # the rendered config. The operator does not touch these -- customPlugin
-  # bodies are passed through verbatim -- so the substitution is still
-  # fluent-bit's own. logs-pg-app lives in this namespace and is created by the
-  # logs-pg Cluster in platform/logs-pg.yaml.
   envVars:
     - name: LOGS_PG_HOST
       valueFrom:
@@ -178,18 +138,6 @@ spec:
     readFromTail: "on"
     stripUnderscores: "on"
 ---
-# The log pipeline must not tail its own components. Without this exclusion a
-# logs-pg wobble makes PostgREST emit error lines at several per second, which
-# are tailed, which load logs-pg further — a spiral that gets worse exactly
-# when the database is least able to absorb it. Container log filenames are
-# <pod>_<namespace>_<container>-<id>.log.
-#
-# logs-pg-[0-9]* matches the CNPG instance pods and nothing else. A bare
-# logs-pg-* also swallowed logs-pg-rotate-<ts>-<hash>, the daily retention
-# CronJob, which is not part of the spiral: its output is fixed and tiny and
-# does not grow when logs-pg degrades. That exclusion discarded the psql
-# stderr from a failing rotate run, and a suppressed channel is
-# indistinguishable from a job that emitted nothing.
 apiVersion: fluentbit.fluent.io/v1alpha2
 kind: ClusterInput
 metadata:
@@ -206,12 +154,6 @@ spec:
   tail:
     tag: kube.*
     path: /var/log/containers/*.log
-    # No ssint-main-coding exclude: claude-rc was tried as a tail-level
-    # exclude (simplesalt/projects#390) to cut its ~77% share of ingested
-    # bytes, but that also silently dropped any genuine claude-rc error --
-    # it never reached the grep-errors filter below, let alone
-    # logs_api.errors. claude-rc gets the same treatment as every other
-    # workload instead: tailed in full, cut down by grep-errors.
     excludePath: /var/log/containers/fluent-bit-*_cluster-main-observability_*.log,/var/log/containers/logs-pg-[0-9]*_cluster-main-observability_*.log,/var/log/containers/logs-postgrest-*_cluster-main-observability_*.log,/var/log/containers/logs-mcp-*_cluster-main-observability_*.log
     multilineParser: cri
     skipLongLines: true
@@ -241,49 +183,9 @@ spec:
         keepLog: true
         k8sLoggingParser: true
         k8sLoggingExclude: true
-        # Labels are what makes `-l app=foo` possible against the log store,
-        # so they are worth their weight on every record: without them a
-        # workload can only be addressed by the pod-name prefix, which changes
-        # on every ReplicaSet roll. public.logs promotes them to a generated
-        # jsonb column with a GIN index over it.
-        #
-        # Annotations stay off. They carry
-        # kubectl.kubernetes.io/last-applied-configuration, which is an entire
-        # serialised manifest attached to every single log line.
         labels: true
         annotations: false
 ---
-# Ingest-time error filter, simplesalt/projects#390. This was a general log
-# backend (#362 grew it past #299's original purpose); at 1.84M lines/day
-# it does not fit the 20Gi PVC at 14-day retention. Sampling put error-signal
-# lines (error, fail, fatal, panic, exception, traceback, refused, denied,
-# timeout, oom) at a 7.28% match rate -- a ~13.6x cut.
-#
-# This must run after the kubernetes filter (ordinal 0, unset) so labels are
-# already attached when it runs -- hence the explicit ordinal here. Without
-# it, FilterByOrdinalAndName's tie-break falls back to name, and
-# "grep-errors" < "kubernetes" alphabetically would run this first.
-#
-# Two stages, because the typed Grep CRD exposes exactly one Regex and one
-# Exclude, and this needs an OR of two independent Regex conditions on two
-# different keys:
-#
-#   1. customPlugin, since the operator's typed Grep has no way to combine
-#      two Regex clauses. Merge_Log On (the kubernetes filter above) puts
-#      parsed fields of JSON-emitting workloads at the record root, so a
-#      level match is checked as a second, more precise condition alongside
-#      the substring match, catching structured errors (e.g. {"level":"error"}
-#      with no keyword in the message) that the substring alone would miss.
-#   2. A plain typed Grep exclude, chained immediately after. Sampling turned
-#      up kyverno's admission webhook logging "http: TLS handshake error"
-#      at info level on every client TLS probe/reset -- a golang net/http
-#      boilerplate message, not a kyverno failure -- which the broad
-#      substring in stage 1 would otherwise keep. This is the "kyverno
-#      INF/TRC lines" false-positive case the issue's sampling found; TRC
-#      itself is already gone (kyverno runs --v=0, see operators/
-#      controllers.yaml). Do not filter on stream (stdout/stderr) here --
-#      only 0.43% of rows are both stderr and error-matching, so it is not a
-#      usable signal for this.
 apiVersion: fluentbit.fluent.io/v1alpha2
 kind: ClusterFilter
 metadata:
@@ -309,38 +211,6 @@ spec:
     - grep:
         exclude: "log http: TLS handshake error"
 ---
-# Scopes the host journal to the units that can actually explain a node
-# problem, and puts the row in a shape public.logs can store meaningfully.
-# Two stages in one CR, same layout as grep-errors above: filters run in list
-# order, so the allowlist drops everything else before the rename does any
-# work on it.
-#
-# The allowlist exists because the alternative is piping the whole journal
-# in, and logs-pg has no room for that (see grep-errors' own note on the
-# 20Gi PVC / 14-day retention). bootc-update, k3s, kcluster-node-network,
-# kcluster-provision and greenboot are the units that can answer "why did
-# this node not update" and "why did this node not come back" -- the
-# concrete gap that motivated this: neither k-0ad0ff18's missing
-# /var/run/reboot-required sentinel nor k-e7488b70's having one could be
-# explained, because the only record of it was bootc-update.service's
-# 03:00 journal entries, and journal content was write-only until now.
-#
-# The rename is not cosmetic. public.logs.message is `GENERATED ALWAYS AS
-# (data ->> 'log') STORED` -- that key is what the container pipeline's tail
-# parser produces, but journald keeps its own field names, so an unrenamed
-# row would insert cleanly and read back with message NULL, which is worse
-# than not capturing the line at all.
-#
-# This also reshapes what host-stdout below prints, since filters run once
-# against the tagged stream and every output sharing that tag sees the
-# result: host-stdout's live view narrows to the same five units, and its
-# MESSAGE key becomes log. That is accepted rather than avoided -- host-stdout
-# was never durable (see the tail input's excludePath note), so nothing
-# queryable is lost, and a quieter debug stream is arguably an improvement.
-# Keeping it byte-for-byte identical would mean cloning the tag with
-# rewrite_tag before filtering, which trades this one paragraph for an
-# emitter, a second tag namespace and doubled event volume through the
-# filter chain -- not justified for a stdout stream nobody retains.
 apiVersion: fluentbit.fluent.io/v1alpha2
 kind: ClusterFilter
 metadata:
@@ -362,29 +232,6 @@ spec:
         rules:
           - rename:
               MESSAGE: log
-    # k3s.service was 100% of captured host volume on first measurement:
-    # 1583 rows in 14 minutes, ~164k/day, which would have roughly doubled
-    # public.logs against the 2.84M rows the container pipeline holds over
-    # the same 14-day retention. The three stages below cut the measured
-    # noise, sampled at 1000 consecutive lines.
-    #
-    # They exclude by source, never by severity, and that distinction is
-    # load-bearing. Severity would be the obvious filter and would destroy
-    # the reason this capture exists: bootc-update.sh writes plain
-    # info-level text, so anything that drops info drops the one unit the
-    # allowlist was built for. Every rule here is therefore pinned to a
-    # k3s or etcd signature that cannot appear in a kcluster-* or
-    # bootc-update line.
-    #
-    # What survives: all klog W/E/F, all etcd warnings, and every line from
-    # a unit other than k3s. Deliberately NOT excluded are etcd's three
-    # chronic warnings -- etcdserver/util "apply request took too long",
-    # v3rpc/interceptor "request stats", rafthttp/peer "dropped" -- which
-    # were 171 of that 1000-line sample and are the next obvious cut if
-    # volume is still too high. They stay because they are not noise: the
-    # sampled applies were taking 486ms and 581ms, which is a real etcd
-    # latency problem, and silencing the evidence before diagnosing it is
-    # how a slow cluster becomes a quiet mystery.
     - grep:
         exclude: 'log "level":"info".*"caller":"(traceutil|mvcc|rafthttp)'
     - grep:
@@ -409,24 +256,6 @@ spec:
   stdout:
     format: json_lines
 ---
-# customPlugin, because fluent-operator has no typed pgsql output -- its output
-# list stops at the plugins the upstream project models, and out_pgsql is not
-# one of them. The body is passed through verbatim into the [Output] section
-# the operator writes, so this is the same configuration fluent-bit read
-# before, but the operator cannot validate any of it. Match and Retry_Limit
-# stay as CR fields because the operator emits those itself; the body may hold
-# only key-value properties, since a line opening a new section is rejected.
-#
-# Timestamp_Key is deliberately absent, and adding it back breaks all ingest.
-# The plugin does not read the timestamp from that key -- it serialises the
-# msgpack event time INTO a JSON key of that name, then emits
-# SELECT ... to_timestamp(CAST(value->>'<key>' AS FLOAT)) ... . Naming it
-# "time" collided with the CRI parser's own string-valued "time" field, which
-# survives in the record; json ->> takes the LAST duplicate key, so Postgres
-# got an ISO8601 string and every INSERT failed with "invalid input syntax for
-# type double precision". With Retry_Limit no_limits that retried forever and
-# no row ever landed. The default key is "date", which nothing else in the
-# record uses.
 apiVersion: fluentbit.fluent.io/v1alpha2
 kind: ClusterOutput
 metadata:
@@ -440,12 +269,6 @@ metadata:
     env: main
     capability: observability
 spec:
-  # host.* rows reaching here have already been through host-allowlist above
-  # -- unit-scoped and MESSAGE renamed to log -- so widening the match to
-  # include them is routing, not a second filtering decision. A single Match
-  # cannot express both prefixes: Fluent Bit's glob syntax has no OR, only a
-  # trailing wildcard. Match_Regex is the field that can, hence that instead
-  # of Match here.
   matchRegex: ^(kube|host)\..*$
   retry_limit: no_limits
   customPlugin:
