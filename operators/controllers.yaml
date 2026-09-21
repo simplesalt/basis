@@ -295,11 +295,11 @@ spec:
     configuration:
       rebootSentinel: /var/run/reboot-required
       useRebootSentinelHostPath: true
-      period: 1h
+      period: 5m
       lockTtl: 30m
       rebootDays: [mo, tu, we, th, fr, sa, su]
-      startTime: "03:00"
-      endTime: "05:00"
+      startTime: "20:00"
+      endTime: "22:00"
       timeZone: UTC
     tolerations:
       - operator: Exists
