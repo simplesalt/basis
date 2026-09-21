@@ -1,4 +1,17 @@
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno-background-controller-cronjobs
+  labels:
+    rbac.kyverno.io/aggregate-to-background-controller: "true"
+    entity: cluster
+    capability: basis
+rules:
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+---
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -81,6 +94,72 @@ spec:
             operator: Equals
             value: false
       mutate:
+        patchStrategicMerge:
+          spec:
+            +(startingDeadlineSeconds): 3600
+            jobTemplate:
+              spec:
+                +(backoffLimit): 3
+                +(activeDeadlineSeconds): 3600
+                +(ttlSecondsAfterFinished): 3600
+
+    - name: sub-hourly-cronjob-bounds-existing
+      match:
+        any:
+          - resources:
+              kinds:
+                - batch/v1/CronJob
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kyverno
+                - kube-system
+      preconditions:
+        all:
+          - key: "{{ regex_match('^[^ ]*[*,/-].*$', request.object.spec.schedule) }}"
+            operator: Equals
+            value: true
+      mutate:
+        mutateExistingOnPolicyUpdate: true
+        targets:
+          - apiVersion: batch/v1
+            kind: CronJob
+            name: "{{ request.object.metadata.name }}"
+            namespace: "{{ request.object.metadata.namespace }}"
+        patchStrategicMerge:
+          spec:
+            +(startingDeadlineSeconds): 300
+            jobTemplate:
+              spec:
+                +(backoffLimit): 0
+                +(activeDeadlineSeconds): 600
+                +(ttlSecondsAfterFinished): 3600
+
+    - name: hourly-or-slower-cronjob-bounds-existing
+      match:
+        any:
+          - resources:
+              kinds:
+                - batch/v1/CronJob
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kyverno
+                - kube-system
+      preconditions:
+        all:
+          - key: "{{ regex_match('^[^ ]*[*,/-].*$', request.object.spec.schedule) }}"
+            operator: Equals
+            value: false
+      mutate:
+        mutateExistingOnPolicyUpdate: true
+        targets:
+          - apiVersion: batch/v1
+            kind: CronJob
+            name: "{{ request.object.metadata.name }}"
+            namespace: "{{ request.object.metadata.namespace }}"
         patchStrategicMerge:
           spec:
             +(startingDeadlineSeconds): 3600
