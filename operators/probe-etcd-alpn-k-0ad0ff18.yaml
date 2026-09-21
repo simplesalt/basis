@@ -2,10 +2,10 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: probe-etcd-client-k-0ad0ff18
+  name: probe-etcd-alpn-k-0ad0ff18
   namespace: kured
   labels:
-    app.kubernetes.io/name: probe-etcd-client
+    app.kubernetes.io/name: probe-etcd-alpn
     app.kubernetes.io/part-of: basis
     app.kubernetes.io/component: node-lifecycle
     entity: cluster
@@ -15,7 +15,7 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: probe-etcd-client
+        app.kubernetes.io/name: probe-etcd-alpn
         app.kubernetes.io/part-of: basis
         app.kubernetes.io/component: node-lifecycle
     spec:
@@ -26,7 +26,7 @@ spec:
       tolerations:
         - operator: Exists
       containers:
-        - name: probe-etcd-client
+        - name: probe-etcd-alpn
           image: ghcr.io/simplesalt/oci/cluster:latest
           imagePullPolicy: IfNotPresent
           securityContext:
@@ -44,6 +44,7 @@ spec:
             - -c
             - |
               set -u
+              export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
               C=/var/lib/rancher/k3s/server/tls/etcd
               echo "=== NODE ==="
               hostname
@@ -60,6 +61,7 @@ spec:
                   ctx = ssl.create_default_context(cafile=C + "/server-ca.crt")
                   ctx.load_cert_chain(C + "/client.crt", C + "/client.key")
                   ctx.check_hostname = False
+                  ctx.set_alpn_protocols(["http/1.1"])
               except Exception as e:
                   print("CTX ERR", type(e).__name__, e)
                   raise SystemExit(0)

@@ -5,6 +5,6 @@ resources:
   - ns.yaml
   - helmrepos.yaml
   - controllers.yaml
-  - probe-etcd-client-k-0ad0ff18.yaml
-  - probe-etcd-client-k-95509ca9.yaml
-  - probe-etcd-client-k-e7488b70.yaml
+  - probe-etcd-alpn-k-0ad0ff18.yaml
+  - probe-etcd-alpn-k-95509ca9.yaml
+  - probe-etcd-alpn-k-e7488b70.yaml
