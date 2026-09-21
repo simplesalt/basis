@@ -1,35 +1,3 @@
-# e2e proof that kubectl logs, the REST surface and the MCP surface agree.
-#
-# logs-api.yaml exposes the same log data three ways: the Kubernetes API
-# (what kubectl logs calls), PostgREST RPCs, and an MCP tool per RPC via
-# agentgateway's OpenAPI-to-MCP bridge. gen-logs-openapi.py converts the
-# Swagger document PostgREST emits into the OpenAPI 3.0 document agentgateway
-# reads, and nothing re-checks that the converted document still describes
-# the same API. A drift there -- a renamed parameter, a type PostgREST
-# advertises as "text" that agentgateway coerces differently, a tool that
-# silently stops existing -- would make MCP answer a different question than
-# REST while returning 200 either way. This CronJob is the check: run the
-# same logical query through all three surfaces on a schedule and fail loudly
-# on any disagreement.
-#
-# Design notes:
-#   - Namespaced Role, not a ClusterRole: every fixture pod this suite reads
-#     lives in cluster-main-observability (the kube-prometheus-stack
-#     HelmRelease), so a cluster-wide grant would be privilege the Job never
-#     exercises.
-#   - No DATABASE_URL / DB Secret: both the REST and MCP surfaces are
-#     unauthenticated by design (logs-api.yaml), so the parity checks run
-#     entirely over HTTP with no credential to provision or leak.
-#   - automountServiceAccountToken is explicitly true here, unlike logs-mcp's
-#     explicit false -- this workload's entire purpose is calling the
-#     Kubernetes API with its own identity, the one thing logs-mcp is
-#     deliberately forbidden from doing.
-#   - logs-postgrest-allow-internal and logs-mcp-allow-internal (logs-api.yaml)
-#     only admit traffic from logs-mcp itself and from the coding/AI agent
-#     namespaces. Rather than widen those, this file adds two more ingress
-#     NetworkPolicies scoped to app: logs-parity -- Kubernetes unions ingress
-#     rules across every policy that selects a pod, so this is additive and
-#     leaves the existing policies untouched.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -54,9 +22,6 @@ metadata:
     app.kubernetes.io/part-of: observability
     app.kubernetes.io/component: e2e-test
 rules:
-  # get on pods/log is the kubectl-logs-equivalent surface under test.
-  # list on pods is only used to pick fixture pods to query -- no other verb,
-  # no other resource, no write of any kind.
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
@@ -161,11 +126,6 @@ data:
         "http://logs-mcp.cluster-main-observability.svc.cluster.local:8080/mcp",
     )
 
-    # fluent-bit self-excludes its own pod plus the four pods that make up
-    # this very pipeline (logs-pg, logs-postgrest, logs-mcp, logs-schema) --
-    # see operators/controllers.yaml's Exclude_Path. None of those ever have
-    # rows to query, so they cannot be fixtures. logs-parity- is excluded too
-    # so this Job never tries to read its own log through itself.
     EXCLUDED_PREFIXES = (
         "fluent-bit-",
         "logs-pg-",
@@ -175,13 +135,6 @@ data:
         "logs-parity-",
     )
 
-    # When the fluent-bit kubernetes filter gained Labels On, only rows
-    # ingested afterwards carried pod labels. Everything older has
-    # labels=NULL permanently -- nothing backfills them, because the labels a
-    # pod carried at the time are not recoverable once it is gone. Any
-    # label_selector assertion evaluated on rows at or before this instant
-    # would see NULL for reasons that have nothing to do with the code under
-    # test.
     LABELS_NULL_CUTOFF = datetime(2026, 8, 30, 13, 42, tzinfo=timezone.utc)
 
     SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -249,14 +202,6 @@ data:
 
 
     def k8s_pod_log(namespace, pod, container, since, tail_lines=5000):
-        # tailLines here is a generous, fixed safety cap on how much of the
-        # container's log kubelet returns -- NOT the number of rows this case
-        # compares. sinceTime bounds the query's start server-side; there is
-        # no matching upper-bound parameter, so the end of the window is
-        # enforced client-side in parse_k8s_log instead. Capping tailLines to
-        # the comparison's own row limit would let kubelet's tail selection
-        # (taken from the live end of the file) crowd out in-window lines
-        # with ones that arrive after the window closes.
         qs = urllib.parse.urlencode(
             {
                 "container": container,
@@ -414,20 +359,6 @@ data:
             self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
         def call_tool(self, name, arguments):
-            # agentgateway groups an operation's parameters by their OpenAPI
-            # `in:` location, so every one of these -- they are all `in:
-            # query` in the generated spec -- has to arrive nested under
-            # "query". Sent flat they are silently dropped: the call still
-            # succeeds, isError is still false, and what comes back is an
-            # unfiltered default page. Nothing that checks only isError can
-            # see that, which is the whole reason this suite compares rows
-            # instead.
-            #
-            # None is stripped rather than sent, to match urlencode_params on
-            # the REST side -- otherwise an unset filter reaches PostgREST as
-            # the literal string "null" on one surface and not at all on the
-            # other, and the two disagree for a reason that is purely this
-            # script's doing.
             query = {key: value for key, value in arguments.items() if value is not None}
             _status, resp_headers, body = self._post(
                 {
@@ -450,10 +381,6 @@ data:
                     c["text"] for c in result.get("content", []) if c.get("type") == "text"
                 ]
                 payload = json.loads("".join(text_parts))
-            # MCP requires structuredContent to be a JSON object, so a tool
-            # whose response body is an array -- which is every one of these
-            # -- comes back wrapped in a single-key "data" envelope. Unwrap it
-            # so the comparison is row list against row list.
             if isinstance(payload, dict) and list(payload) == ["data"]:
                 return payload["data"]
             return payload
@@ -477,20 +404,11 @@ data:
 
 
     def assert_equal_rows(case, query_desc, a_label, a_rows, b_label, b_rows):
-        # Every case in this suite reaches its verdict through here, so this
-        # is the one place that can say how much evidence a green run
-        # actually rested on. Without it a run that compared twelve empty
-        # lists exits zero and looks exactly like one that compared
-        # thousands of rows -- and the first is worth nothing.
         COMPARISONS.append(
             (case, len(a_rows) if isinstance(a_rows, list) else -1)
         )
         if a_rows == b_rows:
             return True
-        # A surface that answers with something other than a row list has a
-        # shape problem, not a content problem, and the membership test below
-        # would only turn that into an unrelated TypeError naming neither the
-        # case nor the surface.
         if not isinstance(a_rows, list) or not isinstance(b_rows, list):
             fail(
                 case,
@@ -518,11 +436,6 @@ data:
 
 
     def self_test():
-        # Proves the equality check this entire suite is built on can actually
-        # detect a difference, before a single real result is trusted. This is
-        # in-memory and synthetic on purpose: it must run, and pass silently,
-        # on every single invocation without depending on cluster state or
-        # producing stderr noise that would make a healthy run look failed.
         a = [{"at": "1", "message": "x"}]
         b = [{"at": "1", "message": "y"}]
         if a == b:
@@ -640,12 +553,6 @@ data:
 
 
     def case_pod_absent(w_start, w_end):
-        # A pod name no workload can hold. Parity alone would not test
-        # anything here: if pod_filter were ignored outright, both surfaces
-        # would ignore it identically and REST-vs-MCP would agree happily on
-        # a full unfiltered page -- which is exactly what this case did
-        # before, having never passed the filter at all. So the absolute
-        # answer, nothing, is asserted alongside the agreement.
         absent = "logs-parity-no-such-pod-000000000"
         args = {
             "since_time": pg_ts(w_start),
@@ -803,9 +710,6 @@ data:
                 )
                 ok = False
 
-        # The two asymmetries the issue calls out as easy to get backwards:
-        # a key nothing has is "not equal" and "not in" (true, matches
-        # everything) but never "equal" or "in" (false, matches nothing).
         check("k-eq", "{}=x".format(absent_key), "none")
         check("k-eq2", "{}==x".format(absent_key), "none")
         check("k-neq", "{}!=x".format(absent_key), "all")
@@ -915,18 +819,8 @@ data:
 
 
     def case_stream_filter(w_start, w_end, namespace):
-        # kubectl logs has no stream flag, but stdout-vs-stderr is the
-        # distinction this whole store was built to preserve, and until now
-        # nothing exercised stream_filter at all.
         ok = True
         cap = 1000
-        # Used to be narrower than every other case: pre-#390, three hours of
-        # this namespace's firehose hit the 1000-row cap and the partition
-        # assertion below -- the only check here that can catch a filter
-        # quietly dropping rows -- never fired. #390's ingest-time error grep
-        # cut volume ~13.6x, so the full window now lands comfortably under
-        # the cap while still giving the partition assertion a real sample
-        # instead of the thin one 30 minutes would leave post-filter.
         w_from = w_start
         base_args = {
             "since_time": pg_ts(w_from),
@@ -962,11 +856,6 @@ data:
                 ok = False
             per_stream[stream] = rest_rows
 
-        # stdout and stderr are the only two values fluent-bit records, so
-        # the two filtered sets have to partition the unfiltered one exactly.
-        # A filter that quietly drops rows satisfies both checks above and
-        # fails only here. A saturated page cannot be summed, so say so
-        # rather than assert something the row cap already invalidated.
         total = len(per_stream["stdout"]) + len(per_stream["stderr"])
         if max(len(base), total) >= cap:
             print("  (stream partition not asserted: a page hit the {}-row cap)".format(cap))
@@ -984,13 +873,6 @@ data:
 
 
     def case_cross_namespace(w_start, w_end, namespace):
-        # Every other case is pinned to this Job's own namespace, because the
-        # kubectl-logs ground truth needs pods/log and the Role granting it is
-        # deliberately namespace-scoped. The REST and MCP surfaces carry no
-        # such limit, and the busiest containers in the cluster -- where
-        # ordering and paging defects would actually show themselves -- are
-        # all somewhere else. This reaches them without asking for
-        # cluster-wide log read.
         ok = True
         args = {"since_time": pg_ts(w_start), "until_time": pg_ts(w_end)}
         rest_vol = rest_rpc("volume", **args)
@@ -1047,11 +929,6 @@ data:
         global mcp
 
         now = datetime.now(timezone.utc).replace(microsecond=0)
-        # Ends the window ten minutes in the past rather than at "now" -- see
-        # k8s_pod_log's comment. Ingest (fluent-bit -> pgsql output plugin) is
-        # asynchronous, so a window that races the tail would occasionally see
-        # a row on one surface's call and not the other's simply because it
-        # landed in the gap between the two HTTP requests.
         w_end = now - timedelta(minutes=10)
         w_start = max(w_end - timedelta(hours=3), LABELS_NULL_CUTOFF + timedelta(minutes=1))
         if w_start >= w_end:
@@ -1105,10 +982,6 @@ data:
         total_rows = sum(rows for _checks, rows in per_case.values())
         print("  {:<22} {:>2} checks {:>6} rows".format("TOTAL", len(COMPARISONS), total_rows))
 
-        # An empty database, a broken filter that matches nothing on both
-        # surfaces, or a window that lands in a gap all produce twelve
-        # agreements over twelve empty lists. That is a passing run that
-        # tested nothing, and it must be as loud as a mismatch.
         if total_rows == 0:
             print(
                 "=== PARITY FAILURE: vacuous-run ===\nevery case compared zero "
@@ -1150,9 +1023,6 @@ spec:
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 900
   successfulJobsHistoryLimit: 2
-  # Kept high on purpose: this runs every 4 hours, and a failure needs to
-  # still be sitting there for kubectl/flux to inspect when the next
-  # scheduled run lands, not just until the next successful one prunes it.
   failedJobsHistoryLimit: 6
   jobTemplate:
     spec:
