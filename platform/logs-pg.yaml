@@ -160,8 +160,7 @@ metadata:
     # reap-orphaned-job-pods rule already exists to sweep up.
     kustomize.toolkit.fluxcd.io/force: "enabled"
 spec:
-  backoffLimit: 3
-  activeDeadlineSeconds: 1800
+  backoffLimit: 6
   # No ttlSecondsAfterFinished: under GitOps pruning, a TTL-deleted Job looks
   # like drift to Flux, which recreates it and re-runs the migration. The
   # completed Job persisting is the correct resting state here.
@@ -323,7 +322,6 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 3
-      activeDeadlineSeconds: 600
       ttlSecondsAfterFinished: 600
       template:
         metadata:

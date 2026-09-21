@@ -11,6 +11,7 @@ resources:
   - logs-parity.yaml
   - logs-pg.yaml
   - mcp-flux.yaml
+  - policies.batch.yaml
   - policies.cleanup.yaml
   - policies.resiliency.yaml
   - policies.secrets.yaml

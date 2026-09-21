@@ -1,0 +1,115 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: batch-run-bounds
+  labels:
+    app.kubernetes.io/name: batch-run-bounds
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: basis
+  annotations:
+    policies.kyverno.io/title: Bound Batch Runs
+    policies.kyverno.io/category: Resiliency
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: CronJob, Job
+    policies.kyverno.io/description: >-
+      Supplies the four batch fields Kubernetes leaves unset with no default:
+      startingDeadlineSeconds, so a CronJob cannot silently stop scheduling
+      after 100 missed starts; activeDeadlineSeconds, so a hung run cannot
+      block every later run under concurrencyPolicy Forbid;
+      ttlSecondsAfterFinished, so finished Jobs expire on time rather than on
+      count; and backoffLimit, which is 0 for schedules repeating within the
+      hour because the next run is the better retry. Every patch is add-if-
+      absent, so stated values are never overwritten. Standalone Jobs are
+      limited to those with no ownerReferences and receive activeDeadlineSeconds
+      only.
+spec:
+  background: false
+  webhookConfiguration:
+    failurePolicy: Ignore
+  rules:
+    - name: sub-hourly-cronjob-bounds
+      match:
+        any:
+          - resources:
+              kinds:
+                - batch/v1/CronJob
+              operations:
+                - CREATE
+                - UPDATE
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kyverno
+                - kube-system
+      preconditions:
+        all:
+          - key: "{{ regex_match('^[^ ]*[*,/-].*$', request.object.spec.schedule) }}"
+            operator: Equals
+            value: true
+      mutate:
+        patchStrategicMerge:
+          spec:
+            +(startingDeadlineSeconds): 300
+            jobTemplate:
+              spec:
+                +(backoffLimit): 0
+                +(activeDeadlineSeconds): 600
+                +(ttlSecondsAfterFinished): 3600
+
+    - name: hourly-or-slower-cronjob-bounds
+      match:
+        any:
+          - resources:
+              kinds:
+                - batch/v1/CronJob
+              operations:
+                - CREATE
+                - UPDATE
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kyverno
+                - kube-system
+      preconditions:
+        all:
+          - key: "{{ regex_match('^[^ ]*[*,/-].*$', request.object.spec.schedule) }}"
+            operator: Equals
+            value: false
+      mutate:
+        patchStrategicMerge:
+          spec:
+            +(startingDeadlineSeconds): 3600
+            jobTemplate:
+              spec:
+                +(backoffLimit): 3
+                +(activeDeadlineSeconds): 3600
+                +(ttlSecondsAfterFinished): 3600
+
+    - name: standalone-job-bounds
+      match:
+        any:
+          - resources:
+              kinds:
+                - batch/v1/Job
+              operations:
+                - CREATE
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kyverno
+                - kube-system
+      preconditions:
+        all:
+          - key: "{{ request.object.metadata.ownerReferences || `[]` | length(@) }}"
+            operator: Equals
+            value: 0
+      mutate:
+        patchStrategicMerge:
+          spec:
+            +(activeDeadlineSeconds): 1800
