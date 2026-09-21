@@ -86,13 +86,6 @@ spec:
       enabled: false
     reportsController:
       enabled: false
-    # Chart defaults are --loggingFormat=text --v=2, and kyverno maps --v>=2 to
-    # TRACE. That made kyverno the single largest log producer in the cluster:
-    # 54.5 MB/day, 27% of all bytes, at ~1350 bytes per line, almost all of it
-    # "validation passed" TRC records carrying the full clusterroles array.
-    # --v=0 keeps INF/WRN/ERR/FTL and drops 96% of the volume. json also removes
-    # the ANSI SGR wrapper that text format puts around every line, which made
-    # the records unparseable downstream.
     features:
       admissionReports:
         enabled: false
@@ -202,21 +195,6 @@ spec:
         namespace: flux-system
   interval: 5m
 ---
-# fluent-operator, not the fluent-bit chart. The chart can only express one
-# central pipeline, so every filter rule for a misbehaving workload had to be
-# written here, in a file that workload's owner does not touch. The operator
-# turns the pipeline into CRs, and adds a namespaced Filter kind: a workload
-# ships its own noise rule alongside its own Deployment.
-#
-# The DaemonSet is still fluent-bit and the sink is still out_pgsql. The
-# operator's image is FROM fluent/fluent-bit and only swaps the entrypoint for
-# a config watcher, so the plugin set -- including pgsql, which is not in the
-# CMake defaults and only exists because Fluent's own Dockerfile turns it on --
-# is the same binary we run today.
-#
-# The pipeline itself lives in platform/fluent-bit.yaml, next to logs-pg, and
-# is applied by the platform Kustomization, which dependsOn this one so the
-# CRDs exist before the CRs referencing them.
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
@@ -245,23 +223,12 @@ spec:
         namespace: flux-system
   interval: 5m
   values:
-    # containerd, so the operator mounts /var/log/containers rather than the
-    # docker path; the tail input's Path is resolved against the host either
-    # way, but the wrong value gives fluent-bit an empty directory.
     containerRuntime: containerd
-    # The chart ships a starter Kubernetes pipeline -- its own ClusterInput,
-    # ClusterFilter and stdout ClusterOutput -- which would sit alongside ours
-    # and duplicate every record. Ours is checked in as CRs; the chart is asked
-    # for the operator and the CRDs only.
     fluentbit:
       enable: false
     fluentd:
       enable: false
     operator:
-      # The chart caps the operator at 60Mi. An OOMKill here is a quiet
-      # failure: the DaemonSet keeps shipping on its last rendered config
-      # while newly added Filter CRs appear to simply do nothing. Headroom is
-      # cheaper than diagnosing that.
       resources:
         requests:
           cpu: 50m
