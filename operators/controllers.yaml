@@ -66,6 +66,8 @@ metadata:
 spec:
   interval: 5m
   releaseName: kyverno-controller
+  driftDetection:
+    mode: enabled
   chart:
     spec:
       chart: kyverno
