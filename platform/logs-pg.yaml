@@ -1,43 +1,4 @@
 ---
-# Durable container-log store: the CNPG Cluster, its schema, and partition
-# maintenance. The read surfaces that sit on top of it are in logs-api.yaml.
-#
-# This replaces reliance on `kubectl logs` / mcp-flux get_kubernetes_logs, both
-# of which read kubelet's on-disk rotation and therefore lose everything a pod
-# emitted before its last rotation -- and everything it emitted at all, once the
-# pod is gone. Pods here are ephemeral by design, so that loss is routine.
-#
-# Lives in `platform/` rather than `operators/` because it is workload, not
-# cluster machinery: the platform Kustomization dependsOn ss-basis-operators and
-# health-checks the cnpg HelmRelease, so the CNPG CRDs are guaranteed registered
-# before any of this reconciles.
-#
-# fluent-bit (the writer) is fluent-bit.yaml in this same directory, so it and
-# logs-pg reconcile together with no ordering between them. Flux does not gate
-# one resource in a Kustomization on another, so the writer can and does come
-# up before the database exists. That is tolerable, but not free, and the
-# distinction matters:
-#
-#   At RUNTIME, out_pgsql returns FLB_RETRY on a failed flush and the
-#   filesystem buffer holds the backlog -- the designed behaviour for a
-#   database that goes down under a running fluent-bit.
-#
-#   At STARTUP it does not. out_pgsql connects during plugin init, and a
-#   refused connection there is fatal to the whole engine
-#   ("failed to initialize 'pgsql' plugin" -> "output initialization failed"),
-#   so fluent-bit CrashLoopBackOffs until logs-pg accepts connections. While it
-#   is down it ships nothing at all, including the systemd stream that has
-#   nothing to do with this database.
-#
-# The exposure is bounded rather than eliminated: the tail input's position DB
-# survives the restarts, so container logs are replayed from the node's own
-# files once fluent-bit comes up, losing only what kubelet rotated away during
-# the outage. The systemd input has no cursor DB and loses its gap outright,
-# which was already true of any fluent-bit restart before this change.
-#
-# Restructuring the layering would not fix this -- Flux ordering cannot help a
-# node that reboots while the database is down. Fixing it properly means
-# separating the systemd and container pipelines, which is not worth it yet.
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
@@ -51,27 +12,8 @@ metadata:
     env: main
     capability: observability
 spec:
-  # A dedicated Cluster rather than a schema inside an existing one. Log growth
-  # has a completely different shape from OLTP app data, and a bad maintenance
-  # job or an ingest burst must not be able to starve gbrain-pg / hindsight-pg /
-  # cal-pg on a shared node. CNPG Clusters are cheap; blast-radius isn't.
-  #
-  # instances and affinity are deliberately absent: policies.resiliency.yaml's
-  # default-ha-instances and required-pod-anti-affinity rules supply
-  # instances: 2 with required, node-scoped anti-affinity at admission. Setting
-  # either here would make Flux the field owner and put kustomize-controller in
-  # a re-apply fight with the Kyverno mutation on every reconcile, which is the
-  # one thing that arrangement cannot survive. The replica sits Pending until a
-  # second node exists; see that file's header for why that is the design and
-  # not a deferral.
   imageName: ghcr.io/cloudnative-pg/postgresql:17
 
-  # Replication stays asynchronous, and that is load-bearing now rather than
-  # merely adequate: the second instance is unschedulable until a second node
-  # joins, and a non-zero minSyncReplicas would make every commit block waiting
-  # for a synchronous standby that cannot exist yet -- turning the parked
-  # replica from free into a total ingest outage. Raise these only alongside a
-  # real second node.
   minSyncReplicas: 0
   maxSyncReplicas: 0
   replicationSlots:
@@ -86,12 +28,6 @@ spec:
     size: 20Gi
     resizeInUseVolumes: true
 
-  # 2Gi was the original limit and it was not enough: the postgres container was
-  # OOMKilled (exit 137) five times in the first five minutes of real ingest,
-  # which took PostgREST and agentgateway down behind it. The node has 30Gi
-  # allocatable and roughly 28Gi uncommitted, so the tight limit bought nothing.
-  # A write-heavy ingest database wants room for shared_buffers, WAL buffers and
-  # the per-backend allocations of a bursty COPY/INSERT path at the same time.
   resources:
     requests:
       cpu: 100m
@@ -101,15 +37,7 @@ spec:
 
   postgresql:
     parameters:
-      # Ingest is append-only and bursty, and every row is discarded within the
-      # retention window. Durability of the last few hundred milliseconds of log
-      # lines is worth far less than not fsync-stalling the write path, so the
-      # commit path is deliberately relaxed. Crash-safety of the DATABASE is
-      # unaffected -- only the tail of already-acknowledged commits is at risk,
-      # and fluent-bit's filesystem buffer replays that anyway.
       synchronous_commit: "off"
-      # Partition pruning across a 21-partition parent (14 days retained + 7
-      # pre-created) needs the planner to actually attempt it at execution time.
       enable_partitionwise_aggregate: "on"
       max_connections: "100"
       wal_compression: "zstd"
@@ -120,21 +48,9 @@ spec:
     initdb:
       database: logs
       owner: logs
-      # Only the genuinely privileged statements live here. postInitApplicationSQL
-      # runs exactly once, at bootstrap, as superuser -- it can never be edited
-      # into an existing cluster, so anything that needs to evolve belongs in the
-      # logs-schema Job instead. Role creation is the one thing that Job cannot
-      # do, because the CNPG-managed app owner has no CREATEROLE.
       postInitApplicationSQL:
-        # logs_read is PostgREST's anonymous role. NOLOGIN: it is never
-        # connected to directly, only switched into via SET LOCAL ROLE. It is
-        # granted no write privilege anywhere, ever -- which is what makes a
-        # write through the read surfaces fail at the database, not at the app.
         - CREATE ROLE logs_read NOLOGIN
-        # Lets the `logs` app role (PostgREST's authenticator) SET ROLE into it.
         - GRANT logs_read TO logs
-        # A runaway query from an agent-authored filter must not pin a backend
-        # forever on a single-node cluster.
         - ALTER ROLE logs_read SET statement_timeout = '30s'
 ---
 apiVersion: batch/v1
@@ -150,20 +66,9 @@ metadata:
     env: main
     capability: observability
   annotations:
-    # A Job's spec is immutable, so an edit to logs-schema.sql would otherwise
-    # be silently ignored forever. Two things together prevent that: the
-    # configMapGenerator in kustomization.yaml gives the ConfigMap a new
-    # content-hashed name on every edit, which moves the volume reference
-    # inside this immutable spec.template, and this annotation tells Flux to
-    # resolve that by deleting and recreating the Job -- which re-runs the
-    # migration. The debris that leaves behind is what policies.cleanup.yaml's
-    # reap-orphaned-job-pods rule already exists to sweep up.
     kustomize.toolkit.fluxcd.io/force: "enabled"
 spec:
   backoffLimit: 6
-  # No ttlSecondsAfterFinished: under GitOps pruning, a TTL-deleted Job looks
-  # like drift to Flux, which recreates it and re-runs the migration. The
-  # completed Job persisting is the correct resting state here.
   template:
     metadata:
       labels:
@@ -227,24 +132,6 @@ spec:
         - name: tmp
           emptyDir: {}
 ---
-# RBAC for logs-pg-rotate's PVC-capacity lookup only: `get` on exactly the one
-# named PVC CNPG manages for this Cluster's single instance, nothing broader.
-# rotate() needs the PVC's declared capacity to size its 3/4 threshold
-# against, and the alternative -- reading real filesystem usage from inside
-# Postgres -- is not reachable at all from the non-superuser `logs` role (see
-# the comment above logs_maint.rotate() in the ConfigMap above). The
-# Kubernetes API is therefore the only avenue, so this identity trades "no
-# cluster access" for "read one PVC's status field", not for anything wider.
-#
-# resourceNames pins this to logs-pg-1, the PVC CNPG derives for the first
-# instance. The Kyverno HA mutation makes this Cluster instances: 2, so
-# logs-pg-2 appears as soon as a second node can host it -- deliberately not
-# added here. rotate() wants one number, the PVC's declared capacity, and both
-# PVCs are provisioned from the same storage.size, so logs-pg-1 answers that
-# question correctly even on a run where logs-pg-2 is the primary. Should
-# logs-pg-1 ever go away entirely, the lookup fails non-fatally and rotate()
-# skips only its size cap, which is the degradation the initContainer is
-# already built around.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -310,10 +197,6 @@ metadata:
     env: main
     capability: observability
 spec:
-  # Vanilla Postgres has no scheduler and pg_cron is an extension this cluster
-  # does not carry, so the clock lives in Kubernetes. Daily is ample: rotate()
-  # creates 7 days of partitions ahead, so ingest survives a week of this
-  # CronJob being broken before it can hit the default partition.
   schedule: "17 3 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
@@ -332,23 +215,10 @@ spec:
             capability: observability
         spec:
           restartPolicy: OnFailure
-          # Scoped to the PVC-capacity read only (see the Role above) --
-          # nothing else in this pod touches the Kubernetes API.
           serviceAccountName: logs-pg-rotate
           initContainers:
-            # Never hardcode the PVC size: storage.size above is the request,
-            # not necessarily what CNPG ends up with after a resize, so this
-            # reads status.capacity.storage from the live PVC on every run
-            # instead of trusting a copy of the number kept in two places.
             - name: pvc-capacity
               image: ghcr.io/cloudnative-pg/postgresql:17
-              # Non-fatal by design: `|| true` on the python3 invocation and
-              # the trailing `exit 0` mean any failure here -- RBAC denial,
-              # API server unreachable, an unexpected response shape -- leaves
-              # /tmp/pvc_bytes empty rather than failing the Job. The psql
-              # container below treats an empty file as "no size cap this
-              # run", which is exactly the degradation this is designed to
-              # produce: age-based retention still runs unconditionally.
               command:
                 - sh
                 - -c
@@ -430,20 +300,6 @@ spec:
           containers:
             - name: psql
               image: ghcr.io/cloudnative-pg/postgresql:17
-              # A shell wrapper rather than a fixed argument list: pvc_bytes
-              # is only known if the initContainer above succeeded, and psql
-              # has no conditional-argument syntax of its own. PVC_BYTES is
-              # re-validated as all-digits here rather than trusted just
-              # because the initContainer wrote it, so a corrupt or truncated
-              # file falls back to the no-size-cap call instead of being
-              # pasted unquoted into the SQL text.
-              #
-              # The value is interpolated by the shell, not by psql -v. A -c
-              # string is handed to the server as-is: psql documents it as
-              # needing to be "completely parsable by the server (i.e. it
-              # contains no psql-specific features)", and :pvc_bytes is such a
-              # feature. It reached the server literally and every run with a
-              # PVC reading errored out.
               command:
                 - sh
                 - -c
