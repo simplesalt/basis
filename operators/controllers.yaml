@@ -68,6 +68,12 @@ spec:
   releaseName: kyverno-controller
   driftDetection:
     mode: enabled
+    ignore:
+      - paths:
+          - /spec
+        target:
+          group: coordination.k8s.io
+          kind: Lease
   chart:
     spec:
       chart: kyverno
@@ -78,6 +84,8 @@ spec:
   values:
     backgroundController:
       enabled: false
+    reportsController:
+      enabled: false
     # Chart defaults are --loggingFormat=text --v=2, and kyverno maps --v>=2 to
     # TRACE. That made kyverno the single largest log producer in the cluster:
     # 54.5 MB/day, 27% of all bytes, at ~1350 bytes per line, almost all of it
@@ -86,6 +94,8 @@ spec:
     # the ANSI SGR wrapper that text format puts around every line, which made
     # the records unparseable downstream.
     features:
+      admissionReports:
+        enabled: false
       logging:
         format: json
         verbosity: 0
