@@ -35,28 +35,17 @@ import json
 import sys
 import urllib.request
 
-# Formats OpenAPI 3.0 names explicitly. PostgREST emits the underlying Postgres
-# type instead ("text", "timestamp without time zone", "character varying"),
-# which is legal as an open-ended format string but is noise to a consumer that
-# cannot interpret it. Dropping the unknown ones keeps the document to formats
-# a strict parser is guaranteed to accept.
 KNOWN_FORMATS = {
     "int32", "int64", "float", "double", "byte",
     "binary", "date", "date-time", "password",
 }
 
-# Keys that belong on a Schema Object once a Swagger 2.0 parameter is reshaped.
-# Everything else on the parameter (name, in, required, description) stays put.
 SCHEMA_KEYS = {
     "type", "format", "items", "enum", "default", "maximum", "minimum",
     "exclusiveMaximum", "exclusiveMinimum", "maxLength", "minLength",
     "pattern", "maxItems", "minItems", "uniqueItems", "multipleOf",
 }
 
-# logs_read holds no write grant anywhere, so PostgREST advertising these is
-# advertising operations that always fail. follow-privileges was expected to
-# suppress them and does not. Each one would otherwise become an MCP tool that
-# exists only to return a permission error.
 WRITE_METHODS = {"post", "put", "patch", "delete"}
 
 
@@ -180,8 +169,6 @@ def convert(spec):
 
     paths = {}
     for path, item in spec.get("paths", {}).items():
-        # The root path serves this very document. As a tool it would hand an
-        # agent the API description it already has.
         if path == "/":
             continue
         operations = {}
@@ -207,9 +194,6 @@ def convert(spec):
     out = {
         "openapi": "3.0.3",
         "info": spec.get("info", {"title": "logs", "version": "1"}),
-        # Relative, because agentgateway is configured with the upstream host
-        # separately. Swagger 2.0's host/basePath/schemes named 0.0.0.0:3000,
-        # PostgREST's own bind address, which is not reachable as written.
         "servers": [{"url": "/"}],
         "paths": paths,
     }

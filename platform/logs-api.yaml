@@ -1,21 +1,4 @@
 ---
-# Read surfaces over the log store in logs-pg.yaml: PostgREST (REST + OpenAPI)
-# and agentgateway (MCP). API and MCP are the only surfaces -- there is no
-# Grafana, no dashboard, and no plan for one.
-#
-# The chain is deliberately one-directional and duplication-free:
-#
-#   COMMENT ON in logs-pg.yaml
-#     -> PostgREST renders it into its auto-generated OpenAPI description
-#       -> gen-logs-openapi.py converts Swagger 2.0 to OpenAPI 3.0
-#         -> agentgateway copies it into MCP tool + parameter descriptions
-#
-# So the semantic layer is still authored exactly once, as SQL in git, and no
-# tool description is written by hand anywhere. But the third step is NOT live:
-# it runs at commit time and its output is committed as
-# logs-openapi.generated.json. Adding a stored query in logs-pg.yaml therefore
-# requires regenerating that file in the same commit. Skipping it does not break
-# anything loudly -- the new query simply never appears as a tool.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -85,13 +68,6 @@ spec:
         - name: postgrest
           image: postgrest/postgrest:v16.2
           env:
-            # Connects as the CNPG-managed app owner, which is PostgREST's
-            # "authenticator" role. It never executes a query as that role:
-            # with DB_ANON_ROLE set and no JWT secret configured, PostgREST
-            # issues SET LOCAL ROLE logs_read for every single request and
-            # there is no code path to reach any other role. logs_read holds no
-            # write grant anywhere, so a POST/PATCH/DELETE through this surface
-            # is refused by Postgres, not by application logic.
             - name: PGRST_DB_URI
               valueFrom:
                 secretKeyRef:
@@ -99,30 +75,18 @@ spec:
                   key: uri
             - name: PGRST_DB_ANON_ROLE
               value: logs_read
-            # Pins the exposed surface to the semantic layer. public.logs is
-            # readable by logs_read but is not a REST resource, so agents get
-            # the named stored queries rather than a raw table to improvise on.
             - name: PGRST_DB_SCHEMAS
               value: logs_api
             - name: PGRST_SERVER_PORT
               value: "3000"
-            # A hard ceiling under the per-function LIMITs, so an unbounded GET
-            # on logs_api.entries cannot try to serialise the whole retention
-            # window into one response.
             - name: PGRST_DB_MAX_ROWS
               value: "1000"
             - name: PGRST_DB_POOL
               value: "10"
-            # Emit COMMENT ON text as OpenAPI summary/description. This is the
-            # entire mechanism by which the semantic layer reaches MCP.
             - name: PGRST_OPENAPI_MODE
               value: follow-privileges
             - name: PGRST_LOG_LEVEL
               value: warn
-            # PostgREST's dedicated admin server, separate from the API port so
-            # it is never exposed through the Service. It is what makes the
-            # probes below able to distinguish "this process is broken" from
-            # "the database it talks to is down".
             - name: PGRST_ADMIN_SERVER_PORT
               value: "3001"
           ports:
@@ -130,14 +94,6 @@ spec:
               containerPort: 3000
             - name: admin
               containerPort: 3001
-          # Probing GET / on the API port was a defect: PostgREST answers 503
-          # there whenever the schema cache cannot load, so every logs-pg
-          # outage killed this pod as well and turned a recoverable database
-          # blip into a restart loop on top of it. The admin server splits the
-          # two signals — /live checks only that the process is up, /ready also
-          # checks the database connection and schema cache. A logs-pg outage
-          # now pulls the pod out of the Service and leaves it running to
-          # reconnect on its own.
           readinessProbe:
             httpGet:
               path: /ready
@@ -180,7 +136,6 @@ metadata:
     capability: observability
 data:
   config.yaml: |
-    # yaml-language-server: $schema=https://agentgateway.dev/schema/config
     binds:
     - port: 8080
       listeners:
@@ -189,24 +144,9 @@ data:
           - mcp:
               targets:
               - name: logs
-                # Reads the spec from disk, not from PostgREST. PostgREST emits
-                # Swagger 2.0 and agentgateway parses with the openapiv3 crate,
-                # which reads 3.0 only -- pointing this at the live root made
-                # the pod exit with "paths: no variant of enum
-                # ParameterSchemaOrContent found in flattened data". The file
-                # mounted here is that same PostgREST output converted to 3.0
-                # at commit time by scripts/gen-logs-openapi.py. Converting in
-                # the request path instead would mean a sidecar, an image and a
-                # build step; converting at commit time costs a regeneration
-                # step when the semantic layer changes. The file arrives from
-                # the configMapGenerator in kustomization.yaml, whose name hash
-                # is what rolls this pod when the spec changes; agentgateway
-                # reads the schema once at startup and never re-reads it.
                 openapi:
                   schema:
                     file: /etc/agentgateway/spec/openapi.json
-                  # Still required: the converted document declares a relative
-                  # server URL, so this is what tool calls are actually sent to.
                   host: logs-postgrest.cluster-main-observability.svc.cluster.local:3000
 ---
 apiVersion: v1
@@ -261,16 +201,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: agentgateway
-          # agentgateway ships two deployment models. This is the standalone
-          # static-config binary, NOT the oci://ghcr.io/kgateway-dev/charts
-          # Helm path -- that one requires the Kubernetes Gateway API CRDs plus
-          # the kgateway control plane, and this cluster has zero
-          # gateway.networking.k8s.io CRDs registered. Adopting Gateway API and
-          # a control plane to serve one MCP endpoint is not proportionate.
           image: ghcr.io/agentgateway/agentgateway:v1.5.0
-          # Not optional. If neither --file nor --config is given while
-          # KUBERNETES_SERVICE_HOST is set, the binary refuses to start rather
-          # than falling back to a default config.
           args:
             - -f
             - /etc/agentgateway/config.yaml
@@ -290,9 +221,6 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/agentgateway
-            # A separate mount, not another key in the config ConfigMap: two
-            # ConfigMaps cannot both project into /etc/agentgateway, and the
-            # spec is generated while config.yaml above is hand-authored.
             - name: spec
               mountPath: /etc/agentgateway/spec
             - name: tmp
@@ -306,8 +234,6 @@ spec:
               memory: 512Mi
           securityContext:
             runAsNonRoot: true
-            # The image declares nonroot 65532 itself; restated so the pod spec
-            # is self-describing and survives an image that later drops USER.
             runAsUser: 65532
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -325,16 +251,6 @@ spec:
         - name: tmp
           emptyDir: {}
 ---
-# Both read surfaces are entirely unauthenticated: PostgREST has no JWT secret
-# configured and agentgateway fronts it with no auth policy. That is a
-# deliberate simplification -- authorisation is the database's job, and
-# logs_read cannot write -- but it means reachability IS the access control,
-# and these two policies are the whole of it.
-#
-# Same shape as mcp-flux-allow-internal in mcp-flux.yaml. There are ZERO
-# Ingress objects in this cluster and these do not add one; if these ever need
-# to be reachable from outside, that is Cloudflare Tunnel plus Zero Trust
-# Access, not an Ingress.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -385,10 +301,6 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # agentgateway, in this namespace. It no longer fetches the spec over the
-    # network -- that is mounted from logs-mcp-openapi -- but it proxies every
-    # tool call back through this port, so losing this rule breaks every tool
-    # while leaving discovery working, which is the more confusing failure.
     - from:
         - podSelector:
             matchLabels:
@@ -396,8 +308,6 @@ spec:
       ports:
         - protocol: TCP
           port: 3000
-    # Direct REST access for agents that have plain HTTP but no MCP client.
-    # This is the documented interim surface if the MCP bridge is ever pulled.
     - from:
         - namespaceSelector:
             matchExpressions:
