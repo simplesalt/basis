@@ -1,10 +1,10 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: bootc-switch-k-e7488b70
+  name: reboot-sentinel-clear-k-e7488b70
   namespace: kured
   labels:
-    app.kubernetes.io/name: bootc-switch
+    app.kubernetes.io/name: reboot-sentinel-clear
     app.kubernetes.io/part-of: basis
     app.kubernetes.io/component: node-lifecycle
     entity: cluster
@@ -15,7 +15,7 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: bootc-switch
+        app.kubernetes.io/name: reboot-sentinel-clear
         app.kubernetes.io/part-of: basis
         app.kubernetes.io/component: node-lifecycle
     spec:
@@ -26,7 +26,7 @@ spec:
       tolerations:
         - operator: Exists
       containers:
-        - name: bootc-switch
+        - name: reboot-sentinel-clear
           image: ghcr.io/simplesalt/oci/cluster:latest
           securityContext:
             privileged: true
@@ -39,9 +39,6 @@ spec:
             - --net
             - --pid
             - --
-            - bash
-            - -c
-            - |
-              set -euo pipefail
-              bootc switch ghcr.io/simplesalt/oci/cluster:qa
-              touch /var/run/reboot-required
+            - rm
+            - -f
+            - /var/run/reboot-required
