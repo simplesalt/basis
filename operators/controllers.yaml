@@ -70,7 +70,7 @@ spec:
     mode: enabled
     ignore:
       - paths:
-          - /spec
+          - ""
         target:
           group: coordination.k8s.io
           kind: Lease
