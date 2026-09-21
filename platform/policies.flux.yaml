@@ -18,8 +18,9 @@ metadata:
       helm-controller re-checks chart-applied objects against the stored release
       manifest each interval. The dry-run in that check passes through Kyverno's
       admission webhook, so a changed admission mutation reaches Helm-shipped
-      objects without a mutate-existing pass. Also defaults an ignore entry for
-      coordination.k8s.io Lease specs, which their holders rewrite by design.
+      objects without a mutate-existing pass. Also defaults an ignore entry that
+      excludes coordination.k8s.io Leases entirely, since their holders rewrite
+      them by design.
       Both patches are add-if-absent, so a HelmRelease that states a mode or an
       ignore list keeps it, and one that states its own ignore list must carry
       the Lease entry itself.
