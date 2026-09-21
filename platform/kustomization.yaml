@@ -18,23 +18,7 @@ resources:
   - policies.secrets.yaml
   - policies.storage.yaml
 
-# A generator rather than a checked-in ConfigMap manifest, for the name hash:
-# kustomize suffixes the ConfigMap name with a hash of its contents and rewrites
-# the logs-mcp Deployment's volume reference to match, so regenerating the spec
-# rolls the pod. agentgateway reads its schema once at startup, so a stable name
-# would leave a new spec sitting unread in the mounted file until something
-# unrelated restarted the pod -- exactly the silent staleness the generated spec
-# exists to avoid. Flux prunes the superseded hashed ConfigMaps.
 configMapGenerator:
-  # Every statement in logs-schema.sql is idempotent (IF NOT EXISTS / OR
-  # REPLACE) because the Job that applies it re-runs on every change to that
-  # file. This generator is what makes "on every change" true: a checked-in
-  # ConfigMap manifest keeps a stable name, so editing the SQL left the Job's
-  # spec byte-identical and Flux had no reason to recreate it -- the new
-  # statements sat in the mounted file, applied to nothing. The hash moves the
-  # name, which moves the volume reference inside the Job's immutable
-  # spec.template, which its kustomize.toolkit.fluxcd.io/force annotation
-  # resolves by delete-and-recreate.
   - name: logs-schema
     namespace: cluster-main-observability
     files:
