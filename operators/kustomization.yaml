@@ -5,6 +5,3 @@ resources:
   - ns.yaml
   - helmrepos.yaml
   - controllers.yaml
-  - probe-etcd-openssl-k-0ad0ff18.yaml
-  - probe-etcd-openssl-k-95509ca9.yaml
-  - probe-etcd-openssl-k-e7488b70.yaml
