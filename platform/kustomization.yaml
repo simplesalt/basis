@@ -11,10 +11,12 @@ resources:
   - logs-parity.yaml
   - logs-pg.yaml
   - mcp-flux.yaml
+  - node-class.yaml
   - policies.batch.yaml
   - policies.cleanup.yaml
   - policies.flux.yaml
   - policies.resiliency.yaml
+  - policies.scheduling.yaml
   - policies.secrets.yaml
   - policies.storage.yaml
 

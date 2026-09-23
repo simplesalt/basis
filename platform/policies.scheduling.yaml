@@ -1,0 +1,78 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: lean-node-scheduling
+  labels:
+    app.kubernetes.io/name: lean-node-scheduling
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: scheduling
+  annotations:
+    policies.kyverno.io/title: Reserve Lean Nodes For Asynchronous Work
+    policies.kyverno.io/category: Scheduling
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Keeps performance-sensitive workloads off the cluster's lean nodes. A
+      lean node is a cheap quorum member -- it exists so etcd has a third
+      voter, and its allocatable memory is a fraction of a work node's, so a
+      pod that bursts will find nothing there to burst into. The node-class
+      CronJob publishes each node's class as the label
+      scheduling.simplesalt.company/node-class; this policy adds node affinity
+      excluding the lean class to every pod that is not asynchronous by
+      construction. Asynchronous is read from the pod's controller rather than
+      from a label anyone has to remember: DaemonSets, which are meant to reach
+      every node; Jobs, including the pods a CronJob creates, which are batch
+      work that can wait; and CloudNativePG instances, whose standbys are
+      exactly the kind of low-performance tenant a lean node should carry.
+      Everything else -- Deployments, StatefulSets, bare pods -- is treated as
+      work and confined to work nodes. Two deliberate choices. The requirement
+      is NotIn lean rather than In work, because a node with no class label yet
+      satisfies NotIn, so the window between this policy taking effect and the
+      classifier's first run cannot strand a restarting pod. And the patch is
+      add-if-absent, so a pod that states its own nodeAffinity keeps it and
+      opts itself out. Neither resource requests nor limits are touched:
+      requests size a pod, they do not classify a node, and raising them to
+      force placement would only move the pressure onto the work nodes.
+spec:
+  background: false
+  webhookConfiguration:
+    failurePolicy: Ignore
+  rules:
+    - name: confine-work-to-work-nodes
+      match:
+        any:
+          - resources:
+              kinds:
+                - v1/Pod
+              operations:
+                - CREATE
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kyverno
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.ownerReferences[0].kind || '''' }}'
+            operator: AnyNotIn
+            value:
+              - DaemonSet
+              - Job
+          - key: '{{ request.object.metadata.ownerReferences[0].apiVersion || '''' }}'
+            operator: NotEquals
+            value: postgresql.cnpg.io/v1
+      mutate:
+        patchStrategicMerge:
+          spec:
+            affinity:
+              +(nodeAffinity):
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: scheduling.simplesalt.company/node-class
+                          operator: NotIn
+                          values:
+                            - lean

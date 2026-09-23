@@ -1,0 +1,230 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-class
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/name: node-class
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: scheduling
+    entity: cluster
+    capability: scheduling
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-class
+  labels:
+    app.kubernetes.io/name: node-class
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: scheduling
+    entity: cluster
+    capability: scheduling
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: node-class
+  labels:
+    app.kubernetes.io/name: node-class
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: scheduling
+    entity: cluster
+    capability: scheduling
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: node-class
+subjects:
+  - kind: ServiceAccount
+    name: node-class
+    namespace: flux-system
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: node-class
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/name: node-class
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: scheduling
+    entity: cluster
+    capability: scheduling
+  annotations:
+    description: >-
+      Publishes each node's scheduling class as the label
+      scheduling.simplesalt.company/node-class, derived from that node's
+      allocatable memory alone: under 8Gi is lean, at or above is work. Lean
+      nodes are the cheap quorum members that carry etcd and little else, so
+      only asynchronous and non-performant workloads belong there; the
+      lean-node-scheduling Kyverno policy is what acts on this label. No node
+      is ever named or special-cased here, and the class is recomputed every
+      ten minutes, so a node that is rebuilt, resized, or newly joined
+      classifies itself without a change to this file. Labelling is the whole
+      job -- deliberately no taint, because a NoSchedule taint would have to
+      be tolerated by DaemonSets that reach every node, including the k3s
+      servicelb pods whose tolerations list only specific keys, and the
+      toleration would then have to be injected by mutating a list that has no
+      strategic-merge key. Publishing a label and letting node affinity read it
+      leaves every existing toleration untouched.
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: node-class
+            entity: cluster
+            capability: scheduling
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: node-class
+          containers:
+            - name: classify
+              image: docker.io/library/python:3.13-alpine
+              command: ["python3", "-c"]
+              args:
+                - |
+                  import json
+                  import re
+                  import ssl
+                  import sys
+                  import urllib.error
+                  import urllib.request
+
+                  LABEL = "scheduling.simplesalt.company/node-class"
+                  LEAN_THRESHOLD_BYTES = 8 * 1024 ** 3
+
+                  API_BASE = "https://kubernetes.default.svc"
+                  TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+                  CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+                  BINARY_UNITS = {
+                      "Ki": 1024 ** 1,
+                      "Mi": 1024 ** 2,
+                      "Gi": 1024 ** 3,
+                      "Ti": 1024 ** 4,
+                  }
+                  DECIMAL_UNITS = {
+                      "K": 1000 ** 1,
+                      "M": 1000 ** 2,
+                      "G": 1000 ** 3,
+                      "T": 1000 ** 4,
+                  }
+
+                  QUANTITY_RE = re.compile(
+                      r"^(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<suffix>Ki|Mi|Gi|Ti|K|M|G|T)?$"
+                  )
+                  EXPONENT_RE = re.compile(
+                      r"^(?P<value>[0-9]+(?:\.[0-9]+)?)e(?P<exp>[0-9]+)$"
+                  )
+
+                  def parse_memory(quantity):
+                      match = QUANTITY_RE.match(quantity)
+                      if match:
+                          value = float(match.group("value"))
+                          suffix = match.group("suffix")
+                          if suffix is None:
+                              return int(value)
+                          if suffix in BINARY_UNITS:
+                              return int(value * BINARY_UNITS[suffix])
+                          return int(value * DECIMAL_UNITS[suffix])
+                      match = EXPONENT_RE.match(quantity)
+                      if match:
+                          value = float(match.group("value"))
+                          exp = int(match.group("exp"))
+                          return int(value * (10 ** exp))
+                      raise ValueError(f"unparseable memory quantity: {quantity!r}")
+
+                  def api_request(method, path, body=None):
+                      token = open(TOKEN_PATH).read().strip()
+                      ctx = ssl.create_default_context(cafile=CA_PATH)
+                      headers = {"Authorization": f"Bearer {token}"}
+                      data = None
+                      if body is not None:
+                          data = json.dumps(body).encode("utf-8")
+                          headers["Content-Type"] = "application/merge-patch+json"
+                      req = urllib.request.Request(
+                          API_BASE + path, data=data, headers=headers, method=method
+                      )
+                      with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+                          return json.load(resp)
+
+                  def main():
+                      failed = False
+                      try:
+                          nodes = api_request("GET", "/api/v1/nodes")
+                      except urllib.error.HTTPError as err:
+                          body = err.read().decode("utf-8", "replace")
+                          print(f"failed to list nodes: {err} {body}", file=sys.stderr)
+                          sys.exit(1)
+
+                      for node in nodes.get("items", []):
+                          name = node["metadata"]["name"]
+                          allocatable = node.get("status", {}).get("allocatable", {})
+                          quantity = allocatable.get("memory")
+                          if quantity is None:
+                              print(f"node {name}: no allocatable.memory reported", file=sys.stderr)
+                              failed = True
+                              continue
+                          try:
+                              allocatable_bytes = parse_memory(quantity)
+                          except ValueError as err:
+                              print(f"node {name}: {err}", file=sys.stderr)
+                              failed = True
+                              continue
+
+                          class_name = "lean" if allocatable_bytes < LEAN_THRESHOLD_BYTES else "work"
+                          current_labels = node.get("metadata", {}).get("labels", {}) or {}
+
+                          if current_labels.get(LABEL) == class_name:
+                              print(
+                                  f"node {name}: allocatable={allocatable_bytes}B class={class_name} already correct"
+                              )
+                              continue
+
+                          patch = {"metadata": {"labels": {LABEL: class_name}}}
+                          try:
+                              api_request("PATCH", f"/api/v1/nodes/{name}", patch)
+                          except urllib.error.HTTPError as err:
+                              body = err.read().decode("utf-8", "replace")
+                              print(f"node {name}: patch failed: {err} {body}", file=sys.stderr)
+                              failed = True
+                              continue
+
+                          print(
+                              f"node {name}: allocatable={allocatable_bytes}B class={class_name} patched"
+                          )
+
+                      sys.exit(1 if failed else 0)
+
+                  main()
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  memory: 64Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+                runAsNonRoot: true
+                runAsUser: 65534
+                seccompProfile:
+                  type: RuntimeDefault
