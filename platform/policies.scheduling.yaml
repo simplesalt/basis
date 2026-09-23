@@ -28,14 +28,25 @@ metadata:
       work that can wait; and CloudNativePG instances, whose standbys are
       exactly the kind of low-performance tenant a lean node should carry.
       Everything else -- Deployments, StatefulSets, bare pods -- is treated as
-      work and confined to work nodes. Two deliberate choices. The requirement
-      is NotIn lean rather than In work, because a node with no class label yet
-      satisfies NotIn, so the window between this policy taking effect and the
-      classifier's first run cannot strand a restarting pod. And the patch is
-      add-if-absent, so a pod that states its own nodeAffinity keeps it and
-      opts itself out. Neither resource requests nor limits are touched:
-      requests size a pod, they do not classify a node, and raising them to
-      force placement would only move the pressure onto the work nodes.
+      work and confined to work nodes.
+
+      The controller is only the default. The pod label
+      scheduling.simplesalt.company/class overrides it in either direction and
+      wins outright: work confines a pod to work nodes however it was created,
+      which is how a batch job too heavy for a lean node declares itself; lean
+      releases a pod to schedule anywhere, for a long-running service small
+      enough not to care. The label must sit on the pod template, not on the
+      controller, because admission sees the pod -- for a CronJob that is
+      spec.jobTemplate.spec.template.metadata.labels.
+
+      Three deliberate choices. The requirement is NotIn lean rather than In
+      work, because a node with no class label yet satisfies NotIn, so the
+      window between this policy taking effect and the classifier's first run
+      cannot strand a restarting pod. The patch is add-if-absent, so a pod that
+      states its own nodeAffinity keeps it. And neither resource requests nor
+      limits are touched: requests size a pod, they do not classify a node, and
+      raising them to force placement would only move the pressure onto the
+      work nodes.
 spec:
   background: false
   webhookConfiguration:
@@ -64,6 +75,40 @@ spec:
           - key: '{{ request.object.metadata.ownerReferences[0].apiVersion || '''' }}'
             operator: NotEquals
             value: postgresql.cnpg.io/v1
+          - key: '{{ request.object.metadata.labels."scheduling.simplesalt.company/class" || '''' }}'
+            operator: NotEquals
+            value: lean
+      mutate:
+        patchStrategicMerge:
+          spec:
+            affinity:
+              +(nodeAffinity):
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  nodeSelectorTerms:
+                    - matchExpressions:
+                        - key: scheduling.simplesalt.company/node-class
+                          operator: NotIn
+                          values:
+                            - lean
+
+    - name: confine-declared-work-to-work-nodes
+      match:
+        any:
+          - resources:
+              kinds:
+                - v1/Pod
+              operations:
+                - CREATE
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kyverno
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.labels."scheduling.simplesalt.company/class" || '''' }}'
+            operator: Equals
+            value: work
       mutate:
         patchStrategicMerge:
           spec:
