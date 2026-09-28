@@ -1,8 +1,11 @@
 """cluster-health HTTP server.
 
-GET /health runs every check module (finalizers implemented; flux and
-crossplane are stubs returning [] until later tasks fill them in) against a
-fresh in-cluster API client and returns:
+GET /health runs every check module -- finalizers (orphaned finalizers),
+flux (stuck Flux reconciliations), crossplane (stuck Crossplane resources),
+alerts (firing Prometheus alerts, including a reboot gate stuck closed),
+nodes (cordoned nodes, a stale kured reboot lock, low usable node memory)
+and stale (objects not Ready for a long time, admission webhooks with no
+backend) -- against a fresh in-cluster API client and returns:
 
     {
       "checked_at": "<RFC3339 timestamp>",
@@ -14,14 +17,18 @@ fresh in-cluster API client and returns:
     }
 
 `duration_ms` covers client construction plus every check module's
-run -- the actual Kubernetes API call cost of this /health call, not
-counting JSON serialization -- so a scan that gets slow (e.g. from the
-orphaned-finalizer check walking more API groups) stays visible in the
-response itself rather than only in server-side logs.
+run -- the actual Kubernetes API (and, for alerts/nodes, Prometheus) call
+cost of this /health call, not counting JSON serialization -- so a scan
+that gets slow (e.g. from the orphaned-finalizer check walking more API
+groups) stays visible in the response itself rather than only in
+server-side logs.
 
 `unverifiable` is never silently empty because it isn't hand-maintained: it
 is exactly whatever client.py's Client recorded while every check ran (see
-client.py's module docstring), read back after all three checks return.
+client.py's module docstring), read back after all six checks return. A
+failed Prometheus read (alerts.py, nodes.py -- see prometheus.py's module
+docstring) lands there the same way a failed Kubernetes read does: nothing
+here treats the two differently.
 
 GET /healthz is a separate, cheap liveness/readiness path that never calls
 the Kubernetes API, so kubelet probing this pod doesn't itself hammer the
@@ -38,12 +45,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import alerts
 import client as client_mod  # noqa: E402
 import crossplane  # noqa: E402
 import finalizers  # noqa: E402
 import flux  # noqa: E402
+import nodes
+import stale
 
-CHECKS = (finalizers, flux, crossplane)
+CHECKS = (finalizers, flux, crossplane, alerts, nodes, stale)
 
 
 def run_checks():

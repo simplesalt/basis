@@ -21,7 +21,7 @@ binds:
                     "/health": {
                       "get": {
                         "operationId": "health",
-                        "summary": "Cluster health problems: orphaned finalizers, stuck Flux reconciliations, and stuck Crossplane resources.",
+                        "summary": "Cluster health problems: orphaned finalizers, stuck Flux reconciliations, stuck Crossplane resources, firing Prometheus alerts, cordoned nodes and stalled reboots, node memory, objects not Ready for over a day, and admission webhooks with no backend.",
                         "responses": {
                           "200": {
                             "description": "OK",

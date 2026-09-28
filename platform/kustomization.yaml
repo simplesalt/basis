@@ -63,6 +63,10 @@ configMapGenerator:
       - finalizers.py=cluster-health/finalizers.py
       - flux.py=cluster-health/flux.py
       - crossplane.py=cluster-health/crossplane.py
+      - prometheus.py=cluster-health/prometheus.py
+      - alerts.py=cluster-health/alerts.py
+      - nodes.py=cluster-health/nodes.py
+      - stale.py=cluster-health/stale.py
       - controller-map.json=cluster-health/controller-map.json
     options:
       labels:

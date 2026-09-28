@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """Local test for client.py's per-run list cache, no cluster access.
 
-The other three test scripts (test-cluster-health.py, -flux.py,
--crossplane.py) each run one check module against a hand-rolled FakeClient
-that stands in for client.Client entirely, so none of them exercise
-client.py's own caching -- they just implement list_resource/list_deployments
-as plain dict lookups. This script instead exercises the real client.Client
-(the one server.py's run_checks actually constructs per /health call), with
-only its HTTP layer (Client.get) replaced by a fixture-backed fake, so the
-real discovery/list/cache code paths run.
+The other test scripts (test-cluster-health.py, -flux.py, -crossplane.py,
+-alerts.py, -nodes.py, -stale.py) each run one check module against a
+hand-rolled FakeClient that stands in for client.Client entirely, so none of
+them exercise client.py's own caching -- they just implement
+list_resource/list_deployments/group_resources as plain dict lookups. This
+script instead exercises the real client.Client (the one server.py's
+run_checks actually constructs per /health call), with only its HTTP layer
+(Client.get) replaced by a fixture-backed fake, so the real
+discovery/list/cache code paths run.
 
-That real Client is then shared across finalizers.check, flux.check and
-crossplane.check the same way server.py's run_checks shares one Client
-across all three (CHECKS = (finalizers, flux, crossplane)), and every fake
-GET is counted by path. The point: finalizers.py's widened scan now lists
-several (group, resource) pairs -- CustomResourceDefinitions, Kustomizations,
-HelmReleases, the four Source kinds, Providers, ProviderRevisions -- that
-flux.py and crossplane.py also ask for, and client.py's list cache must make
-each one a single real HTTP call shared across all three modules, not one
-call per module.
+That real Client is then shared across finalizers.check, flux.check,
+crossplane.check, alerts.check, nodes.check and stale.check the same way
+server.py's run_checks shares one Client across all six
+(CHECKS = (finalizers, flux, crossplane, alerts, nodes, stale)), and every
+fake GET is counted by path. The point: finalizers.py's and stale.py's
+widened scans list several (group, resource) pairs -- CustomResourceDefinitions,
+Kustomizations, HelmReleases, the four Source kinds, Providers,
+ProviderRevisions, Deployments, Nodes -- that more than one of these modules
+ask for, and client.py's list cache must make each one a single real HTTP
+call shared across every module that asks, not one call per module.
+Prometheus (alerts.py, nodes.py) is faked separately, via a FakePrometheus
+stashed on client.prometheus (the same injection point prometheus.py's
+own for_client docstring describes), so this script never makes a real
+HTTP call to Prometheus either.
 
 Bypasses Client.__init__ (it reads a ServiceAccount token/CA file that don't
 exist here) via Client.__new__ plus manually setting the handful of instance
@@ -46,10 +52,13 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "platform", "cluster-health"))
 
+import alerts
 import client as client_mod  # noqa: E402
 import crossplane  # noqa: E402
 import finalizers  # noqa: E402
 import flux  # noqa: E402
+import nodes
+import stale
 
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -88,26 +97,66 @@ STUCK_CLUSTER = {
     },
 }
 
+HEALTHY_NODE = {
+    "apiVersion": "v1",
+    "kind": "Node",
+    "metadata": {"name": "k-fixture-healthy"},
+    "spec": {"unschedulable": False},
+    "status": {
+        "conditions": [
+            {
+                "type": "Ready",
+                "status": "True",
+                "reason": "KubeletReady",
+                "message": "kubelet is posting ready status",
+                "lastTransitionTime": ago(60),
+            }
+        ]
+    },
+}
+
 RESPONSES = {
     # -- core (v1) --
     "/api/v1": {
         "resources": [
             _resource("namespaces", "Namespace", False),
+            _resource("nodes", "Node", False),
             _resource("pods", "Pod", True),
             _resource("persistentvolumes", "PersistentVolume", False),
             _resource("persistentvolumeclaims", "PersistentVolumeClaim", True),
         ]
     },
     "/api/v1/namespaces": {"items": []},
+    "/api/v1/nodes": {"items": [HEALTHY_NODE]},
     "/api/v1/pods": {"items": []},
     "/api/v1/persistentvolumes": {"items": []},
     "/api/v1/persistentvolumeclaims": {"items": []},
     # -- apps/v1 --
     "/apis/apps": _preferred("v1"),
-    "/apis/apps/v1": {"resources": [_resource("deployments", "Deployment", True)]},
+    "/apis/apps/v1": {
+        "resources": [
+            _resource("deployments", "Deployment", True),
+            _resource("daemonsets", "DaemonSet", True),
+        ]
+    },
     "/apis/apps/v1/deployments": {"items": []},
     "/apis/apps/v1/namespaces/crossplane-system/deployments": {"items": []},
     "/apis/apps/v1/namespaces/cnpg-system/deployments": {"items": []},
+    "/apis/apps/v1/namespaces/kured/daemonsets": {"items": []},
+    "/apis/discovery.k8s.io": _preferred("v1"),
+    "/apis/discovery.k8s.io/v1": {
+        "resources": [_resource("endpointslices", "EndpointSlice", True)]
+    },
+    "/apis/discovery.k8s.io/v1/endpointslices": {"items": []},
+    "/apis/admissionregistration.k8s.io": _preferred("v1"),
+    "/apis/admissionregistration.k8s.io/v1": {
+        "resources": [
+            _resource("validatingwebhookconfigurations", "ValidatingWebhookConfiguration", False),
+            _resource("mutatingwebhookconfigurations", "MutatingWebhookConfiguration", False),
+        ]
+    },
+    "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations": {"items": []},
+    "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations": {"items": []},
     # -- apiextensions.k8s.io/v1 --
     "/apis/apiextensions.k8s.io": _preferred("v1"),
     "/apis/apiextensions.k8s.io/v1": {
@@ -190,6 +239,28 @@ def make_fake_get(calls):
     return fake_get
 
 
+class FakePrometheus:
+    """Stand-in for prometheus.Prometheus, injected on client.prometheus the
+    same way prometheus.for_client's own docstring says a real caller (or a
+    test) would -- so alerts.check/nodes.check read canned data here instead
+    of ever making a real HTTP call to Prometheus. No node in this fake
+    cluster is cordoned (see HEALTHY_NODE), so nodes.py never calls .query()
+    at all; alerts.py calls .alerts() exactly once."""
+
+    def __init__(self, alerts_list=None):
+        self._alerts_list = alerts_list or []
+        self.alert_calls = 0
+        self.query_calls = 0
+
+    def alerts(self):
+        self.alert_calls += 1
+        return self._alerts_list
+
+    def query(self, expr):
+        self.query_calls += 1
+        return []
+
+
 def make_client():
     calls = {}
     c = client_mod.Client.__new__(client_mod.Client)
@@ -199,6 +270,7 @@ def make_client():
     c._list_cache = {}
     c._retry_backoff = (0, 0)
     c.get = make_fake_get(calls)
+    c.prometheus = FakePrometheus()
     return c, calls
 
 
@@ -238,15 +310,19 @@ def find_problem(problems, name):
 def run():
     client, calls = make_client()
 
-    # Run all three checks against the same Client, in the same order
-    # server.py's run_checks does (CHECKS = (finalizers, flux, crossplane)).
     fin_problems = finalizers.check(client, NOW)
     flux_problems = flux.check(client, NOW)
     cp_problems = crossplane.check(client, NOW)
+    alert_problems = alerts.check(client, NOW)
+    node_problems = nodes.check(client, NOW)
+    stale_problems = stale.check(client, NOW)
 
-    all_problems = fin_problems + flux_problems + cp_problems
-    print("problems found: fin={} flux={} crossplane={}".format(
-        len(fin_problems), len(flux_problems), len(cp_problems)
+    all_problems = (
+        fin_problems + flux_problems + cp_problems + alert_problems + node_problems + stale_problems
+    )
+    print("problems found: fin={} flux={} crossplane={} alerts={} nodes={} stale={}".format(
+        len(fin_problems), len(flux_problems), len(cp_problems),
+        len(alert_problems), len(node_problems), len(stale_problems),
     ))
     print("distinct GET paths requested: {}".format(len(calls)))
 
@@ -267,21 +343,43 @@ def run():
         "calls={}".format(sorted(calls)),
     )
 
+    check(
+        "alerts.check ran against the shared FakePrometheus exactly once and "
+        "reported zero problems (empty canned alert list)",
+        alert_problems == [] and client.prometheus.alert_calls == 1,
+        "alert_problems={} alert_calls={}".format(alert_problems, client.prometheus.alert_calls),
+    )
+    check(
+        "nodes.check never queried Prometheus at all -- no node in this fake "
+        "cluster is cordoned",
+        client.prometheus.query_calls == 0,
+        "query_calls={}".format(client.prometheus.query_calls),
+    )
+    check(
+        "stale.check and nodes.check ran over the fixture Node without "
+        "flagging it (Ready=True, unschedulable=False)",
+        find_problem(node_problems, "k-fixture-healthy") is None
+        and find_problem(stale_problems, "k-fixture-healthy") is None,
+        "node_problems={} stale_problems={}".format(node_problems, stale_problems),
+    )
+
     shared_lists = [
-        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",  # finalizers + crossplane
-        "/apis/kustomize.toolkit.fluxcd.io/v1/kustomizations",  # finalizers + flux
-        "/apis/helm.toolkit.fluxcd.io/v2/helmreleases",  # finalizers + flux
-        "/apis/source.toolkit.fluxcd.io/v1/gitrepositories",  # finalizers + flux
-        "/apis/source.toolkit.fluxcd.io/v1/helmrepositories",  # finalizers + flux
-        "/apis/source.toolkit.fluxcd.io/v1/ocirepositories",  # finalizers + flux
-        "/apis/source.toolkit.fluxcd.io/v1/buckets",  # finalizers + flux
-        "/apis/pkg.crossplane.io/v1/providers",  # finalizers + crossplane
-        "/apis/pkg.crossplane.io/v1/providerrevisions",  # finalizers + crossplane
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+        "/apis/kustomize.toolkit.fluxcd.io/v1/kustomizations",
+        "/apis/helm.toolkit.fluxcd.io/v2/helmreleases",
+        "/apis/source.toolkit.fluxcd.io/v1/gitrepositories",
+        "/apis/source.toolkit.fluxcd.io/v1/helmrepositories",
+        "/apis/source.toolkit.fluxcd.io/v1/ocirepositories",
+        "/apis/source.toolkit.fluxcd.io/v1/buckets",
+        "/apis/pkg.crossplane.io/v1/providers",
+        "/apis/pkg.crossplane.io/v1/providerrevisions",
+        "/apis/apps/v1/deployments",
+        "/api/v1/nodes",
     ]
     for path in shared_lists:
         check(
-            "{} is listed at most once across finalizers.check, flux.check and "
-            "crossplane.check together".format(path),
+            "{} is listed at most once across every one of the six check "
+            "modules that share this Client".format(path),
             calls.get(path) == 1,
             "calls[{}]={}".format(path, calls.get(path)),
         )
@@ -292,6 +390,19 @@ def run():
         calls.get("/apis/postgresql.cnpg.io/v1/clusters") == 1,
         "calls={}".format(calls.get("/apis/postgresql.cnpg.io/v1/clusters")),
     )
+
+    new_kind_lists = [
+        "/apis/apps/v1/namespaces/kured/daemonsets",
+        "/apis/discovery.k8s.io/v1/endpointslices",
+        "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations",
+        "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations",
+    ]
+    for path in new_kind_lists:
+        check(
+            "{} (a new kind added for alerts/nodes/stale) is listed exactly once".format(path),
+            calls.get(path) == 1,
+            "calls={}".format(calls.get(path)),
+        )
 
     check(
         "discovery for a group multiple modules touch (pkg.crossplane.io) "

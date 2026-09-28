@@ -1,9 +1,12 @@
 """Minimal in-cluster Kubernetes API client, stdlib only.
 
-Shared by finalizers.py, flux.py and crossplane.py. Every check module gets
-one Client instance (constructed once by server.py) and reads/lists through
-it. Two properties matter for the orphaned-finalizer scan and the checks
-that will join it later:
+Shared by finalizers.py, flux.py, crossplane.py, nodes.py and stale.py (each
+calls list_resource/list_deployments/group_resources on the one Client
+server.py constructs per /health call); alerts.py never calls those, but
+still shares the same Client's `.unverifiable` list, via
+prometheus.for_client(client) -- see prometheus.py's module docstring.
+Three properties matter for the orphaned-finalizer scan and the checks that
+joined it later:
 
 * Nothing here hardcodes a Kind's REST path or apiVersion. `list_resource`
   and `list_deployments` resolve group/version/namespaced-ness through the
@@ -34,6 +37,17 @@ that will join it later:
   reads `client.unverifiable` after running every check to fill the
   `/health` response's `unverifiable` field, so nothing is ever silently
   swallowed as an empty result.
+
+`kind_for`/`api_version_for` expose discovery's own answer for a
+(group, resource) pair -- the Kind a builtin apiserver's discovery doc
+always names per resource (e.g. "nodes" -> "Node") and the version
+`resolve` already picked, rendered as "v1" for the core group or
+"<group>/<version>" otherwise. finalizers.py and stale.py use these as
+their fallback when a listed item itself carries no kind/apiVersion -- true
+of every builtin Kind's list response (Node, Pod, Deployment, ...; a custom
+resource's items do carry both), so without this a builtin object stuck
+deleting or stale would be mislabeled with its plural resource name and
+bare group instead of its real Kind/apiVersion.
 """
 
 import json
@@ -148,10 +162,13 @@ class Client:
             return None
 
     def _discover_group(self, group):
-        """Return ("ok", version, {resource: namespaced}), ("absent", None,
-        None) if the group/version is not registered in this cluster, or
-        ("error", None, None) if discovery failed for another reason (and
-        was recorded to self.unverifiable)."""
+        """Return ("ok", version, {resource: {"namespaced": bool, "kind":
+        str}}), ("absent", None, None) if the group/version is not
+        registered in this cluster, or ("error", None, None) if discovery
+        failed for another reason (and was recorded to self.unverifiable).
+        Each entry's "kind" comes straight from discovery's own APIResource
+        ("kind": "Node", "kind": "Deployment", ...) -- the same field
+        kind_for/api_version_for expose below."""
         try:
             if group == "":
                 body = self.get("/api/v1")
@@ -183,7 +200,10 @@ class Client:
                 continue  # skip subresources (pods/log, deployments/status, ...)
             if "list" not in (entry.get("verbs") or []):
                 continue  # e.g. bindings, tokenreviews -- create-only, no list
-            resources[name] = bool(entry.get("namespaced"))
+            resources[name] = {
+                "namespaced": bool(entry.get("namespaced")),
+                "kind": entry.get("kind") or "",
+            }
         return ("ok", version, resources)
 
     def resolve(self, group, resource):
@@ -195,7 +215,31 @@ class Client:
             return (status, None, None)
         if resource not in resources:
             return ("absent", None, None)
-        return ("ok", version, resources[resource])
+        return ("ok", version, resources[resource]["namespaced"])
+
+    def kind_for(self, group, resource):
+        """The Kind discovery registered for (group, resource) -- e.g.
+        ("", "nodes") -> "Node", ("apps", "deployments") -> "Deployment" --
+        or None if the group/resource isn't registered (absent/error) or
+        discovery didn't carry a kind for it. Used as finalizers.py's and
+        stale.py's fallback for a listed item that itself has no "kind"
+        (every builtin Kind's list response omits it on each item; only a
+        custom resource's items carry it)."""
+        status, _version, resources = self.resolve_group(group)
+        if status != "ok":
+            return None
+        info = resources.get(resource)
+        return (info["kind"] or None) if info else None
+
+    def api_version_for(self, group, resource):
+        """The resolved apiVersion for (group, resource) -- "v1" for the
+        core group, "<group>/<version>" otherwise -- or None if the
+        group/resource isn't registered (absent/error). Same fallback role
+        as kind_for, for a listed item with no "apiVersion" of its own."""
+        status, version, resources = self.resolve_group(group)
+        if status != "ok" or resource not in resources:
+            return None
+        return version if not group else "{}/{}".format(group, version)
 
     def list_resource(self, group, resource, namespace=None):
         """List every object of `resource` in API group `group` (empty
@@ -251,7 +295,7 @@ class Client:
             return []
         if status == "error":
             return None
-        return sorted(resources.items())
+        return sorted((name, info["namespaced"]) for name, info in resources.items())
 
     def resolve_group(self, group):
         if group not in self._discovery_cache:

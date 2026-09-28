@@ -339,18 +339,22 @@ def _problem_for(client, obj, group, kind, api_version, now, threshold_seconds):
     }
 
 
-def _api_version_for(group, obj):
+def _api_version_for(client, group, resource, obj):
     api_version = obj.get("apiVersion")
     if api_version:
         return api_version
-    return group if group else "v1"
+    getter = getattr(client, "api_version_for", None)
+    resolved = getter(group, resource) if getter else None
+    return resolved or (group if group else "v1")
 
 
-def _kind_for(group, resource, obj):
+def _kind_for(client, group, resource, obj):
     kind = obj.get("kind")
     if kind:
         return kind
-    return resource
+    getter = getattr(client, "kind_for", None)
+    resolved = getter(group, resource) if getter else None
+    return resolved or resource
 
 
 def _scan_kind(client, group, resource, namespace, now, threshold_seconds, problems):
@@ -358,8 +362,8 @@ def _scan_kind(client, group, resource, namespace, now, threshold_seconds, probl
     if not items:
         return
     for obj in items:
-        api_version = _api_version_for(group, obj)
-        kind = _kind_for(group, resource, obj)
+        api_version = _api_version_for(client, group, resource, obj)
+        kind = _kind_for(client, group, resource, obj)
         problem = _problem_for(client, obj, group, kind, api_version, now, threshold_seconds)
         if problem is not None:
             problems.append(problem)

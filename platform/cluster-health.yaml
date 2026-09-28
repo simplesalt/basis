@@ -28,6 +28,7 @@ rules:
   - apiGroups: [""]
     resources:
       - namespaces
+      - nodes
       - pods
       - persistentvolumes
       - persistentvolumeclaims
@@ -36,7 +37,7 @@ rules:
       - serviceaccounts
     verbs: ["get", "list"]
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "daemonsets"]
     verbs: ["get", "list"]
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
@@ -49,6 +50,14 @@ rules:
     verbs: ["get", "list"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
+    verbs: ["get", "list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources:
+      - validatingwebhookconfigurations
+      - mutatingwebhookconfigurations
     verbs: ["get", "list"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources:
@@ -156,6 +165,26 @@ spec:
               value: "15"
             - name: CONTROLLER_MAP_PATH
               value: /scripts/controller-map.json
+            - name: PROMETHEUS_URL
+              value: http://prometheus-operated.cluster-main-observability.svc.cluster.local:9090
+            - name: REBOOT_GATE_ALERT
+              value: RebootGateClosed
+            - name: REBOOT_GATE_MAX_HOURS
+              value: "24"
+            - name: CORDON_MAX_MINUTES
+              value: "30"
+            - name: KURED_NAMESPACE
+              value: kured
+            - name: KURED_DAEMONSET
+              value: kured
+            - name: KURED_LOCK_ANNOTATION
+              value: weave.works/kured-node-lock
+            - name: KURED_LOCK_MAX_MINUTES
+              value: "30"
+            - name: NODE_MEMORY_MIN_USABLE_FRACTION
+              value: "0.5"
+            - name: NOT_READY_AFTER_HOURS
+              value: "24"
             - name: PORT
               value: "8080"
             - name: HOME
