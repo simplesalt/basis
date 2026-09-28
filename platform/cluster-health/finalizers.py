@@ -30,10 +30,15 @@ Terminating namespace, so the scan has two halves:
    (nothing here parses cluster-health.yaml at runtime -- it isn't shipped
    into the pod, only the scripts are):
 
-   * EXPLICIT_KINDS -- the core/apps/apiextensions.k8s.io resources the
-     ClusterRole names one by one (never Secrets -- the ClusterRole does
-     not grant the core group's wildcard, so Secret access is never even
-     requested).
+   * EXPLICIT_KINDS -- every resource the ClusterRole names one by one, by
+     group and resource, rather than via a "*" wildcard on the whole group
+     (core Pods/PVs/PVCs/ConfigMaps/Services/ServiceAccounts, apps
+     Deployments, apiextensions.k8s.io CRDs, batch Jobs/CronJobs,
+     coordination.k8s.io Leases, networking.k8s.io NetworkPolicies,
+     rbac.authorization.k8s.io Roles/RoleBindings/ClusterRoles/
+     ClusterRoleBindings, fluxcd.controlplane.io FluxInstances -- never
+     Secrets: the ClusterRole does not grant the core group's wildcard, so
+     Secret access is never even requested).
    * PROACTIVE_GROUPS -- every API group the ClusterRole grants
      resources: ["*"] on, walked in full via Client.group_resources
      (discovered live, so a Kind is never missed by not being on a
@@ -80,17 +85,30 @@ _BUILTIN_FINALIZER_NAMES = {"kubernetes", "orphan", "foregroundDeletion"}
 # service (see _deployment_matches_entry).
 _IN_SELECTOR_RE = re.compile(r"^\s*(\S+)\s+in\s*\(([^)]*)\)\s*$")
 
-# The core/apps/apiextensions.k8s.io resources platform/cluster-health.yaml's
-# ClusterRole names explicitly (not via a "*" resources wildcard). Namespaces
-# is deliberately not here -- check() already lists every Namespace for
-# step 1's Terminating walk, so listing it again here would be redundant.
-# Secrets is deliberately not here either: the ClusterRole never grants it.
+# Every resource platform/cluster-health.yaml's ClusterRole names explicitly
+# by group and resource (not via a "*" resources wildcard on the whole
+# group -- those are PROACTIVE_GROUPS below). Namespaces is deliberately not
+# here -- check() already lists every Namespace for step 1's Terminating
+# walk, so listing it again here would be redundant. Secrets is deliberately
+# not here either: the ClusterRole never grants it.
 EXPLICIT_KINDS = [
     ("", "pods"),
     ("", "persistentvolumes"),
     ("", "persistentvolumeclaims"),
+    ("", "configmaps"),
+    ("", "services"),
+    ("", "serviceaccounts"),
     ("apps", "deployments"),
     ("apiextensions.k8s.io", "customresourcedefinitions"),
+    ("batch", "jobs"),
+    ("batch", "cronjobs"),
+    ("coordination.k8s.io", "leases"),
+    ("networking.k8s.io", "networkpolicies"),
+    ("rbac.authorization.k8s.io", "roles"),
+    ("rbac.authorization.k8s.io", "rolebindings"),
+    ("rbac.authorization.k8s.io", "clusterroles"),
+    ("rbac.authorization.k8s.io", "clusterrolebindings"),
+    ("fluxcd.controlplane.io", "fluxinstances"),
 ]
 
 # Every API group platform/cluster-health.yaml's ClusterRole grants

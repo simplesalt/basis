@@ -28,6 +28,14 @@ fixture function -- so `resolve`/`_discover_group`/`list_resource`/
 bodies shaped like a real apiserver's, rather than being faked out
 themselves.
 
+A second scenario, run_retry(), covers Client.get's 429 (TooManyRequests)
+retry separately: it overrides only `_fetch` (the single HTTP attempt `get`
+now wraps in a retry loop), not `get` itself, so `get`'s real retry logic
+runs against a fixture that fails a controlled number of times -- proving a
+429 that clears within two retries succeeds silently, one that never
+clears still lands in unverifiable (just after retrying), and a non-429
+failure is never retried.
+
     scripts/test-cluster-health-client-cache.py
 """
 
@@ -189,8 +197,25 @@ def make_client():
     c._discovery_cache = {}
     c._deployment_cache = {}
     c._list_cache = {}
+    c._retry_backoff = (0, 0)
     c.get = make_fake_get(calls)
     return c, calls
+
+
+def make_client_for_retry(fetch_fn):
+    """A Client with only `_fetch` (the single-attempt HTTP call) replaced,
+    unlike make_client above which replaces `get` wholesale -- so `get`'s
+    real retry-on-429 loop actually runs against `fetch_fn`. _retry_backoff
+    is (0, 0): same retry COUNT (two) as production's (0.5, 1.0), just
+    without the real sleep, so this test stays fast and deterministic."""
+    c = client_mod.Client.__new__(client_mod.Client)
+    c.unverifiable = []
+    c._discovery_cache = {}
+    c._deployment_cache = {}
+    c._list_cache = {}
+    c._retry_backoff = (0, 0)
+    c._fetch = fetch_fn
+    return c
 
 
 FAILURES = []
@@ -289,11 +314,82 @@ def run():
     check("no call failed / landed in unverifiable", client.unverifiable == [], "unverifiable={}".format(client.unverifiable))
 
     print()
+    run_retry()
+
     if FAILURES:
         print("FAILED: {}".format(", ".join(FAILURES)))
         return 1
     print("all checks passed")
     return 0
+
+
+# --- scenario: 429 (TooManyRequests) retry in Client.get/get_safe -------
+
+
+def run_retry():
+    print("-- scenario: 429 (TooManyRequests) retry in Client.get/get_safe --")
+
+    # Succeeds on the third attempt (two retries): "storage is
+    # (re)initializing" -- e.g. right after an apiserver restart while its
+    # watch cache warms up -- is transient, so a list that clears within
+    # two retries must succeed and never land in unverifiable at all.
+    attempts = {"n": 0}
+
+    def flaky_then_ok(path, params=None):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise client_mod.ApiError("GET", path, 429, "storage is (re)initializing")
+        return {"items": []}
+
+    client = make_client_for_retry(flaky_then_ok)
+    result = client.get_safe("/api/v1/pods", "list pods (cluster-wide)")
+    check(
+        "a 429 that clears within two retries succeeds (three attempts "
+        "total) and is never recorded to unverifiable",
+        result == {"items": []} and attempts["n"] == 3 and client.unverifiable == [],
+        "attempts={} result={} unverifiable={}".format(attempts["n"], result, client.unverifiable),
+    )
+
+    # Exhausts both retries (three total attempts) and still fails -- must
+    # still land in unverifiable, same as any other denied call, just after
+    # retrying rather than failing immediately.
+    attempts2 = {"n": 0}
+
+    def always_429(path, params=None):
+        attempts2["n"] += 1
+        raise client_mod.ApiError("GET", path, 429, "storage is (re)initializing")
+
+    client2 = make_client_for_retry(always_429)
+    result2 = client2.get_safe("/api/v1/pods", "list pods (cluster-wide)")
+    check(
+        "a 429 that never clears is retried twice (three attempts total) "
+        "and then lands in unverifiable via get_safe, same as any other "
+        "failed call",
+        result2 is None
+        and attempts2["n"] == 3
+        and len(client2.unverifiable) == 1
+        and "pods" in client2.unverifiable[0]["attempted"]
+        and "storage is (re)initializing" in client2.unverifiable[0]["detail"],
+        "attempts={} unverifiable={}".format(attempts2["n"], client2.unverifiable),
+    )
+
+    # A non-429 failure (e.g. 403) is not retried at all -- exactly one
+    # attempt, so a genuinely denied call isn't slowed down for nothing.
+    attempts3 = {"n": 0}
+
+    def always_403(path, params=None):
+        attempts3["n"] += 1
+        raise client_mod.ApiError("GET", path, 403, "Forbidden")
+
+    client3 = make_client_for_retry(always_403)
+    result3 = client3.get_safe("/api/v1/pods", "list pods (cluster-wide)")
+    check(
+        "a non-429 failure (403) is not retried at all -- exactly one attempt",
+        result3 is None and attempts3["n"] == 1,
+        "attempts={}".format(attempts3["n"]),
+    )
+
+    print()
 
 
 if __name__ == "__main__":

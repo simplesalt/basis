@@ -38,11 +38,19 @@ that will join it later:
 
 import json
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+# A 429 (TooManyRequests) -- e.g. "storage is (re)initializing" while the
+# apiserver's watch cache warms up after a restart -- is transient and
+# usually clears within a second or two, so Client.get retries it up to
+# twice with this backoff before giving up and raising/recording it like
+# any other failure. Anything other than 429 is not retried.
+RETRY_BACKOFF_SECONDS = (0.5, 1.0)
 
 
 class ApiError(Exception):
@@ -67,6 +75,7 @@ class Client:
         self._discovery_cache = {}
         self._deployment_cache = {}
         self._list_cache = {}
+        self._retry_backoff = RETRY_BACKOFF_SECONDS
 
     @classmethod
     def in_cluster(cls):
@@ -84,8 +93,10 @@ class Client:
         with open(self.token_path) as handle:
             return handle.read().strip()
 
-    def get(self, path, params=None):
-        """GET a JSON path. Raises ApiError on anything but 2xx."""
+    def _fetch(self, path, params=None):
+        """One GET attempt against `path`, no retry. Raises ApiError on
+        anything but 2xx. Separated from `get` so a test can override just
+        this one HTTP call and still exercise `get`'s real retry loop."""
         query = ""
         if params:
             query = "?" + urllib.parse.urlencode(params)
@@ -111,6 +122,21 @@ class Client:
             raise ApiError("GET", path, exc.code, detail[:500]) from None
         except urllib.error.URLError as exc:
             raise ApiError("GET", path, None, str(exc.reason)) from None
+
+    def get(self, path, params=None):
+        """GET a JSON path. Raises ApiError on anything but 2xx (or a 429
+        still failing after self._retry_backoff's retries -- see its
+        definition)."""
+        attempt = 0
+        while True:
+            try:
+                return self._fetch(path, params=params)
+            except ApiError as exc:
+                if exc.status == 429 and attempt < len(self._retry_backoff):
+                    time.sleep(self._retry_backoff[attempt])
+                    attempt += 1
+                    continue
+                raise
 
     def get_safe(self, path, attempted, params=None):
         """GET a JSON path; record failure to self.unverifiable and return

@@ -31,6 +31,9 @@ rules:
       - pods
       - persistentvolumes
       - persistentvolumeclaims
+      - configmaps
+      - services
+      - serviceaccounts
     verbs: ["get", "list"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
@@ -38,8 +41,28 @@ rules:
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
     verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - roles
+      - rolebindings
+      - clusterroles
+      - clusterrolebindings
+    verbs: ["get", "list"]
+  - apiGroups: ["fluxcd.controlplane.io"]
+    resources: ["fluxinstances"]
+    verbs: ["get", "list"]
   - apiGroups:
-      # Flux
+      # Flux (source.toolkit.fluxcd.io's resources: ["*"] here already
+      # covers helmcharts -- no separate rule needed for it)
       - kustomize.toolkit.fluxcd.io
       - helm.toolkit.fluxcd.io
       - source.toolkit.fluxcd.io

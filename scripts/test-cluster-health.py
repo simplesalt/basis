@@ -328,6 +328,16 @@ def run():
     stuck_pod["apiVersion"] = "v1"  # _managed_resource's "{}/v1beta1" shape doesn't fit core/v1
     client.set_resource("", "pods", None, [stuck_pod])
 
+    # widened scan, RBAC-grant follow-up: a stuck object of a kind the
+    # ClusterRole only started granting get/list on alongside this Effort
+    # (coordination.k8s.io Lease), proving EXPLICIT_KINDS was extended to
+    # match the widened grant rather than just the grant itself changing.
+    stuck_lease = _managed_resource(
+        "stuck-lease", "cluster-main-observability", "coordination.k8s.io", "Lease",
+        minutes_ago=30, finalizers_list=["example.io/cleanup"],
+    )
+    client.set_resource("coordination.k8s.io", "leases", None, [stuck_lease])
+
     # --- run ------------------------------------------------------------
     problems = finalizers.check(client, NOW)
 
@@ -414,6 +424,14 @@ def run():
         "wildcarded group), sitting in an Active namespace, is flagged",
         pod is not None and pod["kind"] == "Pod" and pod["category"] == "orphaned-finalizer",
         "found={}".format(pod),
+    )
+
+    lease = find_problem(problems, "stuck-lease")
+    check(
+        "a stuck coordination.k8s.io Lease (one of the kinds newly granted "
+        "get/list and added to EXPLICIT_KINDS) is flagged",
+        lease is not None and lease["kind"] == "Lease" and lease["category"] == "orphaned-finalizer",
+        "found={}".format(lease),
     )
 
     print()

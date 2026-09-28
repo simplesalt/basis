@@ -23,9 +23,18 @@ Covers, per the parent Effort's request:
   currently True -- a release can recover and still be worth knowing it
   flapped.
 * Sources -- GitRepository / HelmRepository / OCIRepository / Bucket
-  (source.toolkit.fluxcd.io): Ready not True (flux-not-ready);
-  status.artifact.lastUpdateTime older than SOURCE_STALE_MULTIPLIER times
-  spec.interval (flux-source-stale).
+  (source.toolkit.fluxcd.io): Ready not True (flux-not-ready), except an
+  OCI-type HelmRepository (spec.type: oci) reporting no Ready condition at
+  all -- by design (confirmed live: flux-system/simplesalt-charts has
+  status: {}), not a problem, so that specific no-condition case is
+  skipped; a HelmRepository (OCI or not) that does report Ready=False is
+  still flagged. Separately, any source whose own conditions show
+  Ready=False, FetchFailed=True or Stalled=True is flux-source-stale --
+  replacing an earlier artifact-age heuristic (status.artifact.lastUpdateTime
+  older than N x spec.interval) that produced false positives on an idle
+  repo whose revision simply hasn't changed (confirmed live:
+  flux-system/ss-cloud-basis, interval 1m, sat ~8h "stale" by that
+  heuristic with nothing wrong).
 * spec.suspend: true on any of the six kinds above (flux-suspended).
 * Objects listed in a Kustomization's status.inventory.entries that carry
   the annotation kustomize.toolkit.fluxcd.io/reconcile: disabled
@@ -59,7 +68,6 @@ mis-pluralized Kind simply fails to list (or lists the wrong thing, which
 finds no matching id and reports nothing for it) rather than crashing.
 """
 
-import re
 from datetime import datetime, timezone
 
 CATEGORY_NOT_READY = "flux-not-ready"
@@ -75,7 +83,6 @@ REQUESTED_AT_ANNOTATION = "reconcile.fluxcd.io/requestedAt"
 RECONCILE_ANNOTATION = "kustomize.toolkit.fluxcd.io/reconcile"
 
 REQUEST_GRACE_SECONDS = 5 * 60
-SOURCE_STALE_MULTIPLIER = 5
 
 KUSTOMIZATION_GROUP = "kustomize.toolkit.fluxcd.io"
 HELMRELEASE_GROUP = "helm.toolkit.fluxcd.io"
@@ -111,8 +118,6 @@ _KIND_TO_RESOURCE_OVERRIDES = {
     "Endpoints": "endpoints",
 }
 
-_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
-
 
 def _parse_ts(raw):
     if raw is None:
@@ -140,27 +145,6 @@ def _format_duration(seconds):
     if minutes:
         return "{}m{}s".format(minutes, secs)
     return "{}s".format(secs)
-
-
-def _duration_seconds(text):
-    """Parse a Go-style duration string (e.g. "10m", "1h30m", "45s") into
-    seconds, or None if it is missing or unparseable."""
-    if not text:
-        return None
-    total = 0.0
-    matched = False
-    for value, unit in _DURATION_RE.findall(text):
-        matched = True
-        n = float(value)
-        if unit == "h":
-            total += n * 3600
-        elif unit == "m":
-            total += n * 60
-        elif unit == "s":
-            total += n
-        elif unit == "ms":
-            total += n / 1000
-    return total if matched else None
 
 
 def _get_condition(obj, cond_type):
@@ -339,7 +323,15 @@ def _check_kustomization(obj, now, problems):
     ]
     succeeded = [h for h in history if h.get("lastReconciledStatus") == "ReconciliationSucceeded"]
     if failed and succeeded:
-        times = sorted(t for t in (h.get("lastReconciledAt") for h in failed) if t)
+        # Kustomization history entries carry firstReconciled/lastReconciled
+        # (confirmed live) -- distinct from HelmRelease's firstDeployed/
+        # lastDeployed below. There is no "lastReconciledAt" field; using
+        # one here always came back None, printing "first=None last=None".
+        times = sorted(
+            t
+            for t in (h.get("lastReconciled") or h.get("firstReconciled") for h in failed)
+            if t
+        )
         first_time = times[0] if times else None
         last_time = times[-1] if times else None
         problems.append(
@@ -402,46 +394,69 @@ def _check_helmrelease(obj, now, problems):
         )
 
 
+def _is_oci_helmrepository(kind, spec):
+    return kind == "HelmRepository" and spec.get("type") == "oci"
+
+
+def _source_condition_problem(kind, obj, api_version, namespace, name):
+    """Flag a source by its own conditions -- Ready=False, FetchFailed=True
+    or Stalled=True -- instead of an artifact-age heuristic (see
+    _check_source's caller and the module docstring): idle repos whose
+    revision hasn't changed don't move status.artifact.lastUpdateTime, so
+    age is not a reliable staleness signal, but these conditions are."""
+    bad = []
+    ready = _get_condition(obj, "Ready")
+    if ready is not None and ready.get("status") == "False":
+        bad.append(ready)
+    for ctype in ("FetchFailed", "Stalled"):
+        cond = _get_condition(obj, ctype)
+        if cond is not None and cond.get("status") == "True":
+            bad.append(cond)
+    if not bad:
+        return None
+    detail = "; ".join(
+        "{}={} reason={} message={}".format(
+            cond.get("type"), cond.get("status"), cond.get("reason"), cond.get("message")
+        )
+        for cond in bad
+    )
+    return _base_problem(
+        CATEGORY_SOURCE_STALE,
+        "warning",
+        kind,
+        api_version,
+        namespace,
+        name,
+        detail,
+    )
+
+
 def _check_source(kind, obj, now, problems):
     metadata = obj.get("metadata", {})
     spec = obj.get("spec", {}) or {}
-    status = obj.get("status", {}) or {}
     namespace = metadata.get("namespace")
     name = metadata.get("name", "<unknown>")
     api_version = _api_version(SOURCE_GROUP, obj)
 
-    problem = _ready_not_true_problem(SOURCE_GROUP, kind, obj)
-    if problem is not None:
-        problems.append(problem)
+    # An OCI-type HelmRepository reports no Ready condition at all by
+    # design (confirmed live: flux-system/simplesalt-charts has
+    # status: {}) -- that specific no-condition case is not a problem, so
+    # it is skipped here; one that does report Ready=False is still
+    # flagged below via the normal path.
+    if not (
+        _is_oci_helmrepository(kind, spec) and _get_condition(obj, "Ready") is None
+    ):
+        problem = _ready_not_true_problem(SOURCE_GROUP, kind, obj)
+        if problem is not None:
+            problems.append(problem)
 
     problem = _suspended_problem(SOURCE_GROUP, kind, obj)
     if problem is not None:
         problems.append(problem)
 
-    artifact = status.get("artifact")
-    interval_seconds = _duration_seconds(spec.get("interval"))
-    if artifact and interval_seconds:
-        last_update = _parse_ts(artifact.get("lastUpdateTime"))
-        if last_update is not None:
-            age_seconds = (now - last_update).total_seconds()
-            threshold_seconds = interval_seconds * SOURCE_STALE_MULTIPLIER
-            if age_seconds > threshold_seconds:
-                problems.append(
-                    _base_problem(
-                        CATEGORY_SOURCE_STALE,
-                        "warning",
-                        kind,
-                        api_version,
-                        namespace,
-                        name,
-                        "artifact last updated {} ago, more than {}x spec.interval "
-                        "({})".format(
-                            _format_duration(age_seconds),
-                            SOURCE_STALE_MULTIPLIER,
-                            spec.get("interval"),
-                        ),
-                    )
-                )
+    problem = _source_condition_problem(kind, obj, api_version, namespace, name)
+    if problem is not None:
+        problems.append(problem)
 
 
 def _check_inventory_disabled(client, kustomizations, problems):

@@ -8,7 +8,7 @@ method flux.py actually calls (list_resource) plus .unverifiable, and
 counts calls per (group, resource, namespace) so the "list once, reuse"
 API-call bound can be asserted directly.
 
-Three scenarios:
+Four scenarios:
 
 1. run_conditions() -- one object per problem category flux.check() can
    report (flux-not-ready, flux-retrying, flux-generation-lag,
@@ -21,12 +21,23 @@ Three scenarios:
    prove it is listed once and reused, not once per entry. The
    flux-history-failures instance here is the HelmRelease example from
    the parent Effort's request: kube-prometheus-stack with 9 failed
-   releases 2026-09-12..21 before recovering to Ready=True.
+   releases 2026-09-12..21 before recovering to Ready=True. The
+   flux-source-stale instance here is a GitRepository with FetchFailed=True
+   -- the conditions-based replacement for the old artifact-age heuristic.
 2. run_kustomization_flapping() -- isolates Kustomization-side flapping
    (status.history's lastReconciledStatus/ReconciliationSucceeded shape,
    distinct from HelmRelease's status/failed shape) in its own fixture so
    it does not collide with scenario 1's "exactly once" counts.
-3. run_healthy() -- one object of every kind, all clean, expects zero
+3. run_source_conditions() -- isolates the source-specific fixes: an
+   OCI-type HelmRepository reporting no Ready condition at all (the live
+   shape of flux-system/simplesalt-charts) must not be flagged, but one
+   that does report Ready=False still is; a non-OCI HelmRepository with no
+   Ready condition is unaffected by that exemption; an idle source with
+   healthy conditions and no recent artifact update (the live shape of
+   flux-system/ss-cloud-basis, which the old age heuristic flagged stale at
+   ~8h old on a 1m interval) is never flagged; and a source with
+   Stalled=True is flagged even while Ready is still True.
+4. run_healthy() -- one object of every kind, all clean, expects zero
    problems and an empty unverifiable list.
 
     scripts/test-cluster-health-flux.py
@@ -161,21 +172,34 @@ def _source(
     ready_status="True",
     ready_reason="Succeeded",
     interval="10m",
-    artifact_age_minutes=None,
     suspend=False,
+    source_type=None,
+    no_ready_condition=False,
+    extra_conditions=None,
 ):
-    conditions = [
-        {"type": "Ready", "status": ready_status, "reason": ready_reason, "message": "..."}
-    ]
-    status = {"conditions": conditions}
-    if artifact_age_minutes is not None:
-        status["artifact"] = {"lastUpdateTime": ago(artifact_age_minutes)}
+    """A source fixture. no_ready_condition=True omits the Ready condition
+    entirely (status: {} -- the real shape of an OCI-type HelmRepository,
+    e.g. flux-system/simplesalt-charts, confirmed live). source_type sets
+    spec.type (e.g. "oci"). extra_conditions appends condition dicts such
+    as FetchFailed/Stalled. No status.artifact is ever set here -- the
+    conditions-based health check (see flux.py's _source_condition_problem)
+    never reads it, unlike the artifact-age heuristic it replaced."""
+    conditions = []
+    if not no_ready_condition:
+        conditions.append(
+            {"type": "Ready", "status": ready_status, "reason": ready_reason, "message": "..."}
+        )
+    if extra_conditions:
+        conditions.extend(extra_conditions)
+    spec = {"interval": interval, "suspend": suspend}
+    if source_type is not None:
+        spec["type"] = source_type
     return {
         "apiVersion": "source.toolkit.fluxcd.io/v1",
         "kind": kind,
         "metadata": {"name": name, "namespace": namespace},
-        "spec": {"interval": interval, "suspend": suspend},
-        "status": status,
+        "spec": spec,
+        "status": {"conditions": conditions} if conditions else {},
     }
 
 
@@ -304,8 +328,20 @@ def run_conditions():
     )
     client.set_resource("helm.toolkit.fluxcd.io", "helmreleases", None, [hr_history_flapping])
 
-    src_stale = _source("GitRepository", "src-stale", interval="10m", artifact_age_minutes=90)
-    client.set_resource("source.toolkit.fluxcd.io", "gitrepositories", None, [src_stale])
+    src_fetch_failed = _source(
+        "GitRepository",
+        "src-fetch-failed",
+        interval="10m",
+        extra_conditions=[
+            {
+                "type": "FetchFailed",
+                "status": "True",
+                "reason": "GitOperationFailed",
+                "message": "unable to clone: authentication required",
+            }
+        ],
+    )
+    client.set_resource("source.toolkit.fluxcd.io", "gitrepositories", None, [src_fetch_failed])
 
     problems = flux.check(client, NOW)
 
@@ -378,10 +414,10 @@ def run_conditions():
         "found={}".format(flapping_hr),
     )
 
-    stale = find_problem(problems, "src-stale")
+    stale = find_problem(problems, "src-fetch-failed")
     check(
-        "a source whose artifact is older than 5x spec.interval is "
-        "flux-source-stale, exactly once",
+        "a source with FetchFailed=True is flux-source-stale -- conditions-"
+        "based, not an artifact-age heuristic -- exactly once",
         stale is not None
         and stale["category"] == "flux-source-stale"
         and stale["kind"] == "GitRepository"
@@ -446,12 +482,30 @@ def run_kustomization_flapping():
     print("-- scenario: Kustomization status.history flapping --")
     client = FakeClient()
 
+    # Kustomization history entries carry firstReconciled/lastReconciled
+    # (confirmed live), not "lastReconciledAt" -- see flux.py's
+    # _check_kustomization. Each entry here uses a distinct
+    # firstReconciled/lastReconciled pair so the assertion below can prove
+    # the real fields are read (a bug that always returns None for both
+    # would print "first=None last=None" and still pass a same-valued test).
     ks_flapping = _kustomization(
         "ks-flapping",
         history=[
-            {"lastReconciledStatus": "ReconciliationFailed", "lastReconciledAt": ago(120)},
-            {"lastReconciledStatus": "ReconciliationFailed", "lastReconciledAt": ago(90)},
-            {"lastReconciledStatus": "ReconciliationSucceeded", "lastReconciledAt": ago(10)},
+            {
+                "lastReconciledStatus": "ReconciliationFailed",
+                "firstReconciled": ago(125),
+                "lastReconciled": ago(120),
+            },
+            {
+                "lastReconciledStatus": "ReconciliationFailed",
+                "firstReconciled": ago(95),
+                "lastReconciled": ago(90),
+            },
+            {
+                "lastReconciledStatus": "ReconciliationSucceeded",
+                "firstReconciled": ago(15),
+                "lastReconciled": ago(10),
+            },
         ],
     )
     client.set_resource("kustomize.toolkit.fluxcd.io", "kustomizations", None, [ks_flapping])
@@ -461,21 +515,139 @@ def run_kustomization_flapping():
 
     check(
         "a Kustomization with failed history entries alongside a current success "
-        "is flux-history-failures, with count and first/last times",
+        "is flux-history-failures, with real first/last reconciled times (not "
+        "\"first=None last=None\")",
         len(problems) == 1
         and problems[0]["category"] == "flux-history-failures"
         and problems[0]["kind"] == "Kustomization"
         and problems[0]["name"] == "ks-flapping"
         and problems[0]["count"] == 2
         and problems[0]["first_time"] == ago(120)
-        and problems[0]["last_time"] == ago(90),
+        and problems[0]["last_time"] == ago(90)
+        and "None" not in problems[0]["detail"],
         "problems={}".format(problems),
     )
 
     print()
 
 
-# --- scenario 3: a healthy fixture set reports nothing -------------------
+# --- scenario 3: source health via conditions, not artifact age ---------
+
+
+def run_source_conditions():
+    print("-- scenario: source health via conditions, not artifact age --")
+    client = FakeClient()
+
+    # (a) An OCI-type HelmRepository reports no Ready condition at all by
+    # design (confirmed live: flux-system/simplesalt-charts has status: {})
+    # -- must not be flagged critical flux-not-ready for that alone, and
+    # has no other bad condition either, so it gets zero problems.
+    oci_no_ready = _source("HelmRepository", "oci-quiet", source_type="oci", no_ready_condition=True)
+
+    # (a), second half: an OCI HelmRepository that DOES report Ready=False
+    # is still flagged -- the skip is only for the no-condition case.
+    oci_ready_false = _source(
+        "HelmRepository", "oci-broken", source_type="oci",
+        ready_status="False", ready_reason="ChartPullFailed",
+    )
+
+    # The (a) exemption is OCI-only: a plain (non-OCI) HelmRepository with
+    # no Ready condition is still flagged flux-not-ready, same as before.
+    plain_no_ready = _source("HelmRepository", "plain-quiet", no_ready_condition=True)
+
+    client.set_resource(
+        "source.toolkit.fluxcd.io",
+        "helmrepositories",
+        None,
+        [oci_no_ready, oci_ready_false, plain_no_ready],
+    )
+
+    # (b) An idle source with healthy conditions and no recent artifact
+    # update -- the live shape of flux-system/ss-cloud-basis, which the old
+    # artifact-age heuristic flagged stale at ~8h old on a 1m interval
+    # simply because its revision hadn't changed. No status.artifact is
+    # even set here, to make the point sharply: age is never consulted.
+    idle_but_healthy = _source("GitRepository", "idle-but-healthy", interval="1m")
+    client.set_resource("source.toolkit.fluxcd.io", "gitrepositories", None, [idle_but_healthy])
+
+    # (b) A source with Stalled=True -- a terminal failure Flux won't retry
+    # without intervention -- is flagged even while Ready is still True.
+    stalled = _source(
+        "Bucket",
+        "src-stalled",
+        ready_status="True",
+        extra_conditions=[
+            {
+                "type": "Stalled",
+                "status": "True",
+                "reason": "InvalidBucketName",
+                "message": "bucket name is invalid",
+            }
+        ],
+    )
+    client.set_resource("source.toolkit.fluxcd.io", "buckets", None, [stalled])
+
+    problems = flux.check(client, NOW)
+    print("problems found: {}".format(len(problems)))
+    for p in problems:
+        print(
+            "  - {} {} {}/{}  category={}".format(
+                p["category"], p["kind"], p.get("namespace"), p["name"], p["category"]
+            )
+        )
+
+    check("exactly 4 problems reported", len(problems) == 4, "found {}".format(len(problems)))
+
+    check(
+        "an OCI HelmRepository with no Ready condition at all is not flagged "
+        "at all (no flux-not-ready, no flux-source-stale)",
+        find_problem(problems, "oci-quiet") is None,
+        "found={}".format(find_problem(problems, "oci-quiet")),
+    )
+
+    oci_broken = find_problem(problems, "oci-broken")
+    check(
+        "an OCI HelmRepository that DOES report Ready=False is still "
+        "flagged flux-not-ready, critical",
+        oci_broken is not None
+        and oci_broken["category"] == "flux-not-ready"
+        and oci_broken["severity"] == "critical",
+        "found={}".format(oci_broken),
+    )
+    check(
+        "the same Ready=False HelmRepository is also flagged flux-source-stale "
+        "via the new conditions-based check",
+        any(p["name"] == "oci-broken" and p["category"] == "flux-source-stale" for p in problems),
+        "problems={}".format(problems),
+    )
+
+    plain_broken = find_problem(problems, "plain-quiet")
+    check(
+        "a non-OCI HelmRepository with no Ready condition is still flagged "
+        "flux-not-ready -- the (a) exemption is OCI-only",
+        plain_broken is not None and plain_broken["category"] == "flux-not-ready",
+        "found={}".format(plain_broken),
+    )
+
+    check(
+        "an idle source with healthy conditions and no recent artifact update "
+        "is never flagged flux-source-stale -- age is no longer consulted",
+        find_problem(problems, "idle-but-healthy") is None,
+        "found={}".format(find_problem(problems, "idle-but-healthy")),
+    )
+
+    stalled_problem = find_problem(problems, "src-stalled")
+    check(
+        "a source with Stalled=True is flagged flux-source-stale even while "
+        "Ready is still True",
+        stalled_problem is not None and stalled_problem["category"] == "flux-source-stale",
+        "found={}".format(stalled_problem),
+    )
+
+    print()
+
+
+# --- scenario 4: a healthy fixture set reports nothing -------------------
 
 
 def run_healthy():
@@ -489,7 +661,7 @@ def run_healthy():
         observed_generation=5,
         requested_at=same_ts,
         handled_at=same_ts,
-        history=[{"lastReconciledStatus": "ReconciliationSucceeded", "lastReconciledAt": ago(5)}],
+        history=[{"lastReconciledStatus": "ReconciliationSucceeded", "firstReconciled": ago(6), "lastReconciled": ago(5)}],
         inventory_entries=[
             {"id": "apps_healthy-app_apps_Deployment", "v": "v1"},
             {"id": "apps_healthy-secret__Secret", "v": "v1"},
@@ -507,25 +679,33 @@ def run_healthy():
         "source.toolkit.fluxcd.io",
         "gitrepositories",
         None,
-        [_source("GitRepository", "git-healthy", interval="10m", artifact_age_minutes=2)],
+        [_source("GitRepository", "git-healthy", interval="10m")],
     )
+    # helmrepo-healthy is an ordinary HelmRepository; oci-healthy is an
+    # OCI-type HelmRepository reporting no Ready condition at all (the live
+    # shape of flux-system/simplesalt-charts) -- also a healthy case now,
+    # must not contribute any problem to this scenario's "zero problems"
+    # expectation.
     client.set_resource(
         "source.toolkit.fluxcd.io",
         "helmrepositories",
         None,
-        [_source("HelmRepository", "helmrepo-healthy", interval="1h", artifact_age_minutes=5)],
+        [
+            _source("HelmRepository", "helmrepo-healthy", interval="1h"),
+            _source("HelmRepository", "oci-healthy", source_type="oci", no_ready_condition=True),
+        ],
     )
     client.set_resource(
         "source.toolkit.fluxcd.io",
         "ocirepositories",
         None,
-        [_source("OCIRepository", "ocirepo-healthy", interval="30m", artifact_age_minutes=10)],
+        [_source("OCIRepository", "ocirepo-healthy", interval="30m")],
     )
     client.set_resource(
         "source.toolkit.fluxcd.io",
         "buckets",
         None,
-        [_source("Bucket", "bucket-healthy", interval="15m", artifact_age_minutes=3)],
+        [_source("Bucket", "bucket-healthy", interval="15m")],
     )
 
     client.set_resource("apps", "deployments", None, [_deployment("healthy-app", "apps")])
@@ -542,6 +722,7 @@ def run_healthy():
 def run():
     run_conditions()
     run_kustomization_flapping()
+    run_source_conditions()
     run_healthy()
 
     if FAILURES:
