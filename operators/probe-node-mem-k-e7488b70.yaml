@@ -1,0 +1,87 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: probe-node-mem-k-e7488b70
+  namespace: kured
+  labels:
+    app.kubernetes.io/name: probe-node-mem
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: node-lifecycle
+    entity: cluster
+    capability: lifecycle
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: probe-node-mem
+        app.kubernetes.io/part-of: basis
+        app.kubernetes.io/component: node-lifecycle
+    spec:
+      restartPolicy: Never
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/hostname: k-e7488b70
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: probe-node-mem
+          image: ghcr.io/simplesalt/oci/cluster:latest
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            privileged: true
+          command:
+            - nsenter
+            - --target=1
+            - --mount
+            - --uts
+            - --ipc
+            - --net
+            - --pid
+            - --
+            - bash
+            - -c
+            - |
+              set -u
+              echo "=== NODE ==="
+              hostname
+              date -u
+              uptime
+              echo "=== FREE (MiB) ==="
+              free -m
+              echo "=== MEMINFO ==="
+              grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapTotal|SwapFree|Shmem|Slab|SReclaimable|SUnreclaim|KernelStack|PageTables|Committed_AS|AnonPages|Mapped)' /proc/meminfo
+              echo "=== ZRAM / SWAP ==="
+              swapon --show 2>&1 || true
+              echo "=== TOP 25 PROCESSES BY RSS (KiB) ==="
+              ps -eo rss,vsz,pid,etimes,comm --sort=-rss | head -26
+              echo "=== CGROUP MEMORY (bytes) ==="
+              for g in /sys/fs/cgroup/system.slice /sys/fs/cgroup/kubepods.slice /sys/fs/cgroup/user.slice /sys/fs/cgroup/init.scope; do
+                [ -r "$g/memory.current" ] && echo "$g $(cat $g/memory.current)"
+              done
+              echo "=== SYSTEM.SLICE SERVICES BY MEMORY (bytes) ==="
+              for s in /sys/fs/cgroup/system.slice/*.service; do
+                [ -r "$s/memory.current" ] && echo "$(cat $s/memory.current) $(basename $s)"
+              done | sort -rn | head -15
+              echo "=== KUBELET CONFIG (reservation / eviction lines) ==="
+              grep -iE 'reserved|eviction|memory|enforce' /etc/rancher/k3s/kubelet.config 2>&1
+              echo "=== K3S CONFIG DROP-INS (reservation / eviction lines) ==="
+              grep -rihE 'reserved|eviction' /etc/rancher/k3s/config.yaml /etc/rancher/k3s/config.yaml.d 2>&1 || echo "none"
+              echo "=== ETCD DB SIZE ==="
+              ls -la /var/lib/rancher/k3s/server/db/etcd/member/snap/db 2>&1
+              echo "=== K3S VERSION ==="
+              k3s --version 2>&1 | head -2
+              echo "=== OOM KILLS LAST 24H ==="
+              journalctl -k --since "-24h" --no-pager 2>&1 | grep -iE 'out of memory|oom-kill|killed process' | tail -30
+              echo "=== K3S SERVICE 04:50-05:05 UTC 2026-09-28 ==="
+              journalctl -u k3s --since "2026-09-28 04:50:00 UTC" --until "2026-09-28 05:05:00 UTC" --no-pager 2>&1 | grep -iE 'start|stop|exit|fail|signal|leader|etcd.*(slow|timeout|lost)|panic|fatal' | tail -60
+              echo "=== SYSTEM EVENTS 04:50-05:05 UTC 2026-09-28 ==="
+              journalctl --since "2026-09-28 04:50:00 UTC" --until "2026-09-28 05:05:00 UTC" --no-pager -p warning 2>&1 | tail -40
+              echo "=== END ==="
