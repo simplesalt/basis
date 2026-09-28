@@ -15,9 +15,7 @@ SECRETS=(
 
   'ssint-main-ai|gbrain-embedding-secret|ssint-main-ai|gbrain-embedding-secret|OPENAI_API_KEY'
   'crossplane-system|gcp-credentials|crossplane-system|gcp-credentials|credentials,sa_key'
-  'cert-manager|ss-acme-cf-token|cert-manager|ss-acme-cf-token|api-token'
   'crossplane-system|ssint-main-g-idp-secret|crossplane-system|ssint-main-g-idp-secret|client_secret'
-  'cert-manager|fe-acme-cf-token|cert-manager|fe-acme-cf-token|api-token'
   'ssint-main-ai|hermes-secrets|ssint-main-ai|hermes-secrets|CLOUDFLARE_ACCOUNT_ID,CLOUDFLARE_API_TOKEN,FIRECRAWL_API_KEY,GENERAL_API_LLM_API_KEY,GITHUB_TOKEN,GOOGLE_CLIENT_ID,GOOGLE_PRIVATE_KEY_B64,GOOGLE_PRIVATE_KEY_ID,HERMES_BEARER_TOKEN,HERMES_WEBHOOK_HMAC_KEY,HINDSIGHT_API_LLM_API_KEY,TAVILY_API_KEY,WORK_EMAIL'
   'ssint-main-ai|team-roster|ssint-main-ai|team-roster|roster.json'
   'ssint-main-ai|project-tracking|ssint-main-ai|project-tracking|board-config.json'
