@@ -214,8 +214,9 @@ def _stale_problem(client, obj, group, resource, condition_type, now, threshold_
     message = _truncate(cond.get("message"))
     severity = "critical" if (group, resource) == (NODE_GROUP, NODE_RESOURCE) else "warning"
 
-    detail = "{}={} ({}: {}) since {} ({})".format(
-        condition_type, cond_status, reason, message, since_raw, _format_duration(age_seconds)
+    cause = "{}: {}".format(reason, message) if message else reason
+    detail = "{}={} ({}) since {} ({})".format(
+        condition_type, cond_status, cause, since_raw, _format_duration(age_seconds)
     )
 
     return _base_problem(
