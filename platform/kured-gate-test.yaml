@@ -1,0 +1,30 @@
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kured-gate-test
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: kured-gate-test
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: node-lifecycle
+    entity: cluster
+    env: main
+    capability: lifecycle
+    release: prometheus
+spec:
+  groups:
+    - name: kured-gate-test.rules
+      rules:
+        - alert: KuredGateTest
+          expr: vector(1)
+          labels:
+            severity: critical
+          annotations:
+            summary: Temporary test alarm holding the kured reboot gate closed
+            description: >-
+              Temporary test alert for simplesalt/projects#559. Always firing
+              by construction (expr: vector(1)) so it satisfies the
+              severity=critical clause of RebootGateClosed for the duration of
+              the live gate test. Remove this rule once the test concludes
+              (see #559 phase D).
