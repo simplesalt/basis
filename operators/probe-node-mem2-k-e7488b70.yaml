@@ -2,7 +2,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: probe-node-mem-k-e7488b70
+  name: probe-node-mem2-k-e7488b70
   namespace: kured
   labels:
     app.kubernetes.io/name: probe-node-mem
@@ -32,9 +32,9 @@ spec:
           resources:
             requests:
               cpu: 10m
-              memory: 32Mi
+              memory: 192Mi
             limits:
-              memory: 128Mi
+              memory: 256Mi
           securityContext:
             privileged: true
           command:
