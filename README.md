@@ -1,8 +1,9 @@
 # basis
 
 Cluster-wide Flux Kustomization content for the kCluster base stack: operator
-installs (cert-manager, crossplane, kyverno, cnpg, observability) and platform
-resources (Crossplane providers, Kyverno cleanup policies).
+installs (cert-manager, kyverno, cnpg, observability) and platform resources
+(Kyverno cleanup policies). Crossplane and its cloud providers are installed
+by `simplesalt/cloud-basis`.
 
 ## Out of scope: kube-vip
 

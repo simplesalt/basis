@@ -14,20 +14,6 @@ metadata:
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: crossplane-system
-  labels:
-    name: crossplane-system
-    entity: cluster
-    capability: iac
-    pod-security.kubernetes.io/enforce: baseline
-    pod-security.kubernetes.io/audit: baseline
-    pod-security.kubernetes.io/warn: baseline
-  annotations:
-    kustomize.toolkit.fluxcd.io/prune: disabled
----
-apiVersion: v1
-kind: Namespace
-metadata:
   name: kyverno
   labels:
     name: kyverno

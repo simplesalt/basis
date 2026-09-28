@@ -28,35 +28,6 @@ spec:
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
-  name: crossplane
-  namespace: crossplane-system
-  labels:
-    app.kubernetes.io/name: crossplane
-    app.kubernetes.io/part-of: basis
-    app.kubernetes.io/component: iac
-    entity: cluster
-    capability: iac
-  annotations:
-    kustomize.toolkit.fluxcd.io/prune: disabled
-spec:
-  interval: 5m
-  releaseName: crossplane
-  chart:
-    spec:
-      chart: crossplane
-      sourceRef:
-        kind: HelmRepository
-        name: crossplane-stable
-        namespace: flux-system
-  values:
-    provider:
-      packages: []
-    configuration:
-      packages: []
----
-apiVersion: helm.toolkit.fluxcd.io/v2
-kind: HelmRelease
-metadata:
   name: kyverno
   namespace: kyverno
   labels:

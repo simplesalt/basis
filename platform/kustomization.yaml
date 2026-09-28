@@ -1,12 +1,8 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - cf-providers.yaml
-  - cf-runtime.yaml
   - cluster-health.yaml
   - fluent-bit.yaml
-  - gcp-providers.yaml
-  - gcp-runtime.yaml
   - human-operator.yaml
   - kured-gate.yaml
   - logs-api.yaml

@@ -14,20 +14,6 @@ spec:
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: HelmRepository
 metadata:
-  name: crossplane-stable
-  namespace: flux-system
-  labels:
-    entity: cluster
-    capability: basis
-  annotations:
-    kustomize.toolkit.fluxcd.io/prune: disabled
-spec:
-  url: https://charts.crossplane.io/stable
-  interval: 24h
----
-apiVersion: source.toolkit.fluxcd.io/v1
-kind: HelmRepository
-metadata:
   name: kyverno
   namespace: flux-system
   labels:
