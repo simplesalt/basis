@@ -49,6 +49,11 @@ _CONTENT_REMAINING_ITEM_RE = re.compile(r"^(?P<gvr>.+)\shas\s\d+\sresource\sinst
 
 _BUILTIN_FINALIZER_NAMES = {"kubernetes", "orphan", "foregroundDeletion"}
 
+# controller-map.json's "labelSelector" entries use exactly this one shape:
+# `key in (value,value,...)`, e.g. for a group several Deployments could
+# service (see _deployment_matches_entry).
+_IN_SELECTOR_RE = re.compile(r"^\s*(\S+)\s+in\s*\(([^)]*)\)\s*$")
+
 CLUSTER_SCOPED_KINDS = [
     ("", "persistentvolumes"),
     ("apiextensions.k8s.io", "customresourcedefinitions"),
@@ -104,6 +109,46 @@ def _match_controller_entry(group):
     return None
 
 
+def _deployment_labels(dep):
+    """The labels that actually identify what a Deployment's pods run:
+    spec.template.metadata.labels, falling back to spec.selector.matchLabels
+    for a Deployment whose template happens to omit a key its selector still
+    carries. Never metadata.labels -- several real Deployments controller-map.json
+    matches against (every Crossplane provider package runtime, confirmed
+    live) have no top-level labels at all, and others that do have some
+    still omit the specific key an entry needs (the Flux controllers carry
+    `app=<name>` only in the template/selector, not at the top level)."""
+    template_labels = dep.get("spec", {}).get("template", {}).get("metadata", {}).get("labels")
+    if template_labels:
+        return template_labels
+    return dep.get("spec", {}).get("selector", {}).get("matchLabels", {}) or {}
+
+
+def _parse_in_selector(expr):
+    """Parse a `key in (a,b,c)` label-selector expression -- the only shape
+    controller-map.json's "labelSelector" entries use -- into (key,
+    {value, ...}). Returns None if `expr` is not that shape."""
+    match = _IN_SELECTOR_RE.match(expr or "")
+    if not match:
+        return None
+    key = match.group(1)
+    values = {v.strip() for v in match.group(2).split(",") if v.strip()}
+    return key, values
+
+
+def _deployment_matches_entry(dep, entry):
+    labels = _deployment_labels(dep)
+    label_selector = entry.get("labelSelector")
+    if label_selector:
+        parsed = _parse_in_selector(label_selector)
+        if parsed is None:
+            return False
+        key, values = parsed
+        return labels.get(key) in values
+    match_labels = entry.get("matchLabels") or {}
+    return all(labels.get(k) == v for k, v in match_labels.items())
+
+
 def _parse_ts(raw):
     if raw is None:
         return None
@@ -149,17 +194,18 @@ def classify_controller(client, group, finalizers):
     if entry.get("builtin"):
         return "builtin"
 
-    deployments = client.list_deployments(
-        entry["namespace"],
-        match_labels=entry.get("matchLabels"),
-        label_selector=entry.get("labelSelector"),
-    )
+    # Listed once per namespace and cached by client.list_deployments for
+    # the lifetime of this check run; matched client-side below rather than
+    # via a server-side label selector (see _deployment_labels).
+    deployments = client.list_deployments(entry["namespace"])
     if deployments is None:
         return "unknown"
-    if not deployments:
+
+    matching = [dep for dep in deployments if _deployment_matches_entry(dep, entry)]
+    if not matching:
         return "missing"
 
-    for dep in deployments:
+    for dep in matching:
         wanted = dep.get("spec", {}).get("replicas")
         if wanted is None:
             wanted = 1

@@ -33,12 +33,6 @@ def ago(minutes):
     return iso(NOW - timedelta(minutes=minutes))
 
 
-def _selector_key(match_labels, label_selector):
-    if label_selector:
-        return ("raw", label_selector)
-    return ("labels", tuple(sorted((match_labels or {}).items())))
-
-
 class FakeClient:
     """A fixture-backed stand-in for client.Client.
 
@@ -46,6 +40,13 @@ class FakeClient:
     set_deployments; deny_resource/deny_deployments simulate an RBAC 403 (or
     any other failed call) the way client.py's get_safe records one: append
     to self.unverifiable and return None instead of raising.
+
+    set_deployments/list_deployments take only a namespace, matching the
+    real client.py's list_deployments (one unfiltered list per namespace,
+    cached for the check run -- see its docstring): classify_controller
+    matches client-side against each Deployment's own
+    spec.template.metadata.labels / spec.selector.matchLabels now, not a
+    server-side selector, so the fake needs no selector key either.
     """
 
     def __init__(self):
@@ -81,27 +82,22 @@ class FakeClient:
     def group_resources(self, group):
         return self._group_resources.get(group, [])
 
-    def set_deployments(self, namespace, items, match_labels=None, label_selector=None):
-        key = (namespace, _selector_key(match_labels, label_selector))
-        self._deployments[key] = items
+    def set_deployments(self, namespace, items):
+        self._deployments[namespace] = items
 
-    def deny_deployments(self, namespace, match_labels=None, label_selector=None, detail="403 Forbidden"):
-        key = (namespace, _selector_key(match_labels, label_selector))
-        self._deny_deployments[key] = detail
+    def deny_deployments(self, namespace, detail="403 Forbidden"):
+        self._deny_deployments[namespace] = detail
 
-    def list_deployments(self, namespace, match_labels=None, label_selector=None):
-        key = (namespace, _selector_key(match_labels, label_selector))
-        if key in self._deny_deployments:
+    def list_deployments(self, namespace):
+        if namespace in self._deny_deployments:
             self.unverifiable.append(
                 {
-                    "attempted": "list deployments in {} matching {!r}".format(
-                        namespace, match_labels or label_selector
-                    ),
-                    "detail": self._deny_deployments[key],
+                    "attempted": "list deployments in {}".format(namespace),
+                    "detail": self._deny_deployments[namespace],
                 }
             )
             return None
-        return self._deployments.get(key, [])
+        return self._deployments.get(namespace, [])
 
 
 def _namespace(name, deletion_minutes_ago=None, spec_finalizers=None, conditions=None, phase="Active"):
@@ -143,12 +139,24 @@ def _managed_resource(name, namespace, group, kind, minutes_ago, finalizers_list
     }
 
 
-def _deployment(name, namespace, replicas=1, ready=1, labels=None):
+def _deployment(name, namespace, replicas=1, ready=1, template_labels=None,
+                 selector_labels=None, top_labels=None):
+    """A Deployment fixture shaped like the ones classify_controller
+    actually sees on the live cluster: spec.template.metadata.labels is
+    what a controller-map.json entry matches against (falling back to
+    spec.selector.matchLabels), and top-level metadata.labels defaults to
+    {} -- every Crossplane provider package runtime Deployment in
+    crossplane-system carries no top-level labels at all."""
+    template_labels = template_labels or {}
     return {
         "apiVersion": "apps/v1",
         "kind": "Deployment",
-        "metadata": {"name": name, "namespace": namespace, "labels": labels or {}},
-        "spec": {"replicas": replicas},
+        "metadata": {"name": name, "namespace": namespace, "labels": top_labels or {}},
+        "spec": {
+            "replicas": replicas,
+            "selector": {"matchLabels": selector_labels or template_labels},
+            "template": {"metadata": {"labels": template_labels}},
+        },
         "status": {"readyReplicas": ready},
     }
 
@@ -179,7 +187,10 @@ def run():
         deletion_minutes_ago=40,
         spec_finalizers=["kubernetes"],
         conditions=[
-            _content_remaining_condition(["instances.cloudplatform.gcp.upbound.io"])
+            _content_remaining_condition([
+                "instances.cloudplatform.gcp.upbound.io",
+                "records.dns.upjet-cloudflare.upbound.io",
+            ])
         ],
     )
     ns_young = _namespace(
@@ -202,11 +213,37 @@ def run():
     client.set_resource(
         "cloudplatform.gcp.upbound.io", "instances", "crossplane-orphan-ns", [stuck_instance]
     )
-    # the provider Deployment is missing entirely -> controller "missing"
+
+    stuck_record = _managed_resource(
+        "stuck-record",
+        "crossplane-orphan-ns",
+        "dns.upjet-cloudflare.upbound.io",
+        "Record",
+        minutes_ago=40,
+        finalizers_list=["finalizer.managedresource.crossplane.io"],
+    )
+    client.set_resource(
+        "dns.upjet-cloudflare.upbound.io", "records", "crossplane-orphan-ns", [stuck_record]
+    )
+
+    # crossplane-system, listed once: a running provider-cloudflare-dns
+    # Deployment (no top-level labels at all, matched via
+    # spec.template.metadata.labels -- the real live shape) covers the
+    # "running" path; no Deployment at all carries the
+    # pkg.crossplane.io/provider=provider-gcp-cloudplatform label, so that
+    # group resolves "missing".
     client.set_deployments(
         "crossplane-system",
-        [],
-        match_labels={"pkg.crossplane.io/provider": "provider-gcp-cloudplatform"},
+        [
+            _deployment(
+                "provider-cloudflare-dns-406f1cba2c03", "crossplane-system",
+                replicas=1, ready=1,
+                template_labels={
+                    "pkg.crossplane.io/provider": "provider-cloudflare-dns",
+                    "pkg.crossplane.io/revision": "provider-cloudflare-dns-406f1cba2c03",
+                },
+            ),
+        ],
     )
 
     # cluster-scoped kinds: PVs denied (RBAC 403), CRDs verified-empty
@@ -225,19 +262,32 @@ def run():
         minutes_ago=20, finalizers_list=["finalizers.fluxcd.io"],
     )
     client.set_resource("kustomize.toolkit.fluxcd.io", "kustomizations", None, [stuck_kustomization])
-    client.set_deployments(
-        "flux-system", [_deployment("kustomize-controller", "flux-system", replicas=1, ready=1)],
-        match_labels={"app": "kustomize-controller"},
-    )
 
     stuck_helmrelease = _managed_resource(
         "stuck-hr", "flux-system", "helm.toolkit.fluxcd.io", "HelmRelease",
         minutes_ago=25, finalizers_list=["finalizers.fluxcd.io"],
     )
     client.set_resource("helm.toolkit.fluxcd.io", "helmreleases", None, [stuck_helmrelease])
+
+    # flux-system, listed once: both controllers' top-level metadata.labels
+    # (the real live shape) carry app.kubernetes.io/component etc. but never
+    # the bare "app" key controller-map.json matches on -- only
+    # spec.template.metadata.labels / spec.selector.matchLabels do. A
+    # server-side selector on metadata.labels would match neither.
     client.set_deployments(
-        "flux-system", [_deployment("helm-controller", "flux-system", replicas=1, ready=0)],
-        match_labels={"app": "helm-controller"},
+        "flux-system",
+        [
+            _deployment(
+                "kustomize-controller", "flux-system", replicas=1, ready=1,
+                template_labels={"app": "kustomize-controller", "app.kubernetes.io/component": "kustomize-controller"},
+                top_labels={"app.kubernetes.io/component": "kustomize-controller", "control-plane": "controller"},
+            ),
+            _deployment(
+                "helm-controller", "flux-system", replicas=1, ready=0,
+                template_labels={"app": "helm-controller", "app.kubernetes.io/component": "helm-controller"},
+                top_labels={"app.kubernetes.io/component": "helm-controller", "control-plane": "controller"},
+            ),
+        ],
     )
 
     # unknown group: no controller-map entry
@@ -269,6 +319,14 @@ def run():
         "stale crossplane finalizer with missing provider Deployment is flagged, controller=missing",
         missing is not None and missing["controller"] == "missing" and missing["category"] == "orphaned-finalizer",
         "found={}".format(missing),
+    )
+
+    running_provider = find_problem(problems, "stuck-record")
+    check(
+        "stale crossplane finalizer whose provider Deployment is running is flagged, controller=running"
+        " (matched client-side via spec.template.metadata.labels on a Deployment with no top-level labels)",
+        running_provider is not None and running_provider["controller"] == "running",
+        "found={}".format(running_provider),
     )
 
     young = find_problem(problems, "young-delete-ns")

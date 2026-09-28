@@ -52,6 +52,7 @@ class Client:
         self.token_path = token_path
         self.unverifiable = []
         self._discovery_cache = {}
+        self._deployment_cache = {}
 
     @classmethod
     def in_cluster(cls):
@@ -202,27 +203,36 @@ class Client:
             self._discovery_cache[group] = self._discover_group(group)
         return self._discovery_cache[group]
 
-    def list_deployments(self, namespace, match_labels=None, label_selector=None):
-        """List Deployments in `namespace` matching either an equality
-        `match_labels` dict or a raw `label_selector` expression (e.g. the
-        `in (...)` form used when several Deployments could own a group).
-        Returns a list, or None if the lookup could not be verified."""
+    def list_deployments(self, namespace):
+        """List every Deployment in `namespace`, unfiltered, cached for the
+        lifetime of this Client (one /health call) the same way `resolve`
+        caches discovery per group.
+
+        No server-side label selector: several Deployments these checks care
+        about carry no top-level metadata.labels at all (every Crossplane
+        provider runtime pod -- see crossplane.py's module docstring) or
+        omit the specific key a hand-written selector guessed (the Flux
+        controllers only carry `app=<name>` in spec.template.metadata.labels
+        / spec.selector.matchLabels, not at the top level). Callers
+        (finalizers.classify_controller, crossplane.check) list the whole
+        namespace once and match client-side against the Deployment's own
+        template/selector labels instead.
+
+        Returns a list, or None if the lookup could not be verified (already
+        recorded on self.unverifiable)."""
+        if namespace in self._deployment_cache:
+            return self._deployment_cache[namespace]
+
         status, version, _namespaced = self.resolve("apps", "deployments")
         if status == "absent":
-            return []
-        if status == "error":
-            return None
-
-        if label_selector:
-            selector = label_selector
+            result = []
+        elif status == "error":
+            result = None
         else:
-            selector = ",".join(
-                "{}={}".format(k, v) for k, v in sorted((match_labels or {}).items())
-            )
-        path = "/apis/apps/{}/namespaces/{}/deployments".format(version, namespace)
-        attempted = "list deployments in {} matching {!r}".format(namespace, selector)
-        params = {"labelSelector": selector} if selector else None
-        body = self.get_safe(path, attempted, params=params)
-        if body is None:
-            return None
-        return body.get("items", [])
+            path = "/apis/apps/{}/namespaces/{}/deployments".format(version, namespace)
+            attempted = "list deployments in {}".format(namespace)
+            body = self.get_safe(path, attempted)
+            result = None if body is None else body.get("items", [])
+
+        self._deployment_cache[namespace] = result
+        return result
