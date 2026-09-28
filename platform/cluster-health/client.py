@@ -1,0 +1,228 @@
+"""Minimal in-cluster Kubernetes API client, stdlib only.
+
+Shared by finalizers.py, flux.py and crossplane.py. Every check module gets
+one Client instance (constructed once by server.py) and reads/lists through
+it. Two properties matter for the orphaned-finalizer scan and the checks
+that will join it later:
+
+* Nothing here hardcodes a Kind's REST path or apiVersion. `list_resource`
+  and `list_deployments` resolve group/version/namespaced-ness through the
+  same discovery endpoints (`/api/v1`, `/apis/<group>`, `/apis/<group>/<version>`)
+  a dynamic client or kubectl would use, and cache the result per group for
+  the lifetime of one /health call. That is what lets the checks walk
+  RBAC-scoped groups (see platform/cluster-health.yaml's ClusterRole) without
+  a table of Kind names to keep in sync by hand.
+
+* A failed or denied call never raises out of `list_resource` /
+  `list_deployments` / `get_safe`. It is recorded on `self.unverifiable` --
+  {"attempted": ..., "detail": ...} -- and the caller gets back `None`
+  (distinct from `[]`, which means the call succeeded and found nothing, or
+  the group/resource genuinely does not exist in this cluster). server.py
+  reads `client.unverifiable` after running every check to fill the
+  `/health` response's `unverifiable` field, so nothing is ever silently
+  swallowed as an empty result.
+"""
+
+import json
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
+
+SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+
+class ApiError(Exception):
+    """A Kubernetes API call did not return a usable 2xx response."""
+
+    def __init__(self, method, path, status, detail):
+        self.method = method
+        self.path = path
+        self.status = status
+        self.detail = detail
+        super().__init__(
+            "{} {} -> {}: {}".format(method, path, status, detail)
+        )
+
+
+class Client:
+    def __init__(self, host, port, ca_path=SA_DIR + "/ca.crt", token_path=SA_DIR + "/token"):
+        self.base_url = "https://{}:{}".format(host, port)
+        self.ctx = ssl.create_default_context(cafile=ca_path)
+        self.token_path = token_path
+        self.unverifiable = []
+        self._discovery_cache = {}
+
+    @classmethod
+    def in_cluster(cls):
+        import os
+
+        return cls(
+            os.environ["KUBERNETES_SERVICE_HOST"],
+            os.environ["KUBERNETES_SERVICE_PORT"],
+        )
+
+    def _token(self):
+        # Re-read on every call rather than caching: kubelet rotates a
+        # projected SA token in place, and this process is meant to run for
+        # a long time between pod restarts.
+        with open(self.token_path) as handle:
+            return handle.read().strip()
+
+    def get(self, path, params=None):
+        """GET a JSON path. Raises ApiError on anything but 2xx."""
+        query = ""
+        if params:
+            query = "?" + urllib.parse.urlencode(params)
+        url = self.base_url + path + query
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": "Bearer " + self._token(),
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, context=self.ctx, timeout=20) as resp:
+                body = resp.read()
+                return json.loads(body) if body else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()
+            try:
+                detail = detail.decode("utf-8", "replace")
+            except Exception:
+                detail = str(detail)
+            raise ApiError("GET", path, exc.code, detail[:500]) from None
+        except urllib.error.URLError as exc:
+            raise ApiError("GET", path, None, str(exc.reason)) from None
+
+    def get_safe(self, path, attempted, params=None):
+        """GET a JSON path; record failure to self.unverifiable and return
+        None instead of raising."""
+        try:
+            return self.get(path, params=params)
+        except ApiError as exc:
+            self.unverifiable.append({"attempted": attempted, "detail": str(exc)})
+            return None
+
+    def _discover_group(self, group):
+        """Return ("ok", version, {resource: namespaced}), ("absent", None,
+        None) if the group/version is not registered in this cluster, or
+        ("error", None, None) if discovery failed for another reason (and
+        was recorded to self.unverifiable)."""
+        try:
+            if group == "":
+                body = self.get("/api/v1")
+                version = "v1"
+            else:
+                group_doc = self.get("/apis/{}".format(group))
+                version = (group_doc.get("preferredVersion") or {}).get("version")
+                if not version:
+                    versions = group_doc.get("versions") or []
+                    version = versions[0]["version"] if versions else None
+                if not version:
+                    return ("absent", None, None)
+                body = self.get("/apis/{}/{}".format(group, version))
+        except ApiError as exc:
+            if exc.status == 404:
+                return ("absent", None, None)
+            self.unverifiable.append(
+                {
+                    "attempted": "discover API group {!r}".format(group or "core/v1"),
+                    "detail": str(exc),
+                }
+            )
+            return ("error", None, None)
+
+        resources = {}
+        for entry in body.get("resources", []):
+            name = entry.get("name", "")
+            if "/" in name:
+                continue  # skip subresources (pods/log, deployments/status, ...)
+            resources[name] = bool(entry.get("namespaced"))
+        return ("ok", version, resources)
+
+    def resolve(self, group, resource):
+        """("ok", version, namespaced) | ("absent", None, None) | ("error", None, None)."""
+        if group not in self._discovery_cache:
+            self._discovery_cache[group] = self._discover_group(group)
+        status, version, resources = self._discovery_cache[group]
+        if status != "ok":
+            return (status, None, None)
+        if resource not in resources:
+            return ("absent", None, None)
+        return ("ok", version, resources[resource])
+
+    def list_resource(self, group, resource, namespace=None):
+        """List every object of `resource` in API group `group` (empty
+        string for core/v1).
+
+        namespace=None lists cluster-wide: every namespace for a namespaced
+        resource, or the single collection for a cluster-scoped one.
+        Returns a list (possibly empty, including when the group/resource
+        does not exist in this cluster -- that is a verified absence, not a
+        failure) or None if the call could not be verified (already
+        recorded on self.unverifiable).
+        """
+        status, version, namespaced = self.resolve(group, resource)
+        if status == "absent":
+            return []
+        if status == "error":
+            return None
+
+        base = "/apis/{}/{}".format(group, version) if group else "/api/{}".format(version)
+        if namespaced and namespace:
+            path = "{}/namespaces/{}/{}".format(base, namespace, resource)
+            scope = "namespace {}".format(namespace)
+        else:
+            path = "{}/{}".format(base, resource)
+            scope = "namespace {}".format(namespace) if namespace else "cluster-wide"
+        attempted = "list {}{} ({})".format(
+            resource, "." + group if group else "", scope
+        )
+        body = self.get_safe(path, attempted)
+        if body is None:
+            return None
+        return body.get("items", [])
+
+    def group_resources(self, group):
+        """Every top-level resource name registered under `group`, e.g. to
+        walk "the Flux and Crossplane kinds" without hardcoding each Kind.
+        Returns a list of (resource, namespaced) pairs, or None on failure."""
+        status, _version, resources = self.resolve_group(group)
+        if status == "absent":
+            return []
+        if status == "error":
+            return None
+        return sorted(resources.items())
+
+    def resolve_group(self, group):
+        if group not in self._discovery_cache:
+            self._discovery_cache[group] = self._discover_group(group)
+        return self._discovery_cache[group]
+
+    def list_deployments(self, namespace, match_labels=None, label_selector=None):
+        """List Deployments in `namespace` matching either an equality
+        `match_labels` dict or a raw `label_selector` expression (e.g. the
+        `in (...)` form used when several Deployments could own a group).
+        Returns a list, or None if the lookup could not be verified."""
+        status, version, _namespaced = self.resolve("apps", "deployments")
+        if status == "absent":
+            return []
+        if status == "error":
+            return None
+
+        if label_selector:
+            selector = label_selector
+        else:
+            selector = ",".join(
+                "{}={}".format(k, v) for k, v in sorted((match_labels or {}).items())
+            )
+        path = "/apis/apps/{}/namespaces/{}/deployments".format(version, namespace)
+        attempted = "list deployments in {} matching {!r}".format(namespace, selector)
+        params = {"labelSelector": selector} if selector else None
+        body = self.get_safe(path, attempted, params=params)
+        if body is None:
+            return None
+        return body.get("items", [])

@@ -1,0 +1,67 @@
+{
+  "_comment": [
+    "Maps a stuck object's own API group to the Deployment that owns",
+    "reconciling (and therefore un-stuck-ing) it, per",
+    "finalizers.py:classify_controller. Not the finalizer string:",
+    "finalizers.fluxcd.io and finalizer.managedresource.crossplane.io are",
+    "each shared by several controllers, so only the object's group tells",
+    "you which one actually owns it.",
+    "",
+    "Each entry is {group, namespace, matchLabels} (an equality label",
+    "selector) or {group, namespace, labelSelector} (a raw selector",
+    "expression, for the rare case where any of several Deployments",
+    "servicing that group being ready counts as \"running\"). {group,",
+    "builtin: true} marks a group whose finalizers are removed by the",
+    "kube-apiserver itself, with no controller Deployment to check.",
+    "",
+    "A group with no entry here resolves to controller status \"unknown\" --",
+    "an honest gap, not a bug: extend this file as real stuck objects turn",
+    "up in groups it does not cover yet.",
+    "",
+    "Deployment/label names below come from operators/controllers.yaml and",
+    "operators/flux-instance.yaml (Helm release names, chart conventions)",
+    "and platform/{gcp,cf}-providers.yaml (Provider package names -> the",
+    "pkg.crossplane.io/provider label Crossplane puts on each provider's",
+    "runtime pod); none of it was read back from a live cluster."
+  ],
+  "controllers": [
+    { "group": "kustomize.toolkit.fluxcd.io", "namespace": "flux-system", "matchLabels": { "app": "kustomize-controller" } },
+    { "group": "helm.toolkit.fluxcd.io", "namespace": "flux-system", "matchLabels": { "app": "helm-controller" } },
+    { "group": "source.toolkit.fluxcd.io", "namespace": "flux-system", "matchLabels": { "app": "source-controller" } },
+
+    { "group": "pkg.crossplane.io", "namespace": "crossplane-system", "matchLabels": { "app": "crossplane" } },
+    { "group": "apiextensions.crossplane.io", "namespace": "crossplane-system", "matchLabels": { "app": "crossplane" } },
+
+    { "group": "gcp.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "upbound-provider-family-gcp" } },
+    { "group": "gcp.m.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "upbound-provider-family-gcp" } },
+    { "group": "cloudplatform.gcp.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "provider-gcp-cloudplatform" } },
+    { "group": "cloudplatform.gcp.m.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "provider-gcp-cloudplatform" } },
+
+    { "group": "dns.upjet-cloudflare.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "provider-cloudflare-dns" } },
+    { "group": "dns.upjet-cloudflare.m.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "provider-cloudflare-dns" } },
+    { "group": "r2.upjet-cloudflare.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "provider-cloudflare-r2" } },
+    { "group": "r2.upjet-cloudflare.m.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "provider-cloudflare-r2" } },
+    { "group": "workers.upjet-cloudflare.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "provider-cloudflare-workers" } },
+    { "group": "workers.upjet-cloudflare.m.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "provider-cloudflare-workers" } },
+    { "group": "zero.upjet-cloudflare.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "provider-cloudflare-zero" } },
+    { "group": "zero.upjet-cloudflare.m.upbound.io", "namespace": "crossplane-system", "matchLabels": { "pkg.crossplane.io/provider": "provider-cloudflare-zero" } },
+
+    {
+      "group": "upjet-cloudflare.upbound.io",
+      "namespace": "crossplane-system",
+      "labelSelector": "pkg.crossplane.io/provider in (provider-cloudflare-dns,provider-cloudflare-r2,provider-cloudflare-workers,provider-cloudflare-zero)"
+    },
+    {
+      "group": "upjet-cloudflare.m.upbound.io",
+      "namespace": "crossplane-system",
+      "labelSelector": "pkg.crossplane.io/provider in (provider-cloudflare-dns,provider-cloudflare-r2,provider-cloudflare-workers,provider-cloudflare-zero)"
+    },
+
+    { "group": "fluentbit.fluent.io", "namespace": "cluster-main-observability", "matchLabels": { "app.kubernetes.io/name": "fluent-operator" } },
+    { "group": "postgresql.cnpg.io", "namespace": "cnpg-system", "matchLabels": { "app.kubernetes.io/instance": "cnpg" } },
+    { "group": "cert-manager.io", "namespace": "cert-manager", "matchLabels": { "app.kubernetes.io/instance": "cert-manager", "app.kubernetes.io/component": "controller" } },
+    { "group": "kyverno.io", "namespace": "kyverno", "matchLabels": { "app.kubernetes.io/instance": "kyverno-controller", "app.kubernetes.io/component": "admission-controller" } },
+
+    { "group": "apiextensions.k8s.io", "builtin": true }
+  ]
+}

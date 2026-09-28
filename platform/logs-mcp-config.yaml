@@ -1,0 +1,65 @@
+binds:
+- port: 8080
+  listeners:
+  - routes:
+    - backends:
+      - mcp:
+          targets:
+          - name: logs
+            openapi:
+              schema:
+                file: /etc/agentgateway/spec/openapi.json
+              host: logs-postgrest.cluster-main-observability.svc.cluster.local:3000
+          - name: health
+            openapi:
+              schema: |
+                {
+                  "openapi": "3.0.3",
+                  "info": { "title": "cluster-health", "version": "1" },
+                  "servers": [ { "url": "/" } ],
+                  "paths": {
+                    "/health": {
+                      "get": {
+                        "operationId": "health",
+                        "summary": "Cluster health problems: orphaned finalizers, stuck Flux reconciliations, and stuck Crossplane resources.",
+                        "responses": {
+                          "200": {
+                            "description": "OK",
+                            "content": {
+                              "application/json": {
+                                "schema": {
+                                  "type": "object",
+                                  "properties": {
+                                    "checked_at": { "type": "string" },
+                                    "problems": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "object",
+                                        "properties": {
+                                          "category": { "type": "string" },
+                                          "severity": { "type": "string" },
+                                          "kind": { "type": "string" },
+                                          "apiVersion": { "type": "string" },
+                                          "namespace": { "type": "string" },
+                                          "name": { "type": "string" },
+                                          "detail": { "type": "string" }
+                                        }
+                                      }
+                                    },
+                                    "counts": { "type": "object" },
+                                    "unverifiable": {
+                                      "type": "array",
+                                      "items": { "type": "object" }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              host: cluster-health.cluster-main-observability.svc.cluster.local:8080
+          prefixMode: never

@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - cf-providers.yaml
   - cf-runtime.yaml
+  - cluster-health.yaml
   - fluent-bit.yaml
   - gcp-providers.yaml
   - gcp-runtime.yaml
@@ -42,6 +43,35 @@ configMapGenerator:
         app.kubernetes.io/name: logs-mcp
         app.kubernetes.io/part-of: observability
         app.kubernetes.io/component: mcp-server
+        entity: cluster
+        env: main
+        capability: observability
+  - name: logs-mcp
+    namespace: cluster-main-observability
+    files:
+      - config.yaml=logs-mcp-config.yaml
+    options:
+      labels:
+        app.kubernetes.io/name: logs-mcp
+        app.kubernetes.io/part-of: observability
+        app.kubernetes.io/component: mcp-server
+        entity: cluster
+        env: main
+        capability: observability
+  - name: cluster-health-script
+    namespace: cluster-main-observability
+    files:
+      - server.py=cluster-health/server.py
+      - client.py=cluster-health/client.py
+      - finalizers.py=cluster-health/finalizers.py
+      - flux.py=cluster-health/flux.py
+      - crossplane.py=cluster-health/crossplane.py
+      - controller-map.json=cluster-health/controller-map.json
+    options:
+      labels:
+        app.kubernetes.io/name: cluster-health
+        app.kubernetes.io/part-of: observability
+        app.kubernetes.io/component: health-check
         entity: cluster
         env: main
         capability: observability

@@ -123,33 +123,6 @@ spec:
               type: RuntimeDefault
 ---
 apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: logs-mcp
-  namespace: cluster-main-observability
-  labels:
-    app.kubernetes.io/name: logs-mcp
-    app.kubernetes.io/part-of: observability
-    app.kubernetes.io/component: mcp-server
-    entity: cluster
-    env: main
-    capability: observability
-data:
-  config.yaml: |
-    binds:
-    - port: 8080
-      listeners:
-      - routes:
-        - backends:
-          - mcp:
-              targets:
-              - name: logs
-                openapi:
-                  schema:
-                    file: /etc/agentgateway/spec/openapi.json
-                  host: logs-postgrest.cluster-main-observability.svc.cluster.local:3000
----
-apiVersion: v1
 kind: Service
 metadata:
   name: logs-mcp
