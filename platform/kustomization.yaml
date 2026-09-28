@@ -10,7 +10,6 @@ resources:
   - human-operator.yaml
   - kured-gate.yaml
   - kured-gate-test.yaml
-  - reboot-sentinel-clear-k-0ad0ff18.yaml
   - logs-api.yaml
   - logs-parity.yaml
   - logs-pg.yaml
