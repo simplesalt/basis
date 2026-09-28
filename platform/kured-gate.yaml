@@ -1,0 +1,32 @@
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kured-gate
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: kured-gate
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: node-lifecycle
+    entity: cluster
+    env: main
+    capability: lifecycle
+    release: prometheus
+spec:
+  groups:
+    - name: kured-gate.rules
+      rules:
+        - alert: RebootGateClosed
+          expr: |-
+            (count(kube_node_status_condition{condition="Ready",status="true"} == 0) > 0)
+            or
+            (count(ALERTS{alertstate="firing",severity="critical"}) > 0)
+          labels:
+            severity: warning
+          annotations:
+            summary: Kured node reboots are blocked
+            description: >-
+              A node is not Ready, or another alert with severity=critical is
+              firing. kured watches this alert (RebootGateClosed) via its
+              Prometheus alert filter and will not drain or reboot any node
+              while it is firing.

@@ -268,5 +268,10 @@ spec:
       startTime: "03:00"
       endTime: "05:00"
       timeZone: UTC
+      drainTimeout: 15m
+      prometheusUrl: http://prometheus-operated.cluster-main-observability.svc.cluster.local:9090
+      alertFilterRegexp: "^RebootGateClosed$"
+      alertFilterMatchOnly: true
+      alertFiringOnly: true
     tolerations:
       - operator: Exists

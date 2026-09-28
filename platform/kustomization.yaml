@@ -8,6 +8,7 @@ resources:
   - gcp-providers.yaml
   - gcp-runtime.yaml
   - human-operator.yaml
+  - kured-gate.yaml
   - logs-api.yaml
   - logs-parity.yaml
   - logs-pg.yaml
