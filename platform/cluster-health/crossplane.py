@@ -22,11 +22,32 @@ finalizers.py's PROACTIVE_GROUPS / group_resources walk):
    LastAsyncOperation=False (upjet/terraform-based providers -- observed as
    the condition an async Create/Update/Delete failure lands on) or
    AsyncOperation=False (older/alternate naming for the same signal, kept
-   for safety); or whose annotations carry crossplane.io/external-create-pending
-   (only a problem once it has sat there longer than the grace period below
-   -- Crossplane sets this at the *start* of every async create, so a fresh
-   one is normal) or crossplane.io/external-create-failed (a completed
-   failure -- flagged as soon as it is seen, no grace period).
+   for safety); or one whose external-create annotations show an
+   in-progress or failed create. Crossplane stamps
+   crossplane.io/external-create-pending at the *start* of every async
+   create, and later adds crossplane.io/external-create-succeeded or
+   crossplane.io/external-create-failed when it finishes -- it never
+   clears the pending annotation on success, so a finished create still
+   carries a (now stale) pending annotation alongside its succeeded one.
+   Telling a finished create apart from a stuck one mirrors
+   crossplane-runtime's own rule for exactly this (v2.1.0
+   pkg/meta/meta.go ExternalCreateIncomplete, used by the live Cloudflare
+   providers): a create is incomplete only when pending is set and is
+   strictly after both succeeded and failed (a missing succeeded/failed
+   counts as zero, i.e. "never"; equal timestamps count as complete, not
+   incomplete). So here: crossplane.io/external-create-pending is a
+   problem only once it is strictly newer than both succeeded and failed
+   *and* has sat there longer than the grace period below;
+   crossplane.io/external-create-failed is a problem only when it is
+   strictly newer than both pending and succeeded (still no grace period
+   -- a completed failure is flagged as soon as it is the newest of the
+   three). Whichever of the two is reported names whichever of
+   succeeded/failed also exists, in its detail, for context. When an
+   existing annotation's timestamp cannot be parsed, the comparison that
+   would need it instead falls back to this check's older,
+   single-annotation behavior for that category (grace-period-only for
+   pending, on-sight for failed) rather than letting an unreadable
+   annotation silently mask a real problem.
 
 2. Providers and ProviderRevisions (pkg.crossplane.io). Checked against the
    real cluster (Crossplane v2.4.2): a Provider's own conditions are
@@ -53,6 +74,7 @@ finalizers.py's PROACTIVE_GROUPS / group_resources walk):
 """
 
 import os
+from datetime import datetime, timezone
 
 from finalizers import _format_duration, _parse_ts
 
@@ -100,7 +122,14 @@ CONDITION_CATEGORIES = {
 }
 
 EXTERNAL_CREATE_PENDING_ANNOTATION = "crossplane.io/external-create-pending"
+EXTERNAL_CREATE_SUCCEEDED_ANNOTATION = "crossplane.io/external-create-succeeded"
 EXTERNAL_CREATE_FAILED_ANNOTATION = "crossplane.io/external-create-failed"
+
+# The epoch used for a missing succeeded/failed annotation in the pending/
+# failed comparisons below -- matches crossplane-runtime's
+# ExternalCreateIncomplete treating "unset" as zero, i.e. "never happened"
+# (see module docstring), so it always loses to a real timestamp.
+_ZERO_TIME = datetime.min.replace(tzinfo=timezone.utc)
 
 # Severities are static per category (unlike finalizers.py's controller-
 # state-derived severity) since there is no analogous "is something actively
@@ -211,12 +240,44 @@ def _managed_resource_problems(obj, group, kind, api_version, now, grace_seconds
 
     annotations = metadata.get("annotations") or {}
 
-    pending = annotations.get(EXTERNAL_CREATE_PENDING_ANNOTATION)
-    if pending:
-        pending_ts = _parse_ts(pending)
-        if pending_ts is not None:
+    pending_raw = annotations.get(EXTERNAL_CREATE_PENDING_ANNOTATION)
+    succeeded_raw = annotations.get(EXTERNAL_CREATE_SUCCEEDED_ANNOTATION)
+    failed_raw = annotations.get(EXTERNAL_CREATE_FAILED_ANNOTATION)
+
+    pending_ts = _parse_ts(pending_raw) if pending_raw else None
+    succeeded_ts = _parse_ts(succeeded_raw) if succeeded_raw else None
+    failed_ts = _parse_ts(failed_raw) if failed_raw else None
+
+    # An annotation that is present but fails to parse can't be placed on
+    # the timeline at all -- it is neither "unset" (zero, see _ZERO_TIME)
+    # nor a comparable instant. Folding it in as zero would let a garbled
+    # succeeded/failed annotation silently clear a real pending-create or
+    # create-failed problem, so any comparison that would need it instead
+    # falls back to this check's older, single-annotation behavior for
+    # that category (grace-period-only for pending, on-sight for failed).
+    succeeded_unusable = succeeded_raw is not None and succeeded_ts is None
+    failed_unusable = failed_raw is not None and failed_ts is None
+    pending_unusable = pending_raw is not None and pending_ts is None
+
+    if pending_raw and pending_ts is not None:
+        if succeeded_unusable or failed_unusable:
+            pending_incomplete = True
+        else:
+            pending_incomplete = pending_ts > max(
+                succeeded_ts or _ZERO_TIME, failed_ts or _ZERO_TIME
+            )
+        if pending_incomplete:
             age_seconds = (now - pending_ts).total_seconds()
             if age_seconds >= grace_seconds:
+                detail = "{} {} ({} ago, still pending)".format(
+                    EXTERNAL_CREATE_PENDING_ANNOTATION,
+                    pending_raw,
+                    _format_duration(age_seconds),
+                )
+                if succeeded_raw:
+                    detail += "; last succeeded {}".format(succeeded_raw)
+                elif failed_raw:
+                    detail += "; last failed {}".format(failed_raw)
                 problems.append(
                     _problem(
                         CATEGORY_CREATE_PENDING,
@@ -224,26 +285,31 @@ def _managed_resource_problems(obj, group, kind, api_version, now, grace_seconds
                         api_version,
                         namespace,
                         name,
-                        "{} {} ({} ago, still pending)".format(
-                            EXTERNAL_CREATE_PENDING_ANNOTATION,
-                            pending,
-                            _format_duration(age_seconds),
-                        ),
+                        detail,
                     )
                 )
 
-    failed = annotations.get(EXTERNAL_CREATE_FAILED_ANNOTATION)
-    if failed:
-        problems.append(
-            _problem(
-                CATEGORY_CREATE_FAILED,
-                kind,
-                api_version,
-                namespace,
-                name,
-                "{} {}".format(EXTERNAL_CREATE_FAILED_ANNOTATION, failed),
+    if failed_raw:
+        if failed_ts is None or pending_unusable or succeeded_unusable:
+            # Can't compare (failed's own time, or one of the others,
+            # doesn't parse): keep the pre-comparison behavior of flagging
+            # a completed failure as soon as it is seen.
+            failed_is_latest = True
+        else:
+            failed_is_latest = failed_ts > max(
+                pending_ts or _ZERO_TIME, succeeded_ts or _ZERO_TIME
             )
-        )
+        if failed_is_latest:
+            problems.append(
+                _problem(
+                    CATEGORY_CREATE_FAILED,
+                    kind,
+                    api_version,
+                    namespace,
+                    name,
+                    "{} {}".format(EXTERNAL_CREATE_FAILED_ANNOTATION, failed_raw),
+                )
+            )
 
     return problems
 

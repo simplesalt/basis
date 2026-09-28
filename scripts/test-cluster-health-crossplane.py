@@ -234,6 +234,58 @@ def run_unhealthy():
             annotations={"crossplane.io/external-create-failed": ago(5)},
         ),
         _managed_object(
+            "bucket-create-succeeded-equal", "r2.upjet-cloudflare.upbound.io", "Bucket",
+            annotations={
+                "crossplane.io/external-create-pending": ago(20),
+                "crossplane.io/external-create-succeeded": ago(20),
+            },
+        ),
+        _managed_object(
+            "bucket-create-pending-after-succeeded", "r2.upjet-cloudflare.upbound.io", "Bucket",
+            annotations={
+                "crossplane.io/external-create-pending": ago(20),
+                "crossplane.io/external-create-succeeded": ago(30),
+            },
+        ),
+        _managed_object(
+            "bucket-create-pending-after-succeeded-fresh", "r2.upjet-cloudflare.upbound.io", "Bucket",
+            annotations={
+                "crossplane.io/external-create-pending": ago(2),
+                "crossplane.io/external-create-succeeded": ago(5),
+            },
+        ),
+        _managed_object(
+            "bucket-create-failed-then-succeeded", "r2.upjet-cloudflare.upbound.io", "Bucket",
+            annotations={
+                "crossplane.io/external-create-failed": ago(30),
+                "crossplane.io/external-create-succeeded": ago(10),
+            },
+        ),
+        _managed_object(
+            "bucket-create-failed-newest", "r2.upjet-cloudflare.upbound.io", "Bucket",
+            annotations={
+                "crossplane.io/external-create-succeeded": ago(30),
+                "crossplane.io/external-create-pending": ago(20),
+                "crossplane.io/external-create-failed": ago(5),
+            },
+        ),
+        _managed_object(
+            "info-simplesalt-company", "r2.upjet-cloudflare.upbound.io", "Bucket",
+            conditions=[
+                _condition(
+                    "Synced", "False", "CannotDetermineCreationResult",
+                    "cannot determine creation result",
+                ),
+            ],
+            annotations={
+                # The live shape (simplesalt/basis effort #588): succeeded is
+                # older, pending is one second newer -- genuinely incomplete
+                # by crossplane-runtime's own rule, so this must stay flagged.
+                "crossplane.io/external-create-succeeded": "2026-09-14T12:42:56Z",
+                "crossplane.io/external-create-pending": "2026-09-14T12:43:57Z",
+            },
+        ),
+        _managed_object(
             "bucket-no-apiversion", "r2.upjet-cloudflare.upbound.io", "Bucket",
             conditions=[_condition("Synced", "False", "ReconcileError")],
             api_version=False,
@@ -332,6 +384,43 @@ def run_unhealthy():
     check(
         "external-create-failed is flagged crossplane-create-failed",
         find_problem(problems, "bucket-create-failed", "crossplane-create-failed") is not None,
+    )
+    check(
+        "external-create-pending equal to external-create-succeeded is not flagged (equal counts as complete, per crossplane-runtime's ExternalCreateIncomplete)",
+        find_problem(problems, "bucket-create-succeeded-equal", "crossplane-create-pending") is None,
+    )
+    pending_after_succeeded = find_problem(
+        problems, "bucket-create-pending-after-succeeded", "crossplane-create-pending"
+    )
+    check(
+        "external-create-pending strictly newer than external-create-succeeded and past grace is flagged, and its detail names the succeeded time",
+        pending_after_succeeded is not None
+        and "last succeeded" in pending_after_succeeded["detail"],
+        "found={}".format(pending_after_succeeded),
+    )
+    check(
+        "external-create-pending strictly newer than external-create-succeeded but still within grace is not flagged",
+        find_problem(
+            problems, "bucket-create-pending-after-succeeded-fresh", "crossplane-create-pending"
+        )
+        is None,
+    )
+    check(
+        "external-create-failed followed by a later external-create-succeeded is flagged neither pending nor failed",
+        find_problems(problems, "bucket-create-failed-then-succeeded") == [],
+    )
+    check(
+        "external-create-failed strictly newer than both pending and succeeded is flagged crossplane-create-failed, and its pending is not also flagged",
+        find_problem(problems, "bucket-create-failed-newest", "crossplane-create-failed") is not None
+        and find_problem(problems, "bucket-create-failed-newest", "crossplane-create-pending") is None,
+    )
+    info_pending = find_problem(problems, "info-simplesalt-company", "crossplane-create-pending")
+    check(
+        "the live info-simplesalt-company shape (pending one second newer than succeeded, Synced=False) is flagged for both crossplane-not-synced and crossplane-create-pending, with succeeded named in the detail",
+        find_problem(problems, "info-simplesalt-company", "crossplane-not-synced") is not None
+        and info_pending is not None
+        and "last succeeded" in info_pending["detail"],
+        "found={}".format(find_problems(problems, "info-simplesalt-company")),
     )
     check(
         "a stuck object missing apiVersion falls back to its CRD's group",
