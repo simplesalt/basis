@@ -4,6 +4,7 @@ resources:
   - cf-providers.yaml
   - cf-runtime.yaml
   - cluster-health.yaml
+  - cluster-health-test.yaml
   - fluent-bit.yaml
   - gcp-providers.yaml
   - gcp-runtime.yaml
