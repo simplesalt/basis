@@ -2,7 +2,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: probe-node-mem2-k-e7488b70
+  name: probe-node-mem3-k-e7488b70
   namespace: kured
   labels:
     app.kubernetes.io/name: probe-node-mem
@@ -79,9 +79,11 @@ spec:
               echo "=== K3S VERSION ==="
               k3s --version 2>&1 | head -2
               echo "=== OOM KILLS LAST 24H ==="
-              journalctl -k --since "-24h" --no-pager 2>&1 | grep -iE 'out of memory|oom-kill|killed process' | tail -30
-              echo "=== K3S SERVICE 04:50-05:05 UTC 2026-09-28 ==="
-              journalctl -u k3s --since "2026-09-28 04:50:00 UTC" --until "2026-09-28 05:05:00 UTC" --no-pager 2>&1 | grep -iE 'start|stop|exit|fail|signal|leader|etcd.*(slow|timeout|lost)|panic|fatal' | tail -60
-              echo "=== SYSTEM EVENTS 04:50-05:05 UTC 2026-09-28 ==="
-              journalctl --since "2026-09-28 04:50:00 UTC" --until "2026-09-28 05:05:00 UTC" --no-pager -p warning 2>&1 | tail -40
+              journalctl -k --since "-24h" --no-pager 2>&1 | grep -iE 'out of memory|oom-kill|killed process' | tail -10
+              echo "=== K3S UNIT LIFECYCLE 04:50-05:05 UTC (systemd) ==="
+              journalctl _PID=1 UNIT=k3s.service --since "2026-09-28 04:50:00 UTC" --until "2026-09-28 05:05:00 UTC" --no-pager -o short-iso 2>&1 | grep -v "left-over process\|unclean termination" | tail -15
+              echo "=== K3S LAST LINES BEFORE 04:59:01 UTC ==="
+              journalctl -u k3s --since "2026-09-28 04:55:00 UTC" --until "2026-09-28 04:59:00 UTC" --no-pager -o cat 2>&1 | grep -viE '"level":"(info|warn)"|trace\[' | tail -15
+              echo "=== KERNEL 04:50-05:05 UTC ==="
+              journalctl -k --since "2026-09-28 04:50:00 UTC" --until "2026-09-28 05:05:00 UTC" --no-pager -o short-iso 2>&1 | tail -15
               echo "=== END ==="
