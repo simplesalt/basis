@@ -19,6 +19,8 @@ metadata:
   labels:
     entity: cluster
     capability: basis
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
   url: https://charts.crossplane.io/stable
   interval: 24h

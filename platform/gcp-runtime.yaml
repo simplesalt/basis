@@ -5,4 +5,6 @@ metadata:
   labels:
     entity: cluster
     capability: access
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
 spec: {}

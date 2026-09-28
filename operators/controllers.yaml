@@ -36,6 +36,8 @@ metadata:
     app.kubernetes.io/component: iac
     entity: cluster
     capability: iac
+  annotations:
+    kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
   interval: 5m
   releaseName: crossplane
