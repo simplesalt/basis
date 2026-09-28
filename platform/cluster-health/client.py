@@ -11,7 +11,20 @@ that will join it later:
   a dynamic client or kubectl would use, and cache the result per group for
   the lifetime of one /health call. That is what lets the checks walk
   RBAC-scoped groups (see platform/cluster-health.yaml's ClusterRole) without
-  a table of Kind names to keep in sync by hand.
+  a table of Kind names to keep in sync by hand. Discovery only ever
+  registers a resource that lists `"list"` among its `verbs` (subresources
+  are skipped too, by name containing "/") -- a Kind the ClusterRole can
+  read but that has no list endpoint simply never appears, rather than
+  failing loudly the one time something tries to list it.
+
+* `list_resource` also caches its own return value per (group, resource,
+  namespace) for the lifetime of this Client -- one /health call. finalizers.py,
+  flux.py and crossplane.py all ask for several of the same cluster-wide
+  lists (Kustomizations, HelmReleases, Sources, CustomResourceDefinitions,
+  Providers, ProviderRevisions, and now every Kind under every group the
+  ClusterRole grants), and each Client is constructed fresh per request (see
+  server.py's run_checks), so this cache is naturally per-request, never
+  stale across calls, and never shared between concurrent requests.
 
 * A failed or denied call never raises out of `list_resource` /
   `list_deployments` / `get_safe`. It is recorded on `self.unverifiable` --
@@ -53,6 +66,7 @@ class Client:
         self.unverifiable = []
         self._discovery_cache = {}
         self._deployment_cache = {}
+        self._list_cache = {}
 
     @classmethod
     def in_cluster(cls):
@@ -141,6 +155,8 @@ class Client:
             name = entry.get("name", "")
             if "/" in name:
                 continue  # skip subresources (pods/log, deployments/status, ...)
+            if "list" not in (entry.get("verbs") or []):
+                continue  # e.g. bindings, tokenreviews -- create-only, no list
             resources[name] = bool(entry.get("namespaced"))
         return ("ok", version, resources)
 
@@ -165,27 +181,40 @@ class Client:
         does not exist in this cluster -- that is a verified absence, not a
         failure) or None if the call could not be verified (already
         recorded on self.unverifiable).
+
+        Cached per (group, resource, namespace) for the lifetime of this
+        Client -- one /health call -- so finalizers.py, flux.py and
+        crossplane.py can each ask for the same cluster-wide list (e.g.
+        Kustomizations, CustomResourceDefinitions, Providers) without
+        issuing it more than once. A failed call's None is cached too: a
+        denied list is not retried, and does not get recorded to
+        self.unverifiable a second time.
         """
+        cache_key = (group, resource, namespace)
+        if cache_key in self._list_cache:
+            return self._list_cache[cache_key]
+
         status, version, namespaced = self.resolve(group, resource)
         if status == "absent":
-            return []
-        if status == "error":
-            return None
-
-        base = "/apis/{}/{}".format(group, version) if group else "/api/{}".format(version)
-        if namespaced and namespace:
-            path = "{}/namespaces/{}/{}".format(base, namespace, resource)
-            scope = "namespace {}".format(namespace)
+            result = []
+        elif status == "error":
+            result = None
         else:
-            path = "{}/{}".format(base, resource)
-            scope = "namespace {}".format(namespace) if namespace else "cluster-wide"
-        attempted = "list {}{} ({})".format(
-            resource, "." + group if group else "", scope
-        )
-        body = self.get_safe(path, attempted)
-        if body is None:
-            return None
-        return body.get("items", [])
+            base = "/apis/{}/{}".format(group, version) if group else "/api/{}".format(version)
+            if namespaced and namespace:
+                path = "{}/namespaces/{}/{}".format(base, namespace, resource)
+                scope = "namespace {}".format(namespace)
+            else:
+                path = "{}/{}".format(base, resource)
+                scope = "namespace {}".format(namespace) if namespace else "cluster-wide"
+            attempted = "list {}{} ({})".format(
+                resource, "." + group if group else "", scope
+            )
+            body = self.get_safe(path, attempted)
+            result = None if body is None else body.get("items", [])
+
+        self._list_cache[cache_key] = result
+        return result
 
     def group_resources(self, group):
         """Every top-level resource name registered under `group`, e.g. to

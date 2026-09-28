@@ -9,8 +9,15 @@ fresh in-cluster API client and returns:
       "problems": [{category, severity, kind, apiVersion, namespace, name,
                     detail, ...}],
       "counts": {...},
-      "unverifiable": [{"attempted": ..., "detail": ...}]
+      "unverifiable": [{"attempted": ..., "detail": ...}],
+      "duration_ms": <int>
     }
+
+`duration_ms` covers client construction plus every check module's
+run -- the actual Kubernetes API call cost of this /health call, not
+counting JSON serialization -- so a scan that gets slow (e.g. from the
+orphaned-finalizer check walking more API groups) stays visible in the
+response itself rather than only in server-side logs.
 
 `unverifiable` is never silently empty because it isn't hand-maintained: it
 is exactly whatever client.py's Client recorded while every check ran (see
@@ -24,6 +31,7 @@ API server or flap readiness on a slow cluster-wide scan.
 import json
 import os
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,6 +47,7 @@ CHECKS = (finalizers, flux, crossplane)
 
 
 def run_checks():
+    started = time.monotonic()
     now = datetime.now(timezone.utc).replace(microsecond=0)
     api = client_mod.Client.in_cluster()
 
@@ -72,6 +81,7 @@ def run_checks():
         "problems": problems,
         "counts": counts,
         "unverifiable": api.unverifiable,
+        "duration_ms": int((time.monotonic() - started) * 1000),
     }
 
 

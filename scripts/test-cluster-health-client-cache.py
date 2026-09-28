@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Local test for client.py's per-run list cache, no cluster access.
+
+The other three test scripts (test-cluster-health.py, -flux.py,
+-crossplane.py) each run one check module against a hand-rolled FakeClient
+that stands in for client.Client entirely, so none of them exercise
+client.py's own caching -- they just implement list_resource/list_deployments
+as plain dict lookups. This script instead exercises the real client.Client
+(the one server.py's run_checks actually constructs per /health call), with
+only its HTTP layer (Client.get) replaced by a fixture-backed fake, so the
+real discovery/list/cache code paths run.
+
+That real Client is then shared across finalizers.check, flux.check and
+crossplane.check the same way server.py's run_checks shares one Client
+across all three (CHECKS = (finalizers, flux, crossplane)), and every fake
+GET is counted by path. The point: finalizers.py's widened scan now lists
+several (group, resource) pairs -- CustomResourceDefinitions, Kustomizations,
+HelmReleases, the four Source kinds, Providers, ProviderRevisions -- that
+flux.py and crossplane.py also ask for, and client.py's list cache must make
+each one a single real HTTP call shared across all three modules, not one
+call per module.
+
+Bypasses Client.__init__ (it reads a ServiceAccount token/CA file that don't
+exist here) via Client.__new__ plus manually setting the handful of instance
+attributes __init__ would have, then overrides the `get` method with a
+fixture function -- so `resolve`/`_discover_group`/`list_resource`/
+`list_deployments` all run for real against canned discovery and list
+bodies shaped like a real apiserver's, rather than being faked out
+themselves.
+
+    scripts/test-cluster-health-client-cache.py
+"""
+
+import os
+import sys
+import traceback
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "platform", "cluster-health"))
+
+import client as client_mod  # noqa: E402
+import crossplane  # noqa: E402
+import finalizers  # noqa: E402
+import flux  # noqa: E402
+
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def ago(minutes):
+    return iso(NOW - timedelta(minutes=minutes))
+
+
+def _resource(name, kind, namespaced, verbs=("get", "list", "watch")):
+    return {"name": name, "kind": kind, "namespaced": namespaced, "verbs": list(verbs)}
+
+
+def _preferred(version):
+    return {"preferredVersion": {"version": version}}
+
+
+# A small fake cluster: just enough discovery + list fixtures to exercise
+# every (group, resource) finalizers.py's widened scan, flux.py and
+# crossplane.py actually ask for, plus one stuck object (a postgresql.cnpg.io
+# Cluster) proving the widened scan finds an extra kind end-to-end through
+# the real Client -- and one resource with no "list" verb (Backup), proving
+# discovery's verb filter keeps it out of group_resources()/list_resource()
+# entirely.
+STUCK_CLUSTER = {
+    "apiVersion": "postgresql.cnpg.io/v1",
+    "kind": "Cluster",
+    "metadata": {
+        "name": "stuck-pg",
+        "namespace": "cluster-main-observability",
+        "deletionTimestamp": ago(30),
+        "finalizers": ["cnpg.io/finalizer"],
+    },
+}
+
+RESPONSES = {
+    # -- core (v1) --
+    "/api/v1": {
+        "resources": [
+            _resource("namespaces", "Namespace", False),
+            _resource("pods", "Pod", True),
+            _resource("persistentvolumes", "PersistentVolume", False),
+            _resource("persistentvolumeclaims", "PersistentVolumeClaim", True),
+        ]
+    },
+    "/api/v1/namespaces": {"items": []},
+    "/api/v1/pods": {"items": []},
+    "/api/v1/persistentvolumes": {"items": []},
+    "/api/v1/persistentvolumeclaims": {"items": []},
+    # -- apps/v1 --
+    "/apis/apps": _preferred("v1"),
+    "/apis/apps/v1": {"resources": [_resource("deployments", "Deployment", True)]},
+    "/apis/apps/v1/deployments": {"items": []},
+    "/apis/apps/v1/namespaces/crossplane-system/deployments": {"items": []},
+    "/apis/apps/v1/namespaces/cnpg-system/deployments": {"items": []},
+    # -- apiextensions.k8s.io/v1 --
+    "/apis/apiextensions.k8s.io": _preferred("v1"),
+    "/apis/apiextensions.k8s.io/v1": {
+        "resources": [_resource("customresourcedefinitions", "CustomResourceDefinition", False)]
+    },
+    "/apis/apiextensions.k8s.io/v1/customresourcedefinitions": {"items": []},
+    # -- Flux --
+    "/apis/kustomize.toolkit.fluxcd.io": _preferred("v1"),
+    "/apis/kustomize.toolkit.fluxcd.io/v1": {
+        "resources": [_resource("kustomizations", "Kustomization", True)]
+    },
+    "/apis/kustomize.toolkit.fluxcd.io/v1/kustomizations": {"items": []},
+    "/apis/helm.toolkit.fluxcd.io": _preferred("v2"),
+    "/apis/helm.toolkit.fluxcd.io/v2": {
+        "resources": [_resource("helmreleases", "HelmRelease", True)]
+    },
+    "/apis/helm.toolkit.fluxcd.io/v2/helmreleases": {"items": []},
+    "/apis/source.toolkit.fluxcd.io": _preferred("v1"),
+    "/apis/source.toolkit.fluxcd.io/v1": {
+        "resources": [
+            _resource("gitrepositories", "GitRepository", True),
+            _resource("helmrepositories", "HelmRepository", True),
+            _resource("ocirepositories", "OCIRepository", True),
+            _resource("buckets", "Bucket", True),
+        ]
+    },
+    "/apis/source.toolkit.fluxcd.io/v1/gitrepositories": {"items": []},
+    "/apis/source.toolkit.fluxcd.io/v1/helmrepositories": {"items": []},
+    "/apis/source.toolkit.fluxcd.io/v1/ocirepositories": {"items": []},
+    "/apis/source.toolkit.fluxcd.io/v1/buckets": {"items": []},
+    # -- Crossplane core --
+    "/apis/pkg.crossplane.io": _preferred("v1"),
+    "/apis/pkg.crossplane.io/v1": {
+        "resources": [
+            _resource("providers", "Provider", False),
+            _resource("providerrevisions", "ProviderRevision", False),
+        ]
+    },
+    "/apis/pkg.crossplane.io/v1/providers": {"items": []},
+    "/apis/pkg.crossplane.io/v1/providerrevisions": {"items": []},
+    # -- an extra Kind only reachable via the widened full scan; "backups"
+    # has no "list" verb and must never be requested at all --
+    "/apis/postgresql.cnpg.io": _preferred("v1"),
+    "/apis/postgresql.cnpg.io/v1": {
+        "resources": [
+            _resource("clusters", "Cluster", True),
+            _resource("backups", "Backup", True, verbs=("get",)),
+        ]
+    },
+    "/apis/postgresql.cnpg.io/v1/clusters": {"items": [STUCK_CLUSTER]},
+}
+
+# Every other PROACTIVE_GROUPS group (apiextensions.crossplane.io, the
+# cloudplatform.gcp.*/gcp.*/dns.*/r2.*/upjet-cloudflare.*/workers.*/zero.*
+# Crossplane provider groups, fluentbit.fluent.io, cert-manager.io,
+# kyverno.io) is deliberately left out of RESPONSES: fake_get below treats a
+# missing "/apis/<group>" doc as a 404, i.e. a group genuinely not
+# registered in this fake cluster -- exactly like a real apiserver's 404 for
+# an unregistered group. That exercises the same "absent -> group_resources
+# returns [] -> skip" path client.py already has, without needing fixtures
+# for groups this test has nothing to say about.
+
+
+def make_fake_get(calls):
+    def fake_get(path, params=None):
+        calls[path] = calls.get(path, 0) + 1
+        if path in RESPONSES:
+            return RESPONSES[path]
+        if path.startswith("/apis/") and path.count("/") == 2:
+            # An unfixtured "/apis/<group>" doc: treat as a group this fake
+            # cluster does not have installed, same as a real 404.
+            raise client_mod.ApiError(
+                "GET", path, 404, "the server could not find the requested resource"
+            )
+        raise AssertionError(
+            "fake_get: no fixture for {!r} -- add one to RESPONSES "
+            "(this is a test-fixture gap, not necessarily a code bug)".format(path)
+        )
+
+    return fake_get
+
+
+def make_client():
+    calls = {}
+    c = client_mod.Client.__new__(client_mod.Client)
+    c.unverifiable = []
+    c._discovery_cache = {}
+    c._deployment_cache = {}
+    c._list_cache = {}
+    c.get = make_fake_get(calls)
+    return c, calls
+
+
+FAILURES = []
+
+
+def check(label, condition, detail=""):
+    status = "ok" if condition else "FAIL"
+    print("  [{}] {}{}".format(status, label, "" if condition else " -- " + detail))
+    if not condition:
+        FAILURES.append(label)
+
+
+def find_problem(problems, name):
+    for p in problems:
+        if p.get("name") == name:
+            return p
+    return None
+
+
+def run():
+    client, calls = make_client()
+
+    # Run all three checks against the same Client, in the same order
+    # server.py's run_checks does (CHECKS = (finalizers, flux, crossplane)).
+    fin_problems = finalizers.check(client, NOW)
+    flux_problems = flux.check(client, NOW)
+    cp_problems = crossplane.check(client, NOW)
+
+    all_problems = fin_problems + flux_problems + cp_problems
+    print("problems found: fin={} flux={} crossplane={}".format(
+        len(fin_problems), len(flux_problems), len(cp_problems)
+    ))
+    print("distinct GET paths requested: {}".format(len(calls)))
+
+    stuck = find_problem(fin_problems, "stuck-pg")
+    check(
+        "the widened scan finds a stuck postgresql.cnpg.io Cluster through the "
+        "real Client end-to-end (discovery -> list -> orphaned-finalizer problem)",
+        stuck is not None
+        and stuck["kind"] == "Cluster"
+        and stuck["category"] == "orphaned-finalizer",
+        "found={}".format(stuck),
+    )
+
+    check(
+        "a resource with no \"list\" verb (postgresql.cnpg.io Backup) is never "
+        "requested at all",
+        not any("backups" in path for path in calls),
+        "calls={}".format(sorted(calls)),
+    )
+
+    shared_lists = [
+        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",  # finalizers + crossplane
+        "/apis/kustomize.toolkit.fluxcd.io/v1/kustomizations",  # finalizers + flux
+        "/apis/helm.toolkit.fluxcd.io/v2/helmreleases",  # finalizers + flux
+        "/apis/source.toolkit.fluxcd.io/v1/gitrepositories",  # finalizers + flux
+        "/apis/source.toolkit.fluxcd.io/v1/helmrepositories",  # finalizers + flux
+        "/apis/source.toolkit.fluxcd.io/v1/ocirepositories",  # finalizers + flux
+        "/apis/source.toolkit.fluxcd.io/v1/buckets",  # finalizers + flux
+        "/apis/pkg.crossplane.io/v1/providers",  # finalizers + crossplane
+        "/apis/pkg.crossplane.io/v1/providerrevisions",  # finalizers + crossplane
+    ]
+    for path in shared_lists:
+        check(
+            "{} is listed at most once across finalizers.check, flux.check and "
+            "crossplane.check together".format(path),
+            calls.get(path) == 1,
+            "calls[{}]={}".format(path, calls.get(path)),
+        )
+
+    check(
+        "the widened scan's own new list (postgresql.cnpg.io Clusters) is "
+        "listed exactly once",
+        calls.get("/apis/postgresql.cnpg.io/v1/clusters") == 1,
+        "calls={}".format(calls.get("/apis/postgresql.cnpg.io/v1/clusters")),
+    )
+
+    check(
+        "discovery for a group multiple modules touch (pkg.crossplane.io) "
+        "happens once each for the group doc and the version doc",
+        calls.get("/apis/pkg.crossplane.io") == 1 and calls.get("/apis/pkg.crossplane.io/v1") == 1,
+        "calls={}".format({
+            k: v for k, v in calls.items() if k.startswith("/apis/pkg.crossplane.io")
+        }),
+    )
+
+    check(
+        "no path was requested more than once at all -- the strongest form "
+        "of the \"at most once per run\" guarantee",
+        all(n == 1 for n in calls.values()),
+        "paths requested more than once: {}".format(
+            {k: v for k, v in calls.items() if v != 1}
+        ),
+    )
+
+    check("no call failed / landed in unverifiable", client.unverifiable == [], "unverifiable={}".format(client.unverifiable))
+
+    print()
+    if FAILURES:
+        print("FAILED: {}".format(", ".join(FAILURES)))
+        return 1
+    print("all checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(run())
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)

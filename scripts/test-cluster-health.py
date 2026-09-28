@@ -304,6 +304,30 @@ def run():
     client.set_resource("", "namespaces", None, [ns_missing_provider, ns_young, ns_active, ns_unknown])
     client.set_resource("example.acme.io", "widgets", "unknown-ns", [unknown_obj])
 
+    # widened scan: a stuck object of a kind only reachable through the full
+    # ClusterRole-driven walk (PROACTIVE_GROUPS), sitting in ns_active -- an
+    # Active namespace, never Terminating and naming nothing in any
+    # condition. Before the widening, nothing would have ever listed
+    # postgresql.cnpg.io/clusters here; this proves the full scan finds it
+    # regardless.
+    stuck_cnpg_cluster = _managed_resource(
+        "stuck-pg-cluster", "cluster-main-observability", "postgresql.cnpg.io", "Cluster",
+        minutes_ago=30, finalizers_list=["cnpg.io/finalizer"],
+    )
+    client.set_group_resources("postgresql.cnpg.io", [("clusters", True)])
+    client.set_resource("postgresql.cnpg.io", "clusters", None, [stuck_cnpg_cluster])
+
+    # widened scan, core-group side: a stuck Pod, an EXPLICIT_KINDS resource
+    # (explicitly named by the ClusterRole, not a "*"-wildcarded group), also
+    # in ns_active. Proves the explicitly-named core/apps resources are
+    # scanned cluster-wide too, not just the wildcarded groups.
+    stuck_pod = _managed_resource(
+        "stuck-pod", "cluster-main-observability", "", "Pod",
+        minutes_ago=30, finalizers_list=["example.io/cleanup"],
+    )
+    stuck_pod["apiVersion"] = "v1"  # _managed_resource's "{}/v1beta1" shape doesn't fit core/v1
+    client.set_resource("", "pods", None, [stuck_pod])
+
     # --- run ------------------------------------------------------------
     problems = finalizers.check(client, NOW)
 
@@ -371,6 +395,25 @@ def run():
         "a stuck object in a group with no controller-map entry reports controller=unknown",
         unknown is not None and unknown["controller"] == "unknown",
         "found={}".format(unknown),
+    )
+
+    cnpg_cluster = find_problem(problems, "stuck-pg-cluster")
+    check(
+        "a stuck object of a kind only reachable via the full ClusterRole-driven "
+        "scan (postgresql.cnpg.io Cluster), sitting in an Active namespace, is flagged",
+        cnpg_cluster is not None
+        and cnpg_cluster["kind"] == "Cluster"
+        and cnpg_cluster["apiVersion"] == "postgresql.cnpg.io/v1beta1"
+        and cnpg_cluster["category"] == "orphaned-finalizer",
+        "found={}".format(cnpg_cluster),
+    )
+
+    pod = find_problem(problems, "stuck-pod")
+    check(
+        "a stuck core-group Pod (explicitly-named ClusterRole resource, not a "
+        "wildcarded group), sitting in an Active namespace, is flagged",
+        pod is not None and pod["kind"] == "Pod" and pod["category"] == "orphaned-finalizer",
+        "found={}".format(pod),
     )
 
     print()

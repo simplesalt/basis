@@ -5,7 +5,9 @@ non-empty finalizer list (metadata.finalizers, or spec.finalizers for a
 Namespace -- that is where the "kubernetes" finalizer actually lives) is
 stuck: something was supposed to remove that finalizer and hasn't.
 
-Entry point, per the parent Effort's request:
+Entry point. The requirement this check exists to meet is "every object
+stuck deleting on a finalizer is listed" -- not just one sitting inside a
+Terminating namespace, so the scan has two halves:
 
 1. List Namespaces; for each Terminating one, check it for the same rule,
    then read its status.conditions for NamespaceContentRemaining /
@@ -14,13 +16,37 @@ Entry point, per the parent Effort's request:
    resource instances", straight from
    k8s.io/kubernetes/pkg/controller/namespace/deletion -- see
    _parse_content_remaining), so those get scanned inside that namespace.
-2. Also scan cluster-scoped kinds that never show up in a namespace's own
-   conditions: PersistentVolumes, CustomResourceDefinitions.
-3. Also scan every Kind actually registered under the Flux and Crossplane
-   groups the ClusterRole can read (platform/cluster-health.yaml),
-   discovered live via Client.group_resources rather than a hardcoded Kind
-   list, so a stuck object shows up even when no namespace is mid-delete at
-   all (e.g. someone deleted a single HelmRelease directly).
+   This is the only way to see a stuck object of a Kind the ClusterRole
+   does not grant (still recorded to client.unverifiable, same as always).
+2. Scan every listable resource type in every API group the ClusterRole
+   (platform/cluster-health.yaml) actually grants, cluster-wide (one list
+   per resource type, namespace=None already means "every namespace" for a
+   namespaced resource -- see client.py), regardless of whether any
+   namespace is mid-delete at all -- so a stuck CNPG Cluster, FluentBit
+   Kind, cert-manager Certificate, Kyverno policy, Pod, PVC or Deployment
+   in an otherwise-Active namespace is found too, not just Flux and
+   Crossplane objects. Two constants describe this, both mirroring the
+   ClusterRole's own rules and needing to stay in sync with it by hand
+   (nothing here parses cluster-health.yaml at runtime -- it isn't shipped
+   into the pod, only the scripts are):
+
+   * EXPLICIT_KINDS -- the core/apps/apiextensions.k8s.io resources the
+     ClusterRole names one by one (never Secrets -- the ClusterRole does
+     not grant the core group's wildcard, so Secret access is never even
+     requested).
+   * PROACTIVE_GROUPS -- every API group the ClusterRole grants
+     resources: ["*"] on, walked in full via Client.group_resources
+     (discovered live, so a Kind is never missed by not being on a
+     hand-maintained list) rather than a hardcoded Kind list.
+
+   Namespaces themselves are not repeated here: every Namespace is already
+   listed and checked in step 1 above.
+
+A (group, resource) the full scan in step 2 already covers is not also
+listed namespace-scoped for step 1's condition-named targets -- client.py's
+per-request list cache would make the second call free of a duplicate
+network round trip regardless, but skipping it here keeps this module's own
+intent legible (see check()'s `scanned` set).
 
 For each stuck object, controller status is decided from the object's own
 API group via controller-map.json -- never from the finalizer string, since
@@ -54,21 +80,54 @@ _BUILTIN_FINALIZER_NAMES = {"kubernetes", "orphan", "foregroundDeletion"}
 # service (see _deployment_matches_entry).
 _IN_SELECTOR_RE = re.compile(r"^\s*(\S+)\s+in\s*\(([^)]*)\)\s*$")
 
-CLUSTER_SCOPED_KINDS = [
+# The core/apps/apiextensions.k8s.io resources platform/cluster-health.yaml's
+# ClusterRole names explicitly (not via a "*" resources wildcard). Namespaces
+# is deliberately not here -- check() already lists every Namespace for
+# step 1's Terminating walk, so listing it again here would be redundant.
+# Secrets is deliberately not here either: the ClusterRole never grants it.
+EXPLICIT_KINDS = [
+    ("", "pods"),
     ("", "persistentvolumes"),
+    ("", "persistentvolumeclaims"),
+    ("apps", "deployments"),
     ("apiextensions.k8s.io", "customresourcedefinitions"),
 ]
 
-# Groups proactively walked in full (every Kind registered under them),
-# independent of whether any namespace's conditions mention them. These are
-# the two ecosystems this whole repo exists to drive (see README.md), so a
-# stuck object here matters even with no namespace mid-delete.
+# Every API group platform/cluster-health.yaml's ClusterRole grants
+# resources: ["*"], verbs: [get, list] on, walked in full (every Kind
+# Client.group_resources discovers under it) independent of whether any
+# namespace's conditions mention them -- so a stuck object here matters
+# even with no namespace mid-delete. Kept in the ClusterRole's own order/
+# grouping (Flux; Crossplane core + managed-resource groups; other
+# operators this repo installs) to make the two easy to eyeball against
+# each other.
 PROACTIVE_GROUPS = [
+    # Flux
     "kustomize.toolkit.fluxcd.io",
     "helm.toolkit.fluxcd.io",
     "source.toolkit.fluxcd.io",
+    # Crossplane core + managed-resource groups
     "pkg.crossplane.io",
     "apiextensions.crossplane.io",
+    "cloudplatform.gcp.m.upbound.io",
+    "cloudplatform.gcp.upbound.io",
+    "gcp.m.upbound.io",
+    "gcp.upbound.io",
+    "dns.upjet-cloudflare.m.upbound.io",
+    "dns.upjet-cloudflare.upbound.io",
+    "r2.upjet-cloudflare.m.upbound.io",
+    "r2.upjet-cloudflare.upbound.io",
+    "upjet-cloudflare.m.upbound.io",
+    "upjet-cloudflare.upbound.io",
+    "workers.upjet-cloudflare.m.upbound.io",
+    "workers.upjet-cloudflare.upbound.io",
+    "zero.upjet-cloudflare.m.upbound.io",
+    "zero.upjet-cloudflare.upbound.io",
+    # Other operators this repo installs
+    "fluentbit.fluent.io",
+    "postgresql.cnpg.io",
+    "cert-manager.io",
+    "kyverno.io",
 ]
 
 
@@ -334,11 +393,19 @@ def check(client, now):
             for group, resource in _parse_content_remaining(cond.get("message", "")):
                 scan_targets.add((group, resource, ns_name))
 
-    for group, resource, namespace in scan_targets:
-        _scan_kind(client, group, resource, namespace, now, threshold_seconds, problems)
+    # Full scan: every listable resource type in every group the ClusterRole
+    # grants, cluster-wide, regardless of any namespace's own conditions.
+    # `scanned` tracks each (group, resource) this covers so the
+    # condition-named targets below skip re-listing one namespace-scoped
+    # (client.py's list cache would make that free of a duplicate network
+    # call anyway, but a cluster-wide list already has every namespace's
+    # objects, so there is nothing left for a namespace-scoped repeat to
+    # find).
+    scanned = set()
 
-    for group, resource in CLUSTER_SCOPED_KINDS:
+    for group, resource in EXPLICIT_KINDS:
         _scan_kind(client, group, resource, None, now, threshold_seconds, problems)
+        scanned.add((group, resource))
 
     for group in PROACTIVE_GROUPS:
         resources = client.group_resources(group)
@@ -346,5 +413,15 @@ def check(client, now):
             continue
         for resource, _namespaced in resources:
             _scan_kind(client, group, resource, None, now, threshold_seconds, problems)
+            scanned.add((group, resource))
+
+    # Kinds named by a Terminating namespace's own conditions that the
+    # ClusterRole does not grant (so the full scan above never touched
+    # them) still get scanned inside that namespace, same as always -- a
+    # denied attempt still lands on client.unverifiable.
+    for group, resource, namespace in scan_targets:
+        if (group, resource) in scanned:
+            continue
+        _scan_kind(client, group, resource, namespace, now, threshold_seconds, problems)
 
     return problems

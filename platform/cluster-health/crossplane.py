@@ -42,9 +42,10 @@ finalizers.py's PROACTIVE_GROUPS / group_resources walk):
    (confirmed on every provider-*/upbound-*/wildbitca-* Deployment in
    crossplane-system) -- not the Deployment's own metadata.labels, which
    these package-manager-created Deployments do not carry at all, so a
-   server-side label selector (client.list_deployments(..., match_labels=))
-   would silently match nothing. All Deployments in the namespace are
-   listed once and matched client-side instead. An ownerReference to the
+   server-side label selector would silently match nothing (client.py's
+   list_deployments takes no such parameter for exactly this reason). All
+   Deployments in the namespace are listed once and matched client-side
+   instead. An ownerReference to the
    Provider's active ProviderRevision is also present on these Deployments
    and would work as an alternative link, but the label is simpler to match
    directly and is what the provider's own runtime env vars
