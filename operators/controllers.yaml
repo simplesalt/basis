@@ -93,6 +93,9 @@ spec:
   values:
     prometheus:
       prometheusSpec:
+        podMetadata:
+          annotations:
+            resiliency.simplesalt.company/storage-tier: blips-are-ok
         serviceMonitorSelectorNilUsesHelmValues: false
         honorLabels: true
         scrapeInterval: 120s
@@ -140,6 +143,9 @@ spec:
       enabled: false
     alertmanager:
       alertmanagerSpec:
+        podMetadata:
+          annotations:
+            resiliency.simplesalt.company/storage-tier: blips-are-ok
         storage:
           emptyDir: {}
 ---

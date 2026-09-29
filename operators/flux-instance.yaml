@@ -46,6 +46,20 @@ spec:
 
       - target:
           kind: Deployment
+          name: source-controller
+        patch: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: source-controller
+          spec:
+            template:
+              metadata:
+                annotations:
+                  resiliency.simplesalt.company/storage-tier: blips-are-ok
+
+      - target:
+          kind: Deployment
           name: helm-controller
         patch: |
           - op: test
