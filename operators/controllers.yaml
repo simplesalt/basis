@@ -241,11 +241,11 @@ spec:
     configuration:
       rebootSentinel: /var/run/reboot-required
       useRebootSentinelHostPath: true
-      period: 1m
+      period: 1h
       lockTtl: 30m
       rebootDays: [mo, tu, we, th, fr, sa, su]
-      startTime: "00:00"
-      endTime: "23:59"
+      startTime: "03:00"
+      endTime: "05:00"
       timeZone: UTC
       drainTimeout: 15m
       prometheusUrl: http://prometheus-operated.cluster-main-observability.svc.cluster.local:9090
