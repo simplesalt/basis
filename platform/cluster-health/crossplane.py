@@ -164,6 +164,12 @@ def _condition_map(obj):
     return conditions
 
 
+def _cause(cond):
+    reason = cond.get("reason", "<no reason>")
+    message = cond.get("message")
+    return "{}: {}".format(reason, message) if message else reason
+
+
 def _api_version_for(group, obj):
     api_version = obj.get("apiVersion")
     if api_version:
@@ -232,9 +238,7 @@ def _managed_resource_problems(obj, group, kind, api_version, now, grace_seconds
                 api_version,
                 namespace,
                 name,
-                "{}=False ({}: {})".format(
-                    ctype, cond.get("reason", "<no reason>"), cond.get("message", "")
-                ),
+                "{}=False ({})".format(ctype, _cause(cond)),
             )
         )
 
@@ -344,12 +348,7 @@ def _package_problems(obj, kind):
                 PROVIDER_API_VERSION,
                 None,
                 name,
-                "{}={} ({}: {})".format(
-                    ctype,
-                    cond.get("status"),
-                    cond.get("reason", "<no reason>"),
-                    cond.get("message", ""),
-                ),
+                "{}={} ({})".format(ctype, cond.get("status"), _cause(cond)),
             )
         )
     return problems
