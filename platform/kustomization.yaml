@@ -5,6 +5,7 @@ resources:
   - fluent-bit.yaml
   - human-operator.yaml
   - kured-gate.yaml
+  - node-update
   - logs-api.yaml
   - logs-parity.yaml
   - logs-pg.yaml
