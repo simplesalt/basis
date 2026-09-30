@@ -144,6 +144,19 @@ spec:
       enabled: false
     grafana:
       enabled: false
+    defaultRules:
+      disabled:
+        NodeDiskIOSaturation: true
+        NodeMemoryHighUtilization: true
+        NodeMemoryMajorPagesFaults: true
+        NodeSystemSaturation: true
+        NodeCPUHighUsage: true
+        NodeSystemdServiceFailed: true
+        NodeSystemdServiceCrashlooping: true
+    prometheus-node-exporter:
+      prometheus:
+        monitor:
+          interval: 30s
     alertmanager:
       alertmanagerSpec:
         podMetadata:

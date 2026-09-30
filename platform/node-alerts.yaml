@@ -1,0 +1,148 @@
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: node-alerts
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: node-alerts
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: alerting
+    entity: cluster
+    env: main
+    capability: observability
+    release: prometheus
+spec:
+  groups:
+    - name: node-alerts.rules
+      interval: 30s
+      rules:
+        - alert: NodeDiskQueueDepthHigh
+          expr: |-
+            (
+              rate(node_disk_io_time_weighted_seconds_total{job="node-exporter", device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[1m]) > 10
+            )
+            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: Disk queue is deep on {{ $labels.nodename }} ({{ $labels.device }})
+            description: >-
+              The average disk queue depth on node {{ $labels.nodename }},
+              disk {{ $labels.device }}, over the last minute is
+              {{ $value | humanize }}. That is above the limit of 10, and has
+              been for 1 minute.
+        - alert: NodeDiskReadLatencyHigh
+          expr: |-
+            (
+              (
+                rate(node_disk_read_time_seconds_total{job="node-exporter", device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[1m])
+                / rate(node_disk_reads_completed_total{job="node-exporter", device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[1m])
+                > 0.05
+              )
+              and
+              (
+                rate(node_disk_reads_completed_total{job="node-exporter", device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[1m]) > 1
+              )
+            )
+            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: Disk reads are slow on {{ $labels.nodename }} ({{ $labels.device }})
+            description: >-
+              The average wait per read on node {{ $labels.nodename }},
+              disk {{ $labels.device }}, over the last minute is
+              {{ $value | humanizeDuration }}. That is above the limit of 50 ms
+              while the disk does more than 1 read per second, and has been
+              for 1 minute.
+        - alert: NodeDiskWriteLatencyHigh
+          expr: |-
+            (
+              (
+                rate(node_disk_write_time_seconds_total{job="node-exporter", device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[1m])
+                / rate(node_disk_writes_completed_total{job="node-exporter", device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[1m])
+                > 0.05
+              )
+              and
+              (
+                rate(node_disk_writes_completed_total{job="node-exporter", device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[1m]) > 1
+              )
+            )
+            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: Disk writes are slow on {{ $labels.nodename }} ({{ $labels.device }})
+            description: >-
+              The average wait per write on node {{ $labels.nodename }},
+              disk {{ $labels.device }}, over the last minute is
+              {{ $value | humanizeDuration }}. That is above the limit of 50 ms
+              while the disk does more than 1 write per second, and has been
+              for 1 minute.
+        - alert: NodeMemoryAvailableLow
+          expr: |-
+            (
+              node_memory_MemAvailable_bytes{job="node-exporter"} < 1.5 * 1024^3
+            )
+            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Available memory is low on {{ $labels.nodename }}
+            description: >-
+              Node {{ $labels.nodename }} has {{ $value | humanize1024 }}B of
+              memory available. That is below the limit of 1.5 GiB, and has
+              been for 5 minutes.
+        - alert: NodeCPUStall
+          expr: |-
+            (
+              rate(node_pressure_cpu_waiting_seconds_total{job="node-exporter"}[1m]) > 0.25
+            )
+            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+          for: 3m
+          labels:
+            severity: warning
+          annotations:
+            summary: Work is waiting for CPU on {{ $labels.nodename }}
+            description: >-
+              On node {{ $labels.nodename }}, some work was waiting for CPU
+              {{ $value | humanizePercentage }} of the time over the last
+              minute. That is above the limit of 25%, and has been for 3
+              minutes.
+        - alert: NodeMemoryStall
+          expr: |-
+            (
+              rate(node_pressure_memory_waiting_seconds_total{job="node-exporter"}[1m]) > 0.10
+            )
+            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: Work is waiting for memory on {{ $labels.nodename }}
+            description: >-
+              On node {{ $labels.nodename }}, some work was waiting for memory
+              {{ $value | humanizePercentage }} of the time over the last
+              minute. That is above the limit of 10%, and has been for 1
+              minute.
+        - alert: NodeIOStall
+          expr: |-
+            (
+              rate(node_pressure_io_waiting_seconds_total{job="node-exporter"}[1m]) > 0.25
+            )
+            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: Work is waiting for disk I/O on {{ $labels.nodename }}
+            description: >-
+              On node {{ $labels.nodename }}, some work was waiting for disk
+              I/O {{ $value | humanizePercentage }} of the time over the last
+              minute. That is above the limit of 25%, and has been for 1
+              minute.
