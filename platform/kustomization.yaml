@@ -1,6 +1,7 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
+  - alert-logger.yaml
   - cluster-health.yaml
   - fluent-bit.yaml
   - human-operator.yaml
@@ -53,6 +54,18 @@ configMapGenerator:
         app.kubernetes.io/name: logs-mcp
         app.kubernetes.io/part-of: observability
         app.kubernetes.io/component: mcp-server
+        entity: cluster
+        env: main
+        capability: observability
+  - name: alert-logger-script
+    namespace: cluster-main-observability
+    files:
+      - server.py=alert-logger/server.py
+    options:
+      labels:
+        app.kubernetes.io/name: alert-logger
+        app.kubernetes.io/part-of: observability
+        app.kubernetes.io/component: alert-sink
         entity: cluster
         env: main
         capability: observability

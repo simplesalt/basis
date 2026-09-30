@@ -151,6 +151,33 @@ spec:
             resiliency.simplesalt.company/storage-tier: blips-are-ok
         storage:
           emptyDir: {}
+      # Log every firing and resolved alert (platform/alert-logger.yaml
+      # prints one JSON line per alert; fluent-bit ships it to the logs
+      # database). Only route and receivers are set here: Helm deep-merges
+      # maps, so the chart's default global, inhibit_rules and templates keep
+      # applying unchanged. The chart's route.routes list is replaced by the
+      # one below, which carries its Watchdog entry forward.
+      config:
+        route:
+          receiver: alert-logger
+          # One group per alert (every label), so each alert is logged once
+          # when it fires, once when it resolves, and again every
+          # repeat_interval while it keeps firing -- never re-logged just
+          # because a different alert joined or left a shared group.
+          group_by: ["..."]
+          group_wait: 30s
+          group_interval: 2m
+          repeat_interval: 4h
+          routes:
+            - receiver: "null"
+              matchers:
+                - alertname =~ "Watchdog|InfoInhibitor"
+        receivers:
+          - name: "null"
+          - name: alert-logger
+            webhook_configs:
+              - url: http://alert-logger.cluster-main-observability.svc.cluster.local:8080/alerts
+                send_resolved: true
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
