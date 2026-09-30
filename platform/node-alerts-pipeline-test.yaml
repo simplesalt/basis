@@ -24,7 +24,7 @@ spec:
             )
             * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
           labels:
-            severity: info
+            severity: warning
           annotations:
             summary: Test alert on {{ $labels.nodename }}
             description: >-
