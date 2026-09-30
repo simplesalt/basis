@@ -153,6 +153,11 @@ spec:
         NodeCPUHighUsage: true
         NodeSystemdServiceFailed: true
         NodeSystemdServiceCrashlooping: true
+    customRules:
+      KubeNodePressure:
+        severity: warning
+      KubeNodeEviction:
+        severity: warning
     prometheus-node-exporter:
       prometheus:
         monitor:
