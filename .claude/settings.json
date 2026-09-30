@@ -1,10 +1,5 @@
 {
   "env": {
     "GITOPS": "TRUE"
-  },
-  "permissions": {
-    "deny": [
-      "mcp__flux__patch_kubernetes_resource"
-    ]
   }
 }
