@@ -66,7 +66,7 @@ spec:
       automountServiceAccountToken: false
       containers:
         - name: postgrest
-          image: postgrest/postgrest:v16.2
+          image: postgrest/postgrest:v16.3
           env:
             - name: PGRST_DB_URI
               valueFrom:

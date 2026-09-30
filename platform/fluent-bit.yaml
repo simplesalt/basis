@@ -14,7 +14,7 @@ metadata:
 spec:
   annotations:
     restart-epoch: "2026-09-01-390b"
-  image: ghcr.io/fluent/fluent-operator/fluent-bit:5.1.0
+  image: ghcr.io/fluent/fluent-operator/fluent-bit:5.1.2
   fluentBitConfigName: fluent-bit-config
   namespaceFluentBitCfgSelector: {}
   resources:
