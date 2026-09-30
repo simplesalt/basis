@@ -51,6 +51,7 @@ spec:
             - |
               set -euo pipefail
               trap 'rm -f /var/run/reboot-required; echo "check failed, reboot flag removed"' ERR
+              k3s etcd-snapshot save --name pre-node-update
               systemctl start bootc-update.service
               journalctl -u bootc-update.service -n 20 --no-pager -o cat
               STATUS=$(bootc status --format=json)
@@ -121,6 +122,7 @@ spec:
             - |
               set -euo pipefail
               trap 'rm -f /var/run/reboot-required; echo "check failed, reboot flag removed"' ERR
+              k3s etcd-snapshot save --name pre-node-update
               systemctl start bootc-update.service
               journalctl -u bootc-update.service -n 20 --no-pager -o cat
               STATUS=$(bootc status --format=json)
@@ -191,6 +193,7 @@ spec:
             - |
               set -euo pipefail
               trap 'rm -f /var/run/reboot-required; echo "check failed, reboot flag removed"' ERR
+              k3s etcd-snapshot save --name pre-node-update
               systemctl start bootc-update.service
               journalctl -u bootc-update.service -n 20 --no-pager -o cat
               STATUS=$(bootc status --format=json)
