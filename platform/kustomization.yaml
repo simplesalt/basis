@@ -12,6 +12,7 @@ resources:
   - logs-pg.yaml
   - mcp-flux.yaml
   - node-alerts.yaml
+  - node-alerts-pipeline-test.yaml
   - node-class.yaml
   - policies.batch.yaml
   - policies.cleanup.yaml

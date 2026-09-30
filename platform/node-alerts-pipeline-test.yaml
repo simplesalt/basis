@@ -1,0 +1,32 @@
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: node-alerts-pipeline-test
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: node-alerts-pipeline-test
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: alerting
+    entity: cluster
+    env: main
+    capability: observability
+    release: prometheus
+spec:
+  groups:
+    - name: node-alerts-pipeline-test.rules
+      interval: 30s
+      rules:
+        - alert: NodeAlertPipelineTest
+          expr: |-
+            (
+              node_load1{job="node-exporter"} >= 0
+            )
+            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+          labels:
+            severity: info
+          annotations:
+            summary: Test alert on {{ $labels.nodename }}
+            description: >-
+              Temporary test that a rule-fired node alert reaches the logs
+              with its node name. Removed once seen firing and resolved.
