@@ -58,7 +58,7 @@ spec:
       serviceAccountName: mcp-flux
       containers:
         - name: manager
-          image: ghcr.io/controlplaneio-fluxcd/flux-operator-mcp:v0.49.0
+          image: ghcr.io/controlplaneio-fluxcd/flux-operator-mcp:v0.60.0
           imagePullPolicy: Always
           args:
             - serve
