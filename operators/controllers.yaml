@@ -15,6 +15,7 @@ spec:
   chart:
     spec:
       chart: cert-manager
+      version: "v1.21.2"
       sourceRef:
         kind: HelmRepository
         name: cert-manager
@@ -50,6 +51,7 @@ spec:
   chart:
     spec:
       chart: kyverno
+      version: "3.9.1"
       sourceRef:
         kind: HelmRepository
         name: kyverno
@@ -85,6 +87,7 @@ spec:
   chart:
     spec:
       chart: kube-prometheus-stack
+      version: "91.8.2"
       sourceRef:
         kind: HelmRepository
         name: prometheus-community
@@ -168,6 +171,7 @@ spec:
   chart:
     spec:
       chart: cloudnative-pg
+      version: "0.29.1"
       sourceRef:
         kind: HelmRepository
         name: cnpg
@@ -196,6 +200,7 @@ spec:
   chart:
     spec:
       chart: fluent-operator
+      version: "4.3.0"
       sourceRef:
         kind: HelmRepository
         name: fluent
@@ -232,6 +237,7 @@ spec:
   chart:
     spec:
       chart: kured
+      version: "6.1.0"
       sourceRef:
         kind: HelmRepository
         name: kured
