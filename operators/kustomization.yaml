@@ -5,5 +5,4 @@ resources:
   - ns.yaml
   - helmrepos.yaml
   - controllers.yaml
-  - probe-node-alert-signals.yaml
-  - probe-alert-logger-test.yaml
+  - probe-node-alerts-live.yaml
