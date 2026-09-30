@@ -1,0 +1,133 @@
+---
+# Read-only check of every node alert Prometheus has loaded: its severity,
+# health, and whether each metric it reads has data for every node at its
+# own rate window; plus Alertmanager's inhibit rules (matchers only). Output
+# stays under 100 lines. Remove this file and its kustomization entry after
+# reading.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: probe-node-alerts-coverage
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: probe-node-alerts-coverage
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: diagnostic
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: probe-node-alerts-coverage
+        app.kubernetes.io/part-of: observability
+        app.kubernetes.io/component: diagnostic
+        entity: cluster
+        env: main
+        capability: observability
+        scheduling.simplesalt.company/class: work
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          image: python:3.13-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PROMETHEUS_URL
+              value: http://prometheus-operated.cluster-main-observability.svc.cluster.local:9090
+            - name: ALERTMANAGER_URL
+              value: http://alertmanager-operated.cluster-main-observability.svc.cluster.local:9093
+          command:
+            - python3
+            - -u
+            - -c
+            - |
+              import json, os, re, urllib.parse, urllib.request
+
+              PROM = os.environ["PROMETHEUS_URL"]
+              AM = os.environ["ALERTMANAGER_URL"]
+              GROUPS = re.compile(r"^(node-exporter|node-network|node-alerts|kubernetes-system-kubelet)")
+              NODE_ALERT = re.compile(r"^(Node|KubeNode|KubeletDown)")
+
+              def get(base, path, params=None):
+                  url = base + path + ("?" + urllib.parse.urlencode(params) if params else "")
+                  with urllib.request.urlopen(url, timeout=60) as r:
+                      return json.loads(r.read())
+
+              def q(expr):
+                  try:
+                      return get(PROM, "/api/v1/query", {"query": expr})["data"]["result"]
+                  except Exception as e:
+                      return "ERR " + type(e).__name__
+
+              nodes = {s["metric"]["instance"]: s["metric"].get("nodename", "?")
+                       for s in q('node_uname_info{job="node-exporter"}')}
+              print("nodes: " + " ".join(sorted(nodes.values())))
+              print("== node alerts: severity, health, metrics with data (nodes covered of %d) ==" % len(nodes))
+              for g in get(PROM, "/api/v1/rules", {"type": "alert"})["data"]["groups"]:
+                  if not GROUPS.match(g["name"]):
+                      continue
+                  for r in g["rules"]:
+                      if not NODE_ALERT.match(r["name"]):
+                          continue
+                      expr = r["query"]
+                      windows = re.findall(r"\[(\d+[smh])\]", expr)
+                      win = windows[0] if windows else "5m"
+                      cells = []
+                      for m in sorted(set(re.findall(r"\b((?:node|kube|kubelet)_[a-zA-Z0-9_]+)\b", expr))):
+                          if m.endswith("_total") or m.endswith("_count"):
+                              probe = 'count by (instance) (rate(%s[%s]))' % (m, win)
+                          else:
+                              probe = 'count by (instance) (%s)' % m
+                          res = q(probe)
+                          n = len(res) if isinstance(res, list) else res
+                          cells.append("%s=%s" % (m, n))
+                      print("%-34s %-8s g=%-28s int=%-4s %-3s %s" % (
+                          r["name"], r.get("labels", {}).get("severity", "-"), g["name"][:28],
+                          g.get("interval", "-"), r.get("health", "?"), " ".join(cells)))
+
+              print("== node alerts pending or firing now ==")
+              res = q('ALERTS{alertname=~"Node.*|KubeNode.*"}')
+              for s in res if isinstance(res, list) else []:
+                  l = s["metric"]
+                  print("   %s %s %s %s" % (l.get("alertname"), l.get("alertstate"), l.get("severity"),
+                                           l.get("nodename") or l.get("node") or l.get("instance", "")))
+              if res == []:
+                  print("   none")
+
+              print("== Alertmanager inhibit rules (matchers only) ==")
+              try:
+                  text = get(AM, "/api/v2/status")["config"]["original"]
+                  keep = False
+                  for line in text.splitlines():
+                      if re.match(r"^\S", line):
+                          keep = line.startswith("inhibit_rules:")
+                          continue
+                      if keep and re.search(r"(matchers|equal|^\s*-\s)", line) and not re.search(r"(url|token|password|secret|key)", line, re.I):
+                          print("   " + line.rstrip())
+              except Exception as e:
+                  print("   ERR " + type(e).__name__)
+              print("== END ==")
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 96Mi

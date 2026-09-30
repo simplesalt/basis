@@ -5,3 +5,4 @@ resources:
   - ns.yaml
   - helmrepos.yaml
   - controllers.yaml
+  - probe-node-alerts-coverage.yaml
