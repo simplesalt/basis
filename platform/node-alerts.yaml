@@ -162,15 +162,3 @@ spec:
               The certificate {{ $labels.subject }} on node {{ $labels.node }}
               expires in {{ $value | humanizeDuration }}. That is below the
               limit of 7 days, and has been for 5 minutes.
-        - alert: NodeCertificateExpiresImminently
-          expr: |-
-            min by (node, subject) (k3s_certificate_expiration_seconds{job="kubelet"}) < 1 * 86400
-          for: 5m
-          labels:
-            severity: critical
-          annotations:
-            summary: A certificate on {{ $labels.node }} expires within 1 day ({{ $labels.subject }})
-            description: >-
-              The certificate {{ $labels.subject }} on node {{ $labels.node }}
-              expires in {{ $value | humanizeDuration }}. That is below the
-              limit of 1 day, and has been for 5 minutes.
