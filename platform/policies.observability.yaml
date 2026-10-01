@@ -1,0 +1,45 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: cnpg-observability
+  labels:
+    app.kubernetes.io/name: cnpg-observability
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: observability
+  annotations:
+    policies.kyverno.io/title: CNPG I/O timing
+    policies.kyverno.io/category: Observability
+    policies.kyverno.io/severity: low
+    policies.kyverno.io/subject: Cluster
+    policies.kyverno.io/description: >-
+      Defaults track_io_timing and track_wal_io_timing to on in
+      spec.postgresql.parameters of every CloudNativePG Cluster, so the I/O
+      timing columns in the pg_stat_io metrics exported by the operator's
+      default monitoring queries carry measured time instead of zero. Both
+      patches are add-if-absent, so a Cluster that states either parameter
+      keeps its value. Both parameters take effect on a configuration reload,
+      so adding them restarts nothing.
+spec:
+  background: false
+  webhookConfiguration:
+    failurePolicy: Ignore
+  rules:
+    - name: default-io-timing
+      match:
+        any:
+          - resources:
+              kinds:
+                - postgresql.cnpg.io/v1/Cluster
+              operations:
+                - CREATE
+                - UPDATE
+      mutate:
+        patchStrategicMerge:
+          spec:
+            postgresql:
+              parameters:
+                +(track_io_timing): "on"
+                +(track_wal_io_timing): "on"

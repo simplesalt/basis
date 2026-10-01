@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - alert-logger.yaml
   - cluster-health.yaml
+  - cnpg-monitoring.yaml
   - fluent-bit.yaml
   - human-operator.yaml
   - kured-gate.yaml
@@ -15,6 +16,7 @@ resources:
   - policies.batch.yaml
   - policies.cleanup.yaml
   - policies.flux.yaml
+  - policies.observability.yaml
   - policies.resiliency.yaml
   - policies.scheduling.yaml
   - policies.secrets.yaml
