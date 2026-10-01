@@ -12,7 +12,7 @@ metadata:
     env: main
     capability: observability
 spec:
-  imageName: ghcr.io/cloudnative-pg/postgresql:17
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
 
   minSyncReplicas: 0
   maxSyncReplicas: 0
@@ -80,7 +80,7 @@ spec:
       restartPolicy: OnFailure
       initContainers:
         - name: wait-for-db
-          image: ghcr.io/cloudnative-pg/postgresql:17
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
           command:
             - sh
             - -c
@@ -97,7 +97,7 @@ spec:
                   key: uri
       containers:
         - name: psql
-          image: ghcr.io/cloudnative-pg/postgresql:17
+          image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
           command:
             - psql
             - -v
@@ -218,7 +218,7 @@ spec:
           serviceAccountName: logs-pg-rotate
           initContainers:
             - name: pvc-capacity
-              image: ghcr.io/cloudnative-pg/postgresql:17
+              image: python:3.13-alpine
               command:
                 - sh
                 - -c
@@ -227,14 +227,11 @@ spec:
                   # Reads this Cluster's own PVC capacity via the in-cluster
                   # Kubernetes API, using the ServiceAccount token every pod
                   # has auto-mounted -- the same access pattern mcp-flux.yaml
-                  # uses to reach the API from inside the cluster. python3 is
-                  # present in this image because the bare `:17` tag used
-                  # throughout this file resolves to the deprecated `system`
-                  # build (see cloudnative-pg/postgres-containers), which
-                  # installs python3-pip/python3-psycopg2 to support
-                  # barman-cloud; the newer minimal/standard image types would
-                  # not carry it, so switching imageName later would need
-                  # revisiting this too.
+                  # uses to reach the API from inside the cluster. This
+                  # container uses python:3.13-alpine, the helper image
+                  # alert-logger and cluster-health also use, because the
+                  # pinned `standard` PostgreSQL image used by the rest of
+                  # this file does not ship python3.
                   import json, pathlib, ssl, urllib.request
 
                   NAMESPACE = "cluster-main-observability"
@@ -295,11 +292,13 @@ spec:
                 readOnlyRootFilesystem: true
                 capabilities:
                   drop: ["ALL"]
+                runAsNonRoot: true
+                runAsUser: 65532
                 seccompProfile:
                   type: RuntimeDefault
           containers:
             - name: psql
-              image: ghcr.io/cloudnative-pg/postgresql:17
+              image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
               command:
                 - sh
                 - -c
