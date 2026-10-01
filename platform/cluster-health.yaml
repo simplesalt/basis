@@ -52,7 +52,7 @@ rules:
     resources: ["networkpolicies"]
     verbs: ["get", "list"]
   - apiGroups: ["monitoring.coreos.com"]
-    resources: ["prometheusrules"]
+    resources: ["prometheusrules", "podmonitors"]
     verbs: ["get", "list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
