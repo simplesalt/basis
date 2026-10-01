@@ -153,6 +153,20 @@ spec:
         NodeCPUHighUsage: true
         NodeSystemdServiceFailed: true
         NodeSystemdServiceCrashlooping: true
+        # No RAID arrays or bonded interfaces on this cluster, so node_md_*
+        # and node_bonding_* never exist and these never have data.
+        NodeRAIDDegraded: true
+        NodeRAIDDiskFailure: true
+        NodeBondingDegraded: true
+        # k3s does not export the kubelet_certificate_manager_* and
+        # *_renew_errors metrics these read. Certificate expiry is covered by
+        # NodeCertificateExpiresSoon/Imminently in platform/node-alerts.yaml
+        # (k3s_certificate_expiration_seconds). Each key disables both the
+        # warning and the critical rule of that name.
+        KubeletClientCertificateExpiration: true
+        KubeletServerCertificateExpiration: true
+        KubeletClientCertificateRenewalErrors: true
+        KubeletServerCertificateRenewalErrors: true
     customRules:
       KubeNodePressure:
         severity: warning

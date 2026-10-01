@@ -22,7 +22,7 @@ spec:
             (
               rate(node_disk_io_time_weighted_seconds_total{job="node-exporter", device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[1m]) > 10
             )
-            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+            * on (instance) group_left (nodename) max by (instance, nodename) (node_uname_info{job="node-exporter"})
           for: 1m
           labels:
             severity: warning
@@ -46,7 +46,7 @@ spec:
                 rate(node_disk_reads_completed_total{job="node-exporter", device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[1m]) > 1
               )
             )
-            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+            * on (instance) group_left (nodename) max by (instance, nodename) (node_uname_info{job="node-exporter"})
           for: 1m
           labels:
             severity: warning
@@ -71,7 +71,7 @@ spec:
                 rate(node_disk_writes_completed_total{job="node-exporter", device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|md.+|dasd.+)"}[1m]) > 1
               )
             )
-            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+            * on (instance) group_left (nodename) max by (instance, nodename) (node_uname_info{job="node-exporter"})
           for: 1m
           labels:
             severity: warning
@@ -88,7 +88,7 @@ spec:
             (
               node_memory_MemAvailable_bytes{job="node-exporter"} < 1.5 * 1024^3
             )
-            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+            * on (instance) group_left (nodename) max by (instance, nodename) (node_uname_info{job="node-exporter"})
           for: 5m
           labels:
             severity: warning
@@ -103,7 +103,7 @@ spec:
             (
               rate(node_pressure_cpu_waiting_seconds_total{job="node-exporter"}[1m]) > 0.25
             )
-            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+            * on (instance) group_left (nodename) max by (instance, nodename) (node_uname_info{job="node-exporter"})
           for: 3m
           labels:
             severity: warning
@@ -119,7 +119,7 @@ spec:
             (
               rate(node_pressure_memory_waiting_seconds_total{job="node-exporter"}[1m]) > 0.10
             )
-            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+            * on (instance) group_left (nodename) max by (instance, nodename) (node_uname_info{job="node-exporter"})
           for: 1m
           labels:
             severity: warning
@@ -135,7 +135,7 @@ spec:
             (
               rate(node_pressure_io_waiting_seconds_total{job="node-exporter"}[1m]) > 0.25
             )
-            * on (instance) group_left (nodename) node_uname_info{job="node-exporter"}
+            * on (instance) group_left (nodename) max by (instance, nodename) (node_uname_info{job="node-exporter"})
           for: 1m
           labels:
             severity: warning
@@ -146,3 +146,31 @@ spec:
               I/O {{ $value | humanizePercentage }} of the time over the last
               minute. That is above the limit of 25%, and has been for 1
               minute.
+        # k3s exports the seconds left on each of its certificates (22 per
+        # node, CAs included) as k3s_certificate_expiration_seconds. Every
+        # node's value is served through the apiserver and kubelet scrapes, so
+        # read the kubelet one: it already carries the node name.
+        - alert: NodeCertificateExpiresSoon
+          expr: |-
+            min by (node, subject) (k3s_certificate_expiration_seconds{job="kubelet"}) < 7 * 86400
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: A certificate on {{ $labels.node }} expires within 7 days ({{ $labels.subject }})
+            description: >-
+              The certificate {{ $labels.subject }} on node {{ $labels.node }}
+              expires in {{ $value | humanizeDuration }}. That is below the
+              limit of 7 days, and has been for 5 minutes.
+        - alert: NodeCertificateExpiresImminently
+          expr: |-
+            min by (node, subject) (k3s_certificate_expiration_seconds{job="kubelet"}) < 1 * 86400
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: A certificate on {{ $labels.node }} expires within 1 day ({{ $labels.subject }})
+            description: >-
+              The certificate {{ $labels.subject }} on node {{ $labels.node }}
+              expires in {{ $value | humanizeDuration }}. That is below the
+              limit of 1 day, and has been for 5 minutes.
