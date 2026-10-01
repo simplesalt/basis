@@ -13,7 +13,7 @@ metadata:
     capability: observability
 spec:
   annotations:
-    restart-epoch: "2026-10-01-393"
+    restart-epoch: "2026-10-01-393-resume-test"
   image: ghcr.io/fluent/fluent-operator/fluent-bit:5.1.2
   fluentBitConfigName: fluent-bit-config
   namespaceFluentBitCfgSelector: {}
