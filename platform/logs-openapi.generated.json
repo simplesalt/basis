@@ -170,6 +170,42 @@
           "type": "string"
         }
       },
+      "rowFilter.host.at": {
+        "description": "UTC timestamp the journal entry was written, per journald.",
+        "in": "query",
+        "name": "at",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "rowFilter.host.message": {
+        "description": "The journal entry text, from journald's MESSAGE field.",
+        "in": "query",
+        "name": "message",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "rowFilter.host.node": {
+        "description": "The node hostname the entry was read from, e.g. k-e7488b70. From journald's HOSTNAME field.",
+        "in": "query",
+        "name": "node",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "rowFilter.host.unit": {
+        "description": "The systemd unit that logged the entry, e.g. bootc-update.service. From journald's _SYSTEMD_UNIT field; always one of the allowlisted units, since anything else was dropped at ingest.",
+        "in": "query",
+        "name": "unit",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      },
       "select": {
         "description": "Filtering Columns",
         "in": "query",
@@ -182,7 +218,7 @@
     },
     "schemas": {
       "entries": {
-        "description": "Every captured container log line, newest first when ordered by \"at\". This is the raw feed: prefer the purpose-built endpoints (recent, errors, search, pod_tail) unless you need an arbitrary filter combination. Retention is 14 days; anything older has been dropped. This store retains error-signal lines only, not all container output. An empty result means no matching error-signal lines were recorded -- it does not mean the workload was silent, and it does not mean the pipeline is broken. To tell those apart, call workloads or volume: if they return rows, ingest is healthy. For a workload's normal, unfiltered output use the flux MCP's `get_kubernetes_logs` tool, which reads the live kubelet tail. The log pipeline's own components -- fluent-bit, logs-pg, logs-postgrest and logs-mcp -- are excluded at ingest and never appear here at all. Every other namespace, including ssint-main-coding, is tailed in full and then cut down by the error filter.",
+        "description": "Every captured container log line, newest first when ordered by \"at\". This is the raw feed: prefer the purpose-built endpoints (recent, errors, search, pod_tail) unless you need an arbitrary filter combination. Retention is 14 days; anything older has been dropped. This store retains error-signal lines only, not all container output. An empty result means no matching error-signal lines were recorded -- it does not mean the workload was silent, and it does not mean the pipeline is broken. To tell those apart, call workloads or volume: if they return rows, ingest is healthy. For a workload's normal, unfiltered output use the flux MCP's `get_kubernetes_logs` tool, which reads the live kubelet tail. The log pipeline's own components -- fluent-bit, logs-pg, logs-postgrest and logs-mcp -- are excluded at ingest and never appear here at all. Every other namespace, including ssint-main-coding, is tailed in full and then cut down by the error filter. Host (node/systemd journal) records are not container log lines and never appear here; see logs_api.host.",
         "properties": {
           "at": {
             "description": "UTC timestamp the line was emitted, as recorded by the container runtime.",
@@ -213,6 +249,28 @@
           }
         },
         "type": "object"
+      },
+      "host": {
+        "description": "Host (node) journal lines, newest first when ordered by \"at\". This is not container output -- it is systemd journal entries read directly off each node, scoped at ingest to a small allowlist of units (bootc-update, k3s, kcluster-node-network, kcluster-provision, greenboot) chosen because they can explain a node failing to update or failing to come back afterward. Every other unit on the host journal is discarded before it reaches storage and was never captured -- an empty result here can mean either that an allowlisted unit was quiet, or that the question is about a unit outside the allowlist, which this store cannot answer regardless of the time window. Retention is 14 days, shared with the rest of public.logs. For a node's current, unfiltered journal use the flux MCP against the node directly; this store has no shell-on-node equivalent and only ever holds what fluent-bit's systemd input captured.",
+        "properties": {
+          "at": {
+            "description": "UTC timestamp the journal entry was written, per journald.",
+            "type": "string"
+          },
+          "message": {
+            "description": "The journal entry text, from journald's MESSAGE field.",
+            "type": "string"
+          },
+          "node": {
+            "description": "The node hostname the entry was read from, e.g. k-e7488b70. From journald's HOSTNAME field.",
+            "type": "string"
+          },
+          "unit": {
+            "description": "The systemd unit that logged the entry, e.g. bootc-update.service. From journald's _SYSTEMD_UNIT field; always one of the allowlisted units, since anything else was dropped at ingest.",
+            "type": "string"
+          }
+        },
+        "type": "object"
       }
     }
   },
@@ -223,7 +281,7 @@
   "info": {
     "description": "This is a dynamic API generated by PostgREST",
     "title": "PostgREST API",
-    "version": "16.2"
+    "version": "16.3"
   },
   "openapi": "3.0.3",
   "paths": {
@@ -316,9 +374,95 @@
             "description": "Partial Content"
           }
         },
-        "summary": "Every captured container log line, newest first when ordered by \"at\". This is the raw feed: prefer the purpose-built endpoints (recent, errors, search, pod_tail) unless you need an arbitrary filter combination. Retention is 14 days; anything older has been dropped. This store retains error-signal lines only, not all container output. An empty result means no matching error-signal lines were recorded -- it does not mean the workload was silent, and it does not mean the pipeline is broken. To tell those apart, call workloads or volume: if they return rows, ingest is healthy. For a workload's normal, unfiltered output use the flux MCP's `get_kubernetes_logs` tool, which reads the live kubelet tail. The log pipeline's own components -- fluent-bit, logs-pg, logs-postgrest and logs-mcp -- are excluded at ingest and never appear here at all. Every other namespace, including ssint-main-coding, is tailed in full and then cut down by the error filter.",
+        "summary": "Every captured container log line, newest first when ordered by \"at\". This is the raw feed: prefer the purpose-built endpoints (recent, errors, search, pod_tail) unless you need an arbitrary filter combination. Retention is 14 days; anything older has been dropped. This store retains error-signal lines only, not all container output. An empty result means no matching error-signal lines were recorded -- it does not mean the workload was silent, and it does not mean the pipeline is broken. To tell those apart, call workloads or volume: if they return rows, ingest is healthy. For a workload's normal, unfiltered output use the flux MCP's `get_kubernetes_logs` tool, which reads the live kubelet tail. The log pipeline's own components -- fluent-bit, logs-pg, logs-postgrest and logs-mcp -- are excluded at ingest and never appear here at all. Every other namespace, including ssint-main-coding, is tailed in full and then cut down by the error filter. Host (node/systemd journal) records are not container log lines and never appear here; see logs_api.host.",
         "tags": [
           "entries"
+        ]
+      }
+    },
+    "/host": {
+      "get": {
+        "operationId": "host",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/rowFilter.host.at"
+          },
+          {
+            "$ref": "#/components/parameters/rowFilter.host.node"
+          },
+          {
+            "$ref": "#/components/parameters/rowFilter.host.unit"
+          },
+          {
+            "$ref": "#/components/parameters/rowFilter.host.message"
+          },
+          {
+            "$ref": "#/components/parameters/select"
+          },
+          {
+            "$ref": "#/components/parameters/order"
+          },
+          {
+            "$ref": "#/components/parameters/range"
+          },
+          {
+            "$ref": "#/components/parameters/rangeUnit"
+          },
+          {
+            "$ref": "#/components/parameters/offset"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          },
+          {
+            "$ref": "#/components/parameters/preferCount"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/host"
+                  },
+                  "type": "array"
+                }
+              },
+              "application/vnd.pgrst.object+json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/host"
+                  },
+                  "type": "array"
+                }
+              },
+              "application/vnd.pgrst.object+json;nulls=stripped": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/host"
+                  },
+                  "type": "array"
+                }
+              },
+              "text/csv": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/host"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "206": {
+            "description": "Partial Content"
+          }
+        },
+        "summary": "Host (node) journal lines, newest first when ordered by \"at\". This is not container output -- it is systemd journal entries read directly off each node, scoped at ingest to a small allowlist of units (bootc-update, k3s, kcluster-node-network, kcluster-provision, greenboot) chosen because they can explain a node failing to update or failing to come back afterward. Every other unit on the host journal is discarded before it reaches storage and was never captured -- an empty result here can mean either that an allowlisted unit was quiet, or that the question is about a unit outside the allowlist, which this store cannot answer regardless of the time window. Retention is 14 days, shared with the rest of public.logs. For a node's current, unfiltered journal use the flux MCP against the node directly; this store has no shell-on-node equivalent and only ever holds what fluent-bit's systemd input captured.",
+        "tags": [
+          "host"
         ]
       }
     },
