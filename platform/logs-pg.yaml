@@ -100,12 +100,29 @@ spec:
         - name: psql
           image: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
           command:
-            - psql
-            - -v
-            - ON_ERROR_STOP=1
-            - -f
-            - /sql/schema.sql
-            - $(DATABASE_URL)
+            - sh
+            - -c
+            - |
+              # A logs-pg rolling restart can drop or refuse connections after
+              # wait-for-db has already passed. psql exits 2 when it cannot
+              # reach or loses the server, so retry only that, for about five
+              # minutes, instead of spending the Job's backoffLimit. Exit 1
+              # (psql error) and 3 (SQL error) fail at once. schema.sql is one
+              # transaction and idempotent, so a full re-run is safe.
+              attempt=1
+              end=$(( $(date +%s) + 300 ))
+              while :; do
+                psql -v ON_ERROR_STOP=1 -f /sql/schema.sql "$DATABASE_URL"
+                rc=$?
+                [ "$rc" -eq 2 ] || exit "$rc"
+                if [ "$(date +%s)" -ge "$end" ]; then
+                  echo "psql: server still unreachable after $attempt attempts, giving up" >&2
+                  exit 2
+                fi
+                echo "psql: attempt $attempt exited $rc, retrying in 5s" >&2
+                attempt=$((attempt + 1))
+                sleep 5
+              done
           env:
             - name: DATABASE_URL
               valueFrom:
