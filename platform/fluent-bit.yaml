@@ -13,7 +13,7 @@ metadata:
     capability: observability
 spec:
   annotations:
-    restart-epoch: "2026-09-01-390b"
+    restart-epoch: "2026-10-01-393"
   image: ghcr.io/fluent/fluent-operator/fluent-bit:5.1.2
   fluentBitConfigName: fluent-bit-config
   namespaceFluentBitCfgSelector: {}
@@ -135,6 +135,8 @@ metadata:
 spec:
   systemd:
     tag: host.*
+    db: /var/lib/fluent-bit/systemd-host.db
+    dbSync: Normal
     readFromTail: "on"
     stripUnderscores: "on"
 ---
