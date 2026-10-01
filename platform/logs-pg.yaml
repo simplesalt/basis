@@ -43,6 +43,7 @@ spec:
       wal_compression: "zstd"
       max_wal_size: "2GB"
       checkpoint_timeout: "15min"
+      archive_timeout: "0"
 
   bootstrap:
     initdb:
