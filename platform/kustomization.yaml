@@ -13,6 +13,7 @@ resources:
   - mcp-flux.yaml
   - node-alerts.yaml
   - node-class.yaml
+  - node-flannel-repin.yaml
   - policies.batch.yaml
   - policies.cleanup.yaml
   - policies.flux.yaml
