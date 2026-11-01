@@ -1,0 +1,153 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cluster-main-identity
+  labels:
+    name: cluster-main-identity
+    entity: cluster
+    env: main
+    capability: identity
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oidc-keys-sync
+  namespace: cluster-main-identity
+  labels:
+    app.kubernetes.io/name: oidc-keys-sync
+    app.kubernetes.io/part-of: identity
+    app.kubernetes.io/component: key-publisher
+    entity: cluster
+    env: main
+    capability: identity
+---
+# Reads the KV namespace id and writes the one Kv object holding the key set.
+# create cannot be limited by name, so it covers the Kv kind in
+# crossplane-system; get and patch are limited to the one object.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: oidc-keys-sync
+  namespace: crossplane-system
+  labels:
+    app.kubernetes.io/name: oidc-keys-sync
+    app.kubernetes.io/part-of: identity
+    app.kubernetes.io/component: key-publisher
+    entity: cluster
+    env: main
+    capability: identity
+rules:
+  - apiGroups: ["workers.upjet-cloudflare.m.upbound.io"]
+    resources: ["kvnamespaces"]
+    resourceNames: ["cf-main-kv-oidc-keys"]
+    verbs: ["get"]
+  - apiGroups: ["workers.upjet-cloudflare.m.upbound.io"]
+    resources: ["kvs"]
+    resourceNames: ["oidc-jwks"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["workers.upjet-cloudflare.m.upbound.io"]
+    resources: ["kvs"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oidc-keys-sync
+  namespace: crossplane-system
+  labels:
+    app.kubernetes.io/name: oidc-keys-sync
+    app.kubernetes.io/part-of: identity
+    app.kubernetes.io/component: key-publisher
+    entity: cluster
+    env: main
+    capability: identity
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: oidc-keys-sync
+subjects:
+  - kind: ServiceAccount
+    name: oidc-keys-sync
+    namespace: cluster-main-identity
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: oidc-keys-sync
+  namespace: cluster-main-identity
+  labels:
+    app.kubernetes.io/name: oidc-keys-sync
+    app.kubernetes.io/part-of: identity
+    app.kubernetes.io/component: key-publisher
+    entity: cluster
+    env: main
+    capability: identity
+  annotations:
+    description: >-
+      Keeps the cluster's public service account signing keys published at
+      https://oidc.simplesalt.company/openid/v1/jwks for OpenRouter workload
+      identity federation. That host is a Cloudflare Worker reading KV
+      (simplesalt/cloud-basis); nothing on it reaches the cluster. Every ten
+      minutes this job reads the API server's key set and, only when it
+      changed, writes it to the Crossplane Kv object crossplane-system/oidc-jwks,
+      which Crossplane copies to Cloudflare.
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 120
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: oidc-keys-sync
+            app.kubernetes.io/part-of: identity
+            app.kubernetes.io/component: key-publisher
+            entity: cluster
+            env: main
+            capability: identity
+        spec:
+          restartPolicy: Never
+          serviceAccountName: oidc-keys-sync
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: sync
+              image: docker.io/library/python:3.13-alpine
+              command: ["python3", "/scripts/sync.py"]
+              env:
+                - name: CLOUDFLARE_ACCOUNT_ID
+                  value: ba92fe12c6c1275f965c7c86e3b392ac
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+          volumes:
+            - name: script
+              configMap:
+                name: oidc-keys-sync-script
