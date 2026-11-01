@@ -74,8 +74,48 @@ subjects:
     name: oidc-keys-sync
     namespace: cluster-main-identity
 ---
-apiVersion: batch/v1
-kind: CronJob
+# Watches the API server identity Leases, so a restart (the only moment a new
+# signing key takes effect) triggers a publish. Leases hold no secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: oidc-keys-sync-leases
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: oidc-keys-sync
+    app.kubernetes.io/part-of: identity
+    app.kubernetes.io/component: key-publisher
+    entity: cluster
+    env: main
+    capability: identity
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: oidc-keys-sync-leases
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: oidc-keys-sync
+    app.kubernetes.io/part-of: identity
+    app.kubernetes.io/component: key-publisher
+    entity: cluster
+    env: main
+    capability: identity
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: oidc-keys-sync-leases
+subjects:
+  - kind: ServiceAccount
+    name: oidc-keys-sync
+    namespace: cluster-main-identity
+---
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: oidc-keys-sync
   namespace: cluster-main-identity
@@ -91,63 +131,61 @@ metadata:
       Keeps the cluster's public service account signing keys published at
       https://oidc.simplesalt.company/openid/v1/jwks for OpenRouter workload
       identity federation. That host is a Cloudflare Worker reading KV
-      (simplesalt/cloud-basis); nothing on it reaches the cluster. Every ten
-      minutes this job reads the API server's key set and, only when it
-      changed, writes it to the Crossplane Kv object crossplane-system/oidc-jwks,
-      which Crossplane copies to Cloudflare.
+      (simplesalt/cloud-basis); nothing on it reaches the cluster. No
+      schedule: it publishes at start-up and whenever an API server restarts
+      (a new signing key only takes effect then), seen as a new holder on that
+      API server's identity Lease. It writes the Crossplane Kv object
+      crossplane-system/oidc-jwks only when the key set changed, and Crossplane
+      copies it to Cloudflare.
 spec:
-  schedule: "*/10 * * * *"
-  concurrencyPolicy: Forbid
-  successfulJobsHistoryLimit: 1
-  failedJobsHistoryLimit: 3
-  startingDeadlineSeconds: 300
-  jobTemplate:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: oidc-keys-sync
+  template:
+    metadata:
+      labels:
+        app: oidc-keys-sync
+        app.kubernetes.io/name: oidc-keys-sync
+        app.kubernetes.io/part-of: identity
+        app.kubernetes.io/component: key-publisher
+        entity: cluster
+        env: main
+        capability: identity
     spec:
-      backoffLimit: 0
-      activeDeadlineSeconds: 120
-      ttlSecondsAfterFinished: 3600
-      template:
-        metadata:
-          labels:
-            app.kubernetes.io/name: oidc-keys-sync
-            app.kubernetes.io/part-of: identity
-            app.kubernetes.io/component: key-publisher
-            entity: cluster
-            env: main
-            capability: identity
-        spec:
-          restartPolicy: Never
-          serviceAccountName: oidc-keys-sync
-          securityContext:
-            runAsNonRoot: true
-            runAsUser: 65532
-            runAsGroup: 65532
-            seccompProfile:
-              type: RuntimeDefault
-          containers:
-            - name: sync
-              image: docker.io/library/python:3.13-alpine
-              command: ["python3", "/scripts/sync.py"]
-              env:
-                - name: CLOUDFLARE_ACCOUNT_ID
-                  value: ba92fe12c6c1275f965c7c86e3b392ac
-              volumeMounts:
-                - name: script
-                  mountPath: /scripts
-                  readOnly: true
-              securityContext:
-                allowPrivilegeEscalation: false
-                readOnlyRootFilesystem: true
-                capabilities:
-                  drop: ["ALL"]
-              resources:
-                requests:
-                  cpu: 10m
-                  memory: 32Mi
-                limits:
-                  cpu: 200m
-                  memory: 128Mi
-          volumes:
+      serviceAccountName: oidc-keys-sync
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sync
+          image: docker.io/library/python:3.13-alpine
+          command: ["python3", "-u", "/scripts/sync.py"]
+          env:
+            - name: CLOUDFLARE_ACCOUNT_ID
+              value: ba92fe12c6c1275f965c7c86e3b392ac
+          volumeMounts:
             - name: script
-              configMap:
-                name: oidc-keys-sync-script
+              mountPath: /scripts
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 5m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 96Mi
+      volumes:
+        - name: script
+          configMap:
+            name: oidc-keys-sync-script
