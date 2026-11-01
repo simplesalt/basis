@@ -52,7 +52,7 @@ def fetch(path):
         token = f.read().strip()
     req = urllib.request.Request(
         API + path,
-        headers={"Authorization": "Bearer " + token, "Accept": "application/json"},
+        headers={"Authorization": "Bearer " + token, "Accept": "application/jwk-set+json, application/json"},
     )
     with urllib.request.urlopen(req, context=_ctx, timeout=5) as resp:
         return json.loads(resp.read())
