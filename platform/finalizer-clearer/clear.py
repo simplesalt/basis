@@ -16,7 +16,9 @@ SKIP_KINDS = {
     ("", "persistentvolumes"),
     ("", "persistentvolumeclaims"),
     ("apiextensions.k8s.io", "customresourcedefinitions"),
+    ("fluxcd.controlplane.io", "fluxinstances"),
 }
+SKIP_GROUPS = {"postgresql.cnpg.io", "kyverno.io"}
 DURATION_RE = re.compile(r"^(?P<value>[0-9]+)(?P<unit>[smhd]?)$")
 UNIT_SECONDS = {"": 60, "s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -92,6 +94,8 @@ def candidates(client):
     kinds = [k for k in finalizers.EXPLICIT_KINDS if k not in SKIP_KINDS]
     kinds.append(("", "namespaces"))
     for group in finalizers.PROACTIVE_GROUPS:
+        if group in SKIP_GROUPS:
+            continue
         for resource, _namespaced in client.group_resources(group) or []:
             kinds.append((group, resource))
     for group, resource in kinds:

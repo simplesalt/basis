@@ -40,11 +40,10 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
     verbs: ["patch"]
-  - apiGroups: ["fluxcd.controlplane.io"]
-    resources: ["fluxinstances"]
+  - apiGroups: ["kustomize.toolkit.fluxcd.io"]
+    resources: ["kustomizations"]
     verbs: ["patch"]
   - apiGroups:
-      - kustomize.toolkit.fluxcd.io
       - helm.toolkit.fluxcd.io
       - source.toolkit.fluxcd.io
       - pkg.crossplane.io
@@ -65,9 +64,49 @@ rules:
       - zero.upjet-cloudflare.upbound.io
       - fluentbit.fluent.io
       - cert-manager.io
-      - kyverno.io
     resources: ["*"]
     verbs: ["patch"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: finalizer-clearer-scope
+  labels:
+    app.kubernetes.io/name: finalizer-clearer
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: self-heal
+    entity: cluster
+    capability: resiliency
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        resources: ["*"]
+        operations: ["UPDATE"]
+  matchConditions:
+    - name: finalizer-clearer
+      expression: request.userInfo.username == "system:serviceaccount:cluster-main-observability:finalizer-clearer"
+  validations:
+    - expression: has(oldObject.metadata.deletionTimestamp)
+      message: finalizer-clearer may only change objects that are already deleting
+    - expression: "!has(oldObject.spec) ? !has(object.spec) : (has(object.spec) && object.spec == oldObject.spec)"
+      message: finalizer-clearer may not change spec
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: finalizer-clearer-scope
+  labels:
+    app.kubernetes.io/name: finalizer-clearer
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: self-heal
+    entity: cluster
+    capability: resiliency
+spec:
+  policyName: finalizer-clearer-scope
+  validationActions: ["Deny"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -124,7 +163,8 @@ metadata:
       longer than DEFAULT_TIMEOUT_MINUTES, or the object's self-heal-timeout
       label (e.g. 30m, 2h). Skips anything labelled stateful=true, anything in
       a namespace holding a stateful PVC or CNPG Cluster, and all Secrets,
-      PVCs, PVs and CRDs. Each cleared object is logged as one JSON line.
+      PVCs, PVs, CRDs, FluxInstances, CNPG and Kyverno objects. An admission
+      policy limits it to objects already deleting, with spec unchanged. Each cleared object is logged as one JSON line.
       projects#913.
 spec:
   schedule: "*/5 * * * *"
