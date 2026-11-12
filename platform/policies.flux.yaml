@@ -14,16 +14,7 @@ metadata:
     policies.kyverno.io/severity: medium
     policies.kyverno.io/subject: HelmRelease, Kustomization
     policies.kyverno.io/description: >-
-      Defaults spec.driftDetection.mode to enabled on every HelmRelease so that
-      helm-controller re-checks chart-applied objects against the stored release
-      manifest each interval. The dry-run in that check passes through Kyverno's
-      admission webhook, so a changed admission mutation reaches Helm-shipped
-      objects without a mutate-existing pass. Also defaults an ignore entry that
-      excludes coordination.k8s.io Leases entirely, since their holders rewrite
-      them by design.
-      Both patches are add-if-absent, so a HelmRelease that states a mode or an
-      ignore list keeps it, and one that states its own ignore list must carry
-      the Lease entry itself.
+      Defaults spec.driftDetection.mode to enabled on every HelmRelease so that helm-controller re-checks chart-applied objects against the stored release manifest each interval. The dry-run in that check passes through Kyverno's admission webhook, so a changed admission mutation reaches Helm-shipped objects without a mutate-existing pass. Also defaults an ignore entry that excludes coordination.k8s.io Leases entirely, since their holders rewrite them by design. Both patches are add-if-absent, so a HelmRelease that states a mode or an ignore list keeps it, and one that states its own ignore list must carry the Lease entry itself.
 spec:
   background: false
   webhookConfiguration:
@@ -106,11 +97,7 @@ metadata:
     policies.kyverno.io/severity: medium
     policies.kyverno.io/subject: All kinds
     policies.kyverno.io/description: >-
-      Adds kustomize.toolkit.fluxcd.io/force=Enabled, if absent, to every object
-      kustomize-controller applies, so an immutable-field or invalid apply is
-      recreated, except PVCs, CNPG Clusters, Secrets, CRDs, Namespaces,
-      Kustomizations, HelmReleases and anything labelled stateful=true, whose
-      recreation would delete data. projects#913.
+      Adds kustomize.toolkit.fluxcd.io/force=Enabled, if absent, to every object kustomize-controller applies, so an immutable-field or invalid apply is recreated. Stateful objects are left to stateful-labelling, which sets force=Disabled on them, and anything labelled stateful=true is skipped. Namespaces, CRDs, Kustomizations and HelmReleases are never forced because recreating one deletes everything inside it. projects#913.
 spec:
   background: false
   webhookConfiguration:
@@ -132,10 +119,7 @@ spec:
         any:
           - resources:
               kinds:
-                - v1/PersistentVolumeClaim
-                - v1/Secret
                 - v1/Namespace
-                - postgresql.cnpg.io/v1/Cluster
                 - apiextensions.k8s.io/v1/CustomResourceDefinition
                 - kustomize.toolkit.fluxcd.io/v1/Kustomization
                 - helm.toolkit.fluxcd.io/v2/HelmRelease
