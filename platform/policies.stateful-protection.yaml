@@ -14,7 +14,7 @@ metadata:
     policies.kyverno.io/category: Resiliency
     policies.kyverno.io/severity: high
     policies.kyverno.io/subject: All kinds
-    policies.kyverno.io/description: Denies deleting any object labelled stateful=true, deleting a Namespace, Kustomization or HelmRelease that holds one, and changing or removing that label, unless the request comes from Flux, the CNPG operator, Crossplane, Kyverno or the Kubernetes garbage and namespace controllers. projects#913.
+    policies.kyverno.io/description: 'Defines what holds stateful data, once: any object labelled stateful=true, and any Namespace, Kustomization (at any depth), HelmRelease or CNPG Cluster CRD that holds one. Denies deleting these, and denies the finalizer-clearer removing their finalizers, unless the request comes from Flux, the CNPG operator, Crossplane, Kyverno or the Kubernetes garbage and namespace controllers. Also denies changing or removing the stateful label. projects#913.'
 spec:
   background: false
   webhookConfiguration:
@@ -29,6 +29,15 @@ spec:
                 - '*'
               operations:
                 - DELETE
+          - resources:
+              kinds:
+                - '*'
+              operations:
+                - UPDATE
+            subjects:
+              - kind: ServiceAccount
+                name: finalizer-clearer
+                namespace: cluster-main-observability
       exclude:
         any:
           - subjects:
@@ -138,6 +147,15 @@ spec:
                 - Namespace
               operations:
                 - DELETE
+          - resources:
+              kinds:
+                - Namespace
+              operations:
+                - UPDATE
+            subjects:
+              - kind: ServiceAccount
+                name: finalizer-clearer
+                namespace: cluster-main-observability
       exclude:
         any:
           - subjects:
@@ -209,6 +227,15 @@ spec:
                 - kustomize.toolkit.fluxcd.io/v1/Kustomization
               operations:
                 - DELETE
+          - resources:
+              kinds:
+                - kustomize.toolkit.fluxcd.io/v1/Kustomization
+              operations:
+                - UPDATE
+            subjects:
+              - kind: ServiceAccount
+                name: finalizer-clearer
+                namespace: cluster-main-observability
       exclude:
         any:
           - subjects:
@@ -283,6 +310,15 @@ spec:
                 - kustomize.toolkit.fluxcd.io/v1/Kustomization
               operations:
                 - DELETE
+          - resources:
+              kinds:
+                - kustomize.toolkit.fluxcd.io/v1/Kustomization
+              operations:
+                - UPDATE
+            subjects:
+              - kind: ServiceAccount
+                name: finalizer-clearer
+                namespace: cluster-main-observability
       exclude:
         any:
           - subjects:
@@ -391,6 +427,15 @@ spec:
                 - kustomize.toolkit.fluxcd.io/v1/Kustomization
               operations:
                 - DELETE
+          - resources:
+              kinds:
+                - kustomize.toolkit.fluxcd.io/v1/Kustomization
+              operations:
+                - UPDATE
+            subjects:
+              - kind: ServiceAccount
+                name: finalizer-clearer
+                namespace: cluster-main-observability
       exclude:
         any:
           - subjects:
@@ -499,6 +544,15 @@ spec:
                 - kustomize.toolkit.fluxcd.io/v1/Kustomization
               operations:
                 - DELETE
+          - resources:
+              kinds:
+                - kustomize.toolkit.fluxcd.io/v1/Kustomization
+              operations:
+                - UPDATE
+            subjects:
+              - kind: ServiceAccount
+                name: finalizer-clearer
+                namespace: cluster-main-observability
       exclude:
         any:
           - subjects:
@@ -607,6 +661,15 @@ spec:
                 - helm.toolkit.fluxcd.io/v2/HelmRelease
               operations:
                 - DELETE
+          - resources:
+              kinds:
+                - helm.toolkit.fluxcd.io/v2/HelmRelease
+              operations:
+                - UPDATE
+            subjects:
+              - kind: ServiceAccount
+                name: finalizer-clearer
+                namespace: cluster-main-observability
       exclude:
         any:
           - subjects:
@@ -683,6 +746,17 @@ spec:
                 - DELETE
               names:
                 - clusters.postgresql.cnpg.io
+          - resources:
+              kinds:
+                - apiextensions.k8s.io/v1/CustomResourceDefinition
+              operations:
+                - UPDATE
+              names:
+                - clusters.postgresql.cnpg.io
+            subjects:
+              - kind: ServiceAccount
+                name: finalizer-clearer
+                namespace: cluster-main-observability
       exclude:
         any:
           - subjects:

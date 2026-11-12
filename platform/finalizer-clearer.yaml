@@ -159,13 +159,7 @@ metadata:
     capability: resiliency
   annotations:
     description: >-
-      Every 5 minutes, removes the finalizers from objects stuck deleting for
-      longer than DEFAULT_TIMEOUT_MINUTES, or the object's self-heal-timeout
-      label (e.g. 30m, 2h). Skips anything labelled stateful=true, anything in
-      a namespace holding a stateful PVC or CNPG Cluster, and all Secrets,
-      PVCs, PVs, CRDs, FluxInstances, CNPG and Kyverno objects. An admission
-      policy limits it to objects already deleting, with spec unchanged. Each cleared object is logged as one JSON line.
-      projects#913.
+      Every 5 minutes, removes the finalizers from objects stuck deleting for longer than DEFAULT_TIMEOUT_MINUTES, or the object's self-heal-timeout label (e.g. 30m, 2h). What is stateful is decided only by the Kyverno policy stateful-protection, which refuses this job's patch on anything it protects; those are logged as skip-stateful. Never touches Secrets, PVCs, PVs, CRDs, FluxInstances, CNPG or Kyverno objects. An admission policy limits it to objects already deleting, with spec unchanged. Each cleared object is logged as one JSON line. projects#913.
 spec:
   schedule: "*/5 * * * *"
   concurrencyPolicy: Forbid

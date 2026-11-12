@@ -18,6 +18,7 @@ SKIP_KINDS = {
     ("apiextensions.k8s.io", "customresourcedefinitions"),
     ("fluxcd.controlplane.io", "fluxinstances"),
 }
+STATEFUL_POLICY = "stateful-protection"
 SKIP_GROUPS = {"postgresql.cnpg.io", "kyverno.io"}
 DURATION_RE = re.compile(r"^(?P<value>[0-9]+)(?P<unit>[smhd]?)$")
 UNIT_SECONDS = {"": 60, "s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -42,25 +43,6 @@ def timeout_seconds(obj, default):
     if not match:
         return default
     return int(match.group("value")) * UNIT_SECONDS[match.group("unit")]
-
-
-def is_stateful(obj):
-    return ((obj.get("metadata") or {}).get("labels") or {}).get("stateful") == "true"
-
-
-def stateful_namespaces(client):
-    names = set()
-    for group, resource in (("", "persistentvolumeclaims"), ("postgresql.cnpg.io", "clusters")):
-        items = client.list_resource(group, resource)
-        if items is None:
-            return None
-        for obj in items:
-            if is_stateful(obj):
-                names.add(obj["metadata"].get("namespace"))
-    for ns in client.list_resource("", "namespaces") or []:
-        if is_stateful(ns):
-            names.add(ns["metadata"]["name"])
-    return names
 
 
 def object_path(client, group, resource, obj):
@@ -107,11 +89,6 @@ def main():
     client = Client.in_cluster()
     now = datetime.now(timezone.utc)
     default = default_timeout_seconds()
-    protected_namespaces = stateful_namespaces(client)
-    if protected_namespaces is None:
-        log("abort", reason="cannot list stateful objects", unverifiable=client.unverifiable)
-        return 1
-
     cleared = 0
     failed = 0
     for group, resource, obj in candidates(client):
@@ -130,14 +107,6 @@ def main():
             "finalizers": meta.get("finalizers"),
             "stuck_seconds": int(age),
         }
-        if is_stateful(obj):
-            log("skip-stateful", **ident)
-            continue
-        if meta.get("namespace") in protected_namespaces or (
-            resource == "namespaces" and meta.get("name") in protected_namespaces
-        ):
-            log("skip-stateful-namespace", **ident)
-            continue
         path = object_path(client, group, resource, obj)
         if path is None:
             continue
@@ -146,8 +115,12 @@ def main():
             cleared += 1
             log("cleared", **ident)
         except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")
+            if STATEFUL_POLICY in detail:
+                log("skip-stateful", **ident)
+                continue
             failed += 1
-            log("clear-failed", status=exc.code, detail=exc.read().decode("utf-8", "replace")[:300], **ident)
+            log("clear-failed", status=exc.code, detail=detail[:300], **ident)
 
     log("done", cleared=cleared, failed=failed, unverifiable=len(client.unverifiable))
     return 1 if failed else 0
