@@ -1,0 +1,147 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: stateful-protection
+  labels:
+    app.kubernetes.io/name: stateful-protection
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: governance
+  annotations:
+    policies.kyverno.io/title: Protect stateful objects
+    policies.kyverno.io/category: Resiliency
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: All kinds
+    policies.kyverno.io/description: >-
+      Denies deleting any object labelled stateful=true, and denies changing or
+      removing that label, unless the request comes from Flux, the CNPG
+      operator, Crossplane, Kyverno or the Kubernetes garbage and namespace
+      controllers. Pods and Services are skipped while older CNPG labels on
+      them are cleared. projects#913.
+spec:
+  background: false
+  webhookConfiguration:
+    failurePolicy: Ignore
+  rules:
+    - name: deny-delete-stateful
+      match:
+        any:
+          - resources:
+              kinds:
+                - "*"
+              operations:
+                - DELETE
+      exclude:
+        any:
+          - resources:
+              kinds:
+                - Pod
+                - Service
+          - subjects:
+              - kind: ServiceAccount
+                name: kustomize-controller
+                namespace: flux-system
+              - kind: ServiceAccount
+                name: helm-controller
+                namespace: flux-system
+              - kind: ServiceAccount
+                name: cnpg-cloudnative-pg
+                namespace: cnpg-system
+              - kind: ServiceAccount
+                name: crossplane
+                namespace: crossplane-system
+              - kind: ServiceAccount
+                name: kyverno-admission-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-cleanup-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-background-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-reports-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: generic-garbage-collector
+                namespace: kube-system
+              - kind: ServiceAccount
+                name: namespace-controller
+                namespace: kube-system
+              - kind: User
+                name: system:kube-controller-manager
+      preconditions:
+        all:
+          - key: "{{ request.oldObject.metadata.labels.stateful || '' }}"
+            operator: Equals
+            value: "true"
+      validate:
+        failureAction: Enforce
+        message: >-
+          A policy blocks this delete because deleting it would delete a
+          stateful resource: {{ request.oldObject.kind }}/{{ request.oldObject.metadata.name }}.
+          To delete it, remove it from Git and let Flux prune it.
+        deny: {}
+    - name: deny-stateful-label-change
+      match:
+        any:
+          - resources:
+              kinds:
+                - "*"
+              operations:
+                - UPDATE
+      exclude:
+        any:
+          - resources:
+              kinds:
+                - Pod
+                - Service
+                - Lease
+                - Endpoints
+                - EndpointSlice
+          - subjects:
+              - kind: ServiceAccount
+                name: kustomize-controller
+                namespace: flux-system
+              - kind: ServiceAccount
+                name: helm-controller
+                namespace: flux-system
+              - kind: ServiceAccount
+                name: cnpg-cloudnative-pg
+                namespace: cnpg-system
+              - kind: ServiceAccount
+                name: crossplane
+                namespace: crossplane-system
+              - kind: ServiceAccount
+                name: kyverno-admission-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-cleanup-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-background-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-reports-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: generic-garbage-collector
+                namespace: kube-system
+              - kind: ServiceAccount
+                name: namespace-controller
+                namespace: kube-system
+              - kind: User
+                name: system:kube-controller-manager
+      preconditions:
+        all:
+          - key: "{{ request.oldObject.metadata.labels.stateful || '' }}"
+            operator: NotEquals
+            value: "{{ request.object.metadata.labels.stateful || '' }}"
+      validate:
+        failureAction: Enforce
+        message: >-
+          A policy blocks this change because only Kyverno sets the stateful
+          label: {{ request.object.kind }}/{{ request.object.metadata.name }}.
+        deny: {}

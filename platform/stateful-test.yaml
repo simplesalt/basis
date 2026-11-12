@@ -1,0 +1,25 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stateful-test-protected
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/name: stateful-test
+    entity: cluster
+    capability: governance
+    stateful: "true"
+data:
+  purpose: projects-913-delete-block-test
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stateful-test-plain
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/name: stateful-test
+    entity: cluster
+    capability: governance
+data:
+  purpose: projects-913-delete-block-test
