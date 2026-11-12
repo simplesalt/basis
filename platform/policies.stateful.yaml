@@ -15,11 +15,11 @@ metadata:
     policies.kyverno.io/severity: high
     policies.kyverno.io/subject: Cluster, PersistentVolumeClaim, Secret
     policies.kyverno.io/description: >-
-      Adds the label stateful=yes, unless the object already sets stateful, and the annotation
+      Adds the label stateful=true, unless the object already sets stateful, and the annotation
       kustomize.toolkit.fluxcd.io/force=Disabled at admission to CNPG
-      Clusters, PVCs and Secrets other than Helm release storage. stateful=no on
+      Clusters, PVCs and Secrets other than Helm release storage. stateful=false on
       any of them opts it out, and a PVC annotated storage-tier ephemeral
-      defaults to stateful=no. projects#913.
+      defaults to stateful=false. projects#913.
 spec:
   background: false
   webhookConfiguration:
@@ -38,7 +38,7 @@ spec:
         patchStrategicMerge:
           metadata:
             labels:
-              +(stateful): "yes"
+              +(stateful): "true"
             annotations:
               kustomize.toolkit.fluxcd.io/force: Disabled
     - name: label-pvcs
@@ -59,7 +59,7 @@ spec:
         patchStrategicMerge:
           metadata:
             labels:
-              +(stateful): "yes"
+              +(stateful): "true"
             annotations:
               kustomize.toolkit.fluxcd.io/force: Disabled
     - name: label-ephemeral-pvcs
@@ -80,7 +80,7 @@ spec:
         patchStrategicMerge:
           metadata:
             labels:
-              +(stateful): "no"
+              +(stateful): "false"
     - name: label-secrets
       match:
         any:
@@ -99,6 +99,6 @@ spec:
         patchStrategicMerge:
           metadata:
             labels:
-              +(stateful): "yes"
+              +(stateful): "true"
             annotations:
               kustomize.toolkit.fluxcd.io/force: Disabled

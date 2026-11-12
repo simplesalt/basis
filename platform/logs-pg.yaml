@@ -11,7 +11,7 @@ metadata:
     entity: cluster
     env: main
     capability: observability
-    stateful: "yes"
+    stateful: "true"
 spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
 
