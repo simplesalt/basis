@@ -73,7 +73,6 @@ spec:
           - key: "{{ request.oldObject.metadata.labels.stateful || '' }}"
             operator: Equals
             value: "true"
-        any: []
       validate:
         failureAction: Enforce
         message: >-
@@ -134,7 +133,6 @@ spec:
           - key: "{{ request.oldObject.metadata.labels.stateful || '' }}"
             operator: NotEquals
             value: "{{ request.object.metadata.labels.stateful || '' }}"
-        any: []
       validate:
         failureAction: Enforce
         message: >-
