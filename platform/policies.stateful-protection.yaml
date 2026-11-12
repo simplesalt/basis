@@ -477,3 +477,63 @@ spec:
         message: >-
           A policy blocks this delete because deleting it would delete a stateful resource managed by HelmRelease/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
         deny: {}
+    - name: deny-delete-cnpg-crd-holding-stateful
+      match:
+        any:
+          - resources:
+              kinds:
+                - apiextensions.k8s.io/v1/CustomResourceDefinition
+              operations:
+                - DELETE
+              names:
+                - clusters.postgresql.cnpg.io
+      exclude:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: kustomize-controller
+                namespace: flux-system
+              - kind: ServiceAccount
+                name: helm-controller
+                namespace: flux-system
+              - kind: ServiceAccount
+                name: cnpg-cloudnative-pg
+                namespace: cnpg-system
+              - kind: ServiceAccount
+                name: crossplane
+                namespace: crossplane-system
+              - kind: ServiceAccount
+                name: kyverno-admission-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-cleanup-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-background-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-reports-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: generic-garbage-collector
+                namespace: kube-system
+              - kind: ServiceAccount
+                name: namespace-controller
+                namespace: kube-system
+              - kind: User
+                name: system:kube-controller-manager
+      context:
+        - name: statefulClusters
+          apiCall:
+            urlPath: "/apis/postgresql.cnpg.io/v1/clusters?labelSelector=stateful%3Dtrue"
+            jmesPath: "items[].join('/', [metadata.namespace, metadata.name])"
+      validate:
+        failureAction: Enforce
+        message: >-
+          A policy blocks this delete because deleting it would delete stateful resources: Cluster {{ join(', ', statefulClusters) }}. To delete it, remove it from Git and let Flux prune it.
+        deny:
+          conditions:
+            any:
+              - key: "{{ length(statefulClusters) }}"
+                operator: GreaterThan
+                value: 0
