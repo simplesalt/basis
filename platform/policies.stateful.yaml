@@ -102,3 +102,22 @@ spec:
               stateful: "true"
             annotations:
               kustomize.toolkit.fluxcd.io/force: Disabled
+    - name: strip-stateful-from-pods-and-services
+      match:
+        any:
+          - resources:
+              kinds:
+                - v1/Pod
+                - v1/Service
+              operations:
+                - CREATE
+                - UPDATE
+      preconditions:
+        all:
+          - key: "{{ request.object.metadata.labels.stateful || '' }}"
+            operator: NotEquals
+            value: ""
+      mutate:
+        patchesJson6902: |-
+          - op: remove
+            path: /metadata/labels/stateful
