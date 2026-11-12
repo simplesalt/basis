@@ -89,3 +89,63 @@ spec:
                 +(retries): 3
                 +(remediateLastFailure): true
                 +(strategy): rollback
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: flux-force-opt-in
+  labels:
+    app.kubernetes.io/name: flux-force-opt-in
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: governance
+  annotations:
+    policies.kyverno.io/title: Flux force opt-in
+    policies.kyverno.io/category: GitOps
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: All kinds
+    policies.kyverno.io/description: >-
+      Adds kustomize.toolkit.fluxcd.io/force=Enabled, if absent, to every object
+      kustomize-controller applies, so an immutable-field or invalid apply is
+      recreated, except PVCs, CNPG Clusters, Secrets, CRDs, Namespaces,
+      Kustomizations, HelmReleases and anything labelled stateful=true, whose
+      recreation would delete data. projects#913.
+spec:
+  background: false
+  webhookConfiguration:
+    failurePolicy: Ignore
+    matchConditions:
+      - name: kustomize-controller
+        expression: request.userInfo.username == "system:serviceaccount:flux-system:kustomize-controller"
+  rules:
+    - name: force-non-stateful
+      match:
+        any:
+          - resources:
+              kinds:
+                - "*"
+              operations:
+                - CREATE
+                - UPDATE
+      exclude:
+        any:
+          - resources:
+              kinds:
+                - v1/PersistentVolumeClaim
+                - v1/Secret
+                - v1/Namespace
+                - postgresql.cnpg.io/v1/Cluster
+                - apiextensions.k8s.io/v1/CustomResourceDefinition
+                - kustomize.toolkit.fluxcd.io/v1/Kustomization
+                - helm.toolkit.fluxcd.io/v2/HelmRelease
+      preconditions:
+        all:
+          - key: "{{ request.object.metadata.labels.stateful || '' }}"
+            operator: NotEquals
+            value: "true"
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            annotations:
+              +(kustomize.toolkit.fluxcd.io/force): Enabled
