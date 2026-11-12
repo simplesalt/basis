@@ -4,6 +4,7 @@ resources:
   - alert-logger.yaml
   - cluster-health.yaml
   - cnpg-monitoring.yaml
+  - finalizer-clearer.yaml
   - fluent-bit.yaml
   - human-operator.yaml
   - kured-gate.yaml
@@ -107,3 +108,14 @@ configMapGenerator:
         entity: cluster
         env: main
         capability: identity
+  - name: finalizer-clearer-script
+    namespace: cluster-main-observability
+    files:
+      - clear.py=finalizer-clearer/clear.py
+    options:
+      labels:
+        app.kubernetes.io/name: finalizer-clearer
+        app.kubernetes.io/part-of: basis
+        app.kubernetes.io/component: self-heal
+        entity: cluster
+        capability: resiliency
