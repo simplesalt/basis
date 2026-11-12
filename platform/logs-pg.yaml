@@ -13,6 +13,9 @@ metadata:
     capability: observability
 spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:17.11-202609210816-standard-trixie
+  inheritedMetadata:
+    annotations:
+      kyverno-relabel: "2026-11-12"
 
   minSyncReplicas: 0
   maxSyncReplicas: 0
