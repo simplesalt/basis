@@ -1,0 +1,16 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stateful-clearer-test
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: stateful-clearer-test
+    entity: cluster
+    capability: governance
+    stateful: "true"
+    self-heal-timeout: 1m
+  finalizers:
+    - simplesalt.company/test-never
+data:
+  purpose: test
