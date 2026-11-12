@@ -1,0 +1,94 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: stateful-labelling
+  labels:
+    app.kubernetes.io/name: stateful-labelling
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: governance
+  annotations:
+    policies.kyverno.io/title: Label stateful objects
+    policies.kyverno.io/category: Resiliency
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Cluster, PersistentVolumeClaim, PersistentVolume, Secret, Crossplane credential resources
+    policies.kyverno.io/description: >-
+      Adds the label stateful=true and the annotation
+      kustomize.toolkit.fluxcd.io/force=Disabled at admission to every object
+      whose loss is unrecoverable: CNPG Clusters, PVCs, PVs, Secrets other than
+      Helm release storage, and Crossplane managed resources that mint or
+      publish credentials. projects#913.
+spec:
+  background: false
+  webhookConfiguration:
+    failurePolicy: Ignore
+  rules:
+    - name: label-stateful-kinds
+      match:
+        any:
+          - resources:
+              kinds:
+                - postgresql.cnpg.io/v1/Cluster
+                - v1/PersistentVolumeClaim
+                - v1/PersistentVolume
+                - cloudplatform.gcp.upbound.io/v1beta1/ServiceAccountKey
+                - cloudplatform.gcp.m.upbound.io/v1beta1/ServiceAccountKey
+                - zero.upjet-cloudflare.upbound.io/v1alpha1/TrustTunnelCloudflared
+                - zero.upjet-cloudflare.m.upbound.io/v1alpha1/TrustTunnelCloudflared
+                - zero.upjet-cloudflare.upbound.io/v1alpha1/TrustAccessServiceToken
+                - zero.upjet-cloudflare.m.upbound.io/v1alpha1/TrustAccessServiceToken
+              operations:
+                - CREATE
+                - UPDATE
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            labels:
+              stateful: "true"
+            annotations:
+              kustomize.toolkit.fluxcd.io/force: Disabled
+    - name: label-secrets
+      match:
+        any:
+          - resources:
+              kinds:
+                - v1/Secret
+              operations:
+                - CREATE
+                - UPDATE
+      preconditions:
+        all:
+          - key: "{{ request.object.type || '' }}"
+            operator: NotEquals
+            value: helm.sh/release.v1
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            labels:
+              stateful: "true"
+            annotations:
+              kustomize.toolkit.fluxcd.io/force: Disabled
+    - name: label-connection-secret-writers
+      match:
+        any:
+          - resources:
+              kinds:
+                - zero.upjet-cloudflare.upbound.io/v1alpha1/TrustAccessApplication
+                - zero.upjet-cloudflare.m.upbound.io/v1alpha1/TrustAccessApplication
+              operations:
+                - CREATE
+                - UPDATE
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.writeConnectionSecretToRef.name || '' }}"
+            operator: NotEquals
+            value: ""
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            labels:
+              stateful: "true"
+            annotations:
+              kustomize.toolkit.fluxcd.io/force: Disabled

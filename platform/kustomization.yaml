@@ -21,8 +21,8 @@ resources:
   - policies.resiliency.yaml
   - policies.scheduling.yaml
   - policies.secrets.yaml
+  - policies.stateful.yaml
   - policies.storage.yaml
-
 configMapGenerator:
   - name: logs-schema
     namespace: cluster-main-observability
