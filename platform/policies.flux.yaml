@@ -61,7 +61,7 @@ spec:
       mutate:
         patchStrategicMerge:
           spec:
-            force: true
+            force: false
             +(timeout): 10m
             +(retryInterval): 1m
     - name: helmrelease-remediation
