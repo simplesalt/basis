@@ -41,6 +41,7 @@ spec:
   interval: 1m
   path: ./platform
   prune: true
+  wait: true
   sourceRef:
     kind: GitRepository
     name: ss-basis
