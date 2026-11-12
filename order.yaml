@@ -4,6 +4,8 @@ kind: Kustomization
 metadata:
   name: ss-basis-operators
   namespace: flux-system
+  labels:
+    kyverno-relabel: "2026-11-12"
 spec:
   interval: 1m
   path: ./operators
@@ -35,6 +37,8 @@ kind: Kustomization
 metadata:
   name: ss-basis-platform
   namespace: flux-system
+  labels:
+    kyverno-relabel: "2026-11-12"
 spec:
   dependsOn:
     - name: ss-basis-operators
