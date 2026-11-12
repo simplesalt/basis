@@ -15,7 +15,7 @@ metadata:
     policies.kyverno.io/severity: high
     policies.kyverno.io/subject: All kinds
     policies.kyverno.io/description: >-
-      Denies deleting any object labelled stateful=true, deleting a Namespace, Kustomization or HelmRelease that holds one, and changing or removing that label, unless the request comes from Flux, the CNPG operator, Crossplane, Kyverno or the Kubernetes garbage and namespace controllers. Pods and Services are skipped while older CNPG labels on them are cleared. projects#913.
+      Denies deleting any object labelled stateful=true, deleting a Namespace, Kustomization or HelmRelease that holds one, and changing or removing that label, unless the request comes from Flux, the CNPG operator, Crossplane, Kyverno or the Kubernetes garbage and namespace controllers. projects#913.
 spec:
   background: false
   webhookConfiguration:
@@ -31,10 +31,6 @@ spec:
                 - DELETE
       exclude:
         any:
-          - resources:
-              kinds:
-                - Pod
-                - Service
           - subjects:
               - kind: ServiceAccount
                 name: kustomize-controller
@@ -90,8 +86,6 @@ spec:
         any:
           - resources:
               kinds:
-                - Pod
-                - Service
                 - Lease
                 - Endpoints
                 - EndpointSlice
