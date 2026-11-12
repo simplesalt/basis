@@ -12,7 +12,7 @@ metadata:
     capability: governance
 rules:
   - apiGroups: [""]
-    resources: ["persistentvolumeclaims", "namespaces"]
+    resources: ["persistentvolumeclaims", "namespaces", "secrets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters"]

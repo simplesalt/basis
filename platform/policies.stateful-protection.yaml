@@ -14,19 +14,19 @@ metadata:
     policies.kyverno.io/category: Resiliency
     policies.kyverno.io/severity: high
     policies.kyverno.io/subject: All kinds
-    policies.kyverno.io/description: >-
-      Denies deleting any object labelled stateful=true, deleting a Namespace, Kustomization or HelmRelease that holds one, and changing or removing that label, unless the request comes from Flux, the CNPG operator, Crossplane, Kyverno or the Kubernetes garbage and namespace controllers. projects#913.
+    policies.kyverno.io/description: Denies deleting any object labelled stateful=true, deleting a Namespace, Kustomization or HelmRelease that holds one, and changing or removing that label, unless the request comes from Flux, the CNPG operator, Crossplane, Kyverno or the Kubernetes garbage and namespace controllers. projects#913.
 spec:
   background: false
   webhookConfiguration:
     failurePolicy: Ignore
+    timeoutSeconds: 30
   rules:
     - name: deny-delete-stateful
       match:
         any:
           - resources:
               kinds:
-                - "*"
+                - '*'
               operations:
                 - DELETE
       exclude:
@@ -66,20 +66,19 @@ spec:
                 name: system:kube-controller-manager
       preconditions:
         all:
-          - key: "{{ request.oldObject.metadata.labels.stateful || '' }}"
+          - key: '{{ request.oldObject.metadata.labels.stateful || '''' }}'
             operator: Equals
             value: "true"
       validate:
         failureAction: Enforce
-        message: >-
-          A policy blocks this delete because deleting it would delete a stateful resource: {{ request.oldObject.kind }}/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
+        message: 'A policy blocks this delete because deleting it would delete a stateful resource: {{ request.oldObject.kind }}/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.'
         deny: {}
     - name: deny-stateful-label-change
       match:
         any:
           - resources:
               kinds:
-                - "*"
+                - '*'
               operations:
                 - UPDATE
       exclude:
@@ -124,13 +123,12 @@ spec:
                 name: system:kube-controller-manager
       preconditions:
         all:
-          - key: "{{ request.oldObject.metadata.labels.stateful || '' }}"
+          - key: '{{ request.oldObject.metadata.labels.stateful || '''' }}'
             operator: NotEquals
-            value: "{{ request.object.metadata.labels.stateful || '' }}"
+            value: '{{ request.object.metadata.labels.stateful || '''' }}'
       validate:
         failureAction: Enforce
-        message: >-
-          A policy blocks this change because only Kyverno sets the stateful label: {{ request.object.kind }}/{{ request.object.metadata.name }}.
+        message: 'A policy blocks this change because only Kyverno sets the stateful label: {{ request.object.kind }}/{{ request.object.metadata.name }}.'
         deny: {}
     - name: deny-delete-namespace-holding-stateful
       match:
@@ -178,24 +176,30 @@ spec:
       context:
         - name: pvcCount
           apiCall:
-            urlPath: "/api/v1/namespaces/{{ request.oldObject.metadata.name }}/persistentvolumeclaims?labelSelector=stateful%3Dtrue"
-            jmesPath: "items | length(@)"
+            urlPath: /api/v1/namespaces/{{ request.oldObject.metadata.name }}/persistentvolumeclaims?labelSelector=stateful%3Dtrue
+            jmesPath: items | length(@)
+        - name: secretCount
+          apiCall:
+            urlPath: /api/v1/namespaces/{{ request.oldObject.metadata.name }}/secrets?labelSelector=stateful%3Dtrue
+            jmesPath: items | length(@)
         - name: clusterCount
           apiCall:
-            urlPath: "/apis/postgresql.cnpg.io/v1/namespaces/{{ request.oldObject.metadata.name }}/clusters?labelSelector=stateful%3Dtrue"
-            jmesPath: "items | length(@)"
+            urlPath: /apis/postgresql.cnpg.io/v1/namespaces/{{ request.oldObject.metadata.name }}/clusters?labelSelector=stateful%3Dtrue
+            jmesPath: items | length(@)
       preconditions:
         any:
-          - key: "{{ pvcCount }}"
+          - key: '{{ pvcCount }}'
             operator: GreaterThan
             value: 0
-          - key: "{{ clusterCount }}"
+          - key: '{{ clusterCount }}'
+            operator: GreaterThan
+            value: 0
+          - key: '{{ secretCount }}'
             operator: GreaterThan
             value: 0
       validate:
         failureAction: Enforce
-        message: >-
-          A policy blocks this delete because deleting it would delete a stateful resource inside Namespace/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
+        message: A policy blocks this delete because deleting it would delete a stateful resource inside Namespace/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
         deny: {}
     - name: deny-delete-kustomization-holding-stateful
       match:
@@ -243,29 +247,35 @@ spec:
       context:
         - name: owner
           variable:
-            value: "kustomize.toolkit.fluxcd.io%2Fname%3D{{ request.oldObject.metadata.name }}%2Ckustomize.toolkit.fluxcd.io%2Fnamespace%3D{{ request.oldObject.metadata.namespace }}"
+            value: kustomize.toolkit.fluxcd.io%2Fname%3D{{ request.oldObject.metadata.name }}%2Ckustomize.toolkit.fluxcd.io%2Fnamespace%3D{{ request.oldObject.metadata.namespace }}
         - name: pvcCount
           apiCall:
-            urlPath: "/api/v1/persistentvolumeclaims?labelSelector=stateful%3Dtrue%2C{{ owner }}"
-            jmesPath: "items | length(@)"
+            urlPath: /api/v1/persistentvolumeclaims?labelSelector=stateful%3Dtrue%2C{{ owner }}
+            jmesPath: items | length(@)
+        - name: secretCount
+          apiCall:
+            urlPath: /api/v1/secrets?labelSelector=stateful%3Dtrue%2C{{ owner }}
+            jmesPath: items | length(@)
         - name: clusterCount
           apiCall:
-            urlPath: "/apis/postgresql.cnpg.io/v1/clusters?labelSelector=stateful%3Dtrue%2C{{ owner }}"
-            jmesPath: "items | length(@)"
+            urlPath: /apis/postgresql.cnpg.io/v1/clusters?labelSelector=stateful%3Dtrue%2C{{ owner }}
+            jmesPath: items | length(@)
       preconditions:
         any:
-          - key: "{{ pvcCount }}"
+          - key: '{{ pvcCount }}'
             operator: GreaterThan
             value: 0
-          - key: "{{ clusterCount }}"
+          - key: '{{ clusterCount }}'
+            operator: GreaterThan
+            value: 0
+          - key: '{{ secretCount }}'
             operator: GreaterThan
             value: 0
       validate:
         failureAction: Enforce
-        message: >-
-          A policy blocks this delete because deleting it would delete a stateful resource managed by Kustomization/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
+        message: A policy blocks this delete because deleting it would delete a stateful resource managed by Kustomization/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
         deny: {}
-    - name: deny-delete-kustomization-owning-namespace-holding-stateful
+    - name: deny-delete-kustomization-above-stateful
       match:
         any:
           - resources:
@@ -309,35 +319,71 @@ spec:
               - kind: User
                 name: system:kube-controller-manager
       context:
-        - name: ownedNamespaces
+        - name: kustomizations
           apiCall:
-            urlPath: "/api/v1/namespaces?labelSelector=kustomize.toolkit.fluxcd.io%2Fname%3D{{ request.oldObject.metadata.name }}%2Ckustomize.toolkit.fluxcd.io%2Fnamespace%3D{{ request.oldObject.metadata.namespace }}"
-            jmesPath: "items[].metadata.name"
+            urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/kustomizations
+            jmesPath: 'items[].{n: metadata.namespace, m: metadata.name}'
       validate:
         failureAction: Enforce
-        message: >-
-          A policy blocks this delete because deleting it would delete a stateful resource inside a Namespace managed by Kustomization/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
+        message: A policy blocks this delete because deleting it would delete a stateful resource managed by a Kustomization under Kustomization/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
         foreach:
-          - list: "ownedNamespaces"
+          - list: kustomizations
             context:
+              - name: a1
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ element.n }}/kustomizations/{{ element.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a2
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a1.n }}/kustomizations/{{ a1.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a3
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a2.n }}/kustomizations/{{ a2.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a4
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a3.n }}/kustomizations/{{ a3.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a5
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a4.n }}/kustomizations/{{ a4.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
               - name: pvcCount
                 apiCall:
-                  urlPath: "/api/v1/namespaces/{{ element }}/persistentvolumeclaims?labelSelector=stateful%3Dtrue"
-                  jmesPath: "items | length(@)"
+                  urlPath: /api/v1/persistentvolumeclaims?labelSelector=stateful%3Dtrue%2Ckustomize.toolkit.fluxcd.io%2Fname%3D{{ element.m }}%2Ckustomize.toolkit.fluxcd.io%2Fnamespace%3D{{ element.n }}
+                  jmesPath: items | length(@)
+              - name: secretCount
+                apiCall:
+                  urlPath: /api/v1/secrets?labelSelector=stateful%3Dtrue%2Ckustomize.toolkit.fluxcd.io%2Fname%3D{{ element.m }}%2Ckustomize.toolkit.fluxcd.io%2Fnamespace%3D{{ element.n }}
+                  jmesPath: items | length(@)
               - name: clusterCount
                 apiCall:
-                  urlPath: "/apis/postgresql.cnpg.io/v1/namespaces/{{ element }}/clusters?labelSelector=stateful%3Dtrue"
-                  jmesPath: "items | length(@)"
+                  urlPath: /apis/postgresql.cnpg.io/v1/clusters?labelSelector=stateful%3Dtrue%2Ckustomize.toolkit.fluxcd.io%2Fname%3D{{ element.m }}%2Ckustomize.toolkit.fluxcd.io%2Fnamespace%3D{{ element.n }}
+                  jmesPath: items | length(@)
             deny:
               conditions:
+                all:
+                  - key: '{{ request.oldObject.metadata.namespace }}/{{ request.oldObject.metadata.name }}'
+                    operator: AnyIn
+                    value:
+                      - '{{ element.n }}/{{ element.m }}'
+                      - '{{ a1.n }}/{{ a1.m }}'
+                      - '{{ a2.n }}/{{ a2.m }}'
+                      - '{{ a3.n }}/{{ a3.m }}'
+                      - '{{ a4.n }}/{{ a4.m }}'
+                      - '{{ a5.n }}/{{ a5.m }}'
                 any:
-                  - key: "{{ pvcCount }}"
+                  - key: '{{ pvcCount }}'
                     operator: GreaterThan
                     value: 0
-                  - key: "{{ clusterCount }}"
+                  - key: '{{ secretCount }}'
                     operator: GreaterThan
                     value: 0
-    - name: deny-delete-kustomization-owning-kustomization-holding-stateful
+                  - key: '{{ clusterCount }}'
+                    operator: GreaterThan
+                    value: 0
+    - name: deny-delete-kustomization-above-helmrelease-holding-stateful
       match:
         any:
           - resources:
@@ -381,32 +427,176 @@ spec:
               - kind: User
                 name: system:kube-controller-manager
       context:
-        - name: children
+        - name: helmreleases
           apiCall:
-            urlPath: "/apis/kustomize.toolkit.fluxcd.io/v1/kustomizations?labelSelector=kustomize.toolkit.fluxcd.io%2Fname%3D{{ request.oldObject.metadata.name }}%2Ckustomize.toolkit.fluxcd.io%2Fnamespace%3D{{ request.oldObject.metadata.namespace }}"
-            jmesPath: "items[].{name: metadata.name, namespace: metadata.namespace}"
+            urlPath: /apis/helm.toolkit.fluxcd.io/v2/helmreleases
+            jmesPath: 'items[?metadata.labels."kustomize.toolkit.fluxcd.io/name"].{hn: metadata.namespace, hm: metadata.name, n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace", m: metadata.labels."kustomize.toolkit.fluxcd.io/name"}'
       validate:
         failureAction: Enforce
-        message: >-
-          A policy blocks this delete because deleting it would delete a stateful resource managed by a Kustomization under Kustomization/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
+        message: A policy blocks this delete because deleting it would delete a stateful resource managed by a HelmRelease under Kustomization/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
         foreach:
-          - list: "children"
+          - list: helmreleases
             context:
+              - name: a1
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ element.n }}/kustomizations/{{ element.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a2
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a1.n }}/kustomizations/{{ a1.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a3
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a2.n }}/kustomizations/{{ a2.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a4
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a3.n }}/kustomizations/{{ a3.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a5
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a4.n }}/kustomizations/{{ a4.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
               - name: pvcCount
                 apiCall:
-                  urlPath: "/api/v1/persistentvolumeclaims?labelSelector=stateful%3Dtrue%2Ckustomize.toolkit.fluxcd.io%2Fname%3D{{ element.name }}%2Ckustomize.toolkit.fluxcd.io%2Fnamespace%3D{{ element.namespace }}"
-                  jmesPath: "items | length(@)"
+                  urlPath: /api/v1/persistentvolumeclaims?labelSelector=stateful%3Dtrue%2Chelm.toolkit.fluxcd.io%2Fname%3D{{ element.hm }}%2Chelm.toolkit.fluxcd.io%2Fnamespace%3D{{ element.hn }}
+                  jmesPath: items | length(@)
+              - name: secretCount
+                apiCall:
+                  urlPath: /api/v1/secrets?labelSelector=stateful%3Dtrue%2Chelm.toolkit.fluxcd.io%2Fname%3D{{ element.hm }}%2Chelm.toolkit.fluxcd.io%2Fnamespace%3D{{ element.hn }}
+                  jmesPath: items | length(@)
               - name: clusterCount
                 apiCall:
-                  urlPath: "/apis/postgresql.cnpg.io/v1/clusters?labelSelector=stateful%3Dtrue%2Ckustomize.toolkit.fluxcd.io%2Fname%3D{{ element.name }}%2Ckustomize.toolkit.fluxcd.io%2Fnamespace%3D{{ element.namespace }}"
-                  jmesPath: "items | length(@)"
+                  urlPath: /apis/postgresql.cnpg.io/v1/clusters?labelSelector=stateful%3Dtrue%2Chelm.toolkit.fluxcd.io%2Fname%3D{{ element.hm }}%2Chelm.toolkit.fluxcd.io%2Fnamespace%3D{{ element.hn }}
+                  jmesPath: items | length(@)
             deny:
               conditions:
+                all:
+                  - key: '{{ request.oldObject.metadata.namespace }}/{{ request.oldObject.metadata.name }}'
+                    operator: AnyIn
+                    value:
+                      - '{{ element.n }}/{{ element.m }}'
+                      - '{{ a1.n }}/{{ a1.m }}'
+                      - '{{ a2.n }}/{{ a2.m }}'
+                      - '{{ a3.n }}/{{ a3.m }}'
+                      - '{{ a4.n }}/{{ a4.m }}'
+                      - '{{ a5.n }}/{{ a5.m }}'
                 any:
-                  - key: "{{ pvcCount }}"
+                  - key: '{{ pvcCount }}'
                     operator: GreaterThan
                     value: 0
-                  - key: "{{ clusterCount }}"
+                  - key: '{{ secretCount }}'
+                    operator: GreaterThan
+                    value: 0
+                  - key: '{{ clusterCount }}'
+                    operator: GreaterThan
+                    value: 0
+    - name: deny-delete-kustomization-above-namespace-holding-stateful
+      match:
+        any:
+          - resources:
+              kinds:
+                - kustomize.toolkit.fluxcd.io/v1/Kustomization
+              operations:
+                - DELETE
+      exclude:
+        any:
+          - subjects:
+              - kind: ServiceAccount
+                name: kustomize-controller
+                namespace: flux-system
+              - kind: ServiceAccount
+                name: helm-controller
+                namespace: flux-system
+              - kind: ServiceAccount
+                name: cnpg-cloudnative-pg
+                namespace: cnpg-system
+              - kind: ServiceAccount
+                name: crossplane
+                namespace: crossplane-system
+              - kind: ServiceAccount
+                name: kyverno-admission-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-cleanup-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-background-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: kyverno-reports-controller
+                namespace: kyverno
+              - kind: ServiceAccount
+                name: generic-garbage-collector
+                namespace: kube-system
+              - kind: ServiceAccount
+                name: namespace-controller
+                namespace: kube-system
+              - kind: User
+                name: system:kube-controller-manager
+      context:
+        - name: namespaces
+          apiCall:
+            urlPath: /api/v1/namespaces
+            jmesPath: 'items[?metadata.labels."kustomize.toolkit.fluxcd.io/name"].{ns: metadata.name, n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace", m: metadata.labels."kustomize.toolkit.fluxcd.io/name"}'
+      validate:
+        failureAction: Enforce
+        message: A policy blocks this delete because deleting it would delete a stateful resource inside a Namespace managed under Kustomization/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
+        foreach:
+          - list: namespaces
+            context:
+              - name: a1
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ element.n }}/kustomizations/{{ element.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a2
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a1.n }}/kustomizations/{{ a1.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a3
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a2.n }}/kustomizations/{{ a2.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a4
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a3.n }}/kustomizations/{{ a3.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: a5
+                apiCall:
+                  urlPath: /apis/kustomize.toolkit.fluxcd.io/v1/namespaces/{{ a4.n }}/kustomizations/{{ a4.m }}
+                  jmesPath: '{n: metadata.labels."kustomize.toolkit.fluxcd.io/namespace" || metadata.namespace, m: metadata.labels."kustomize.toolkit.fluxcd.io/name" || metadata.name}'
+              - name: pvcCount
+                apiCall:
+                  urlPath: /api/v1/namespaces/{{ element.ns }}/persistentvolumeclaims?labelSelector=stateful%3Dtrue
+                  jmesPath: items | length(@)
+              - name: secretCount
+                apiCall:
+                  urlPath: /api/v1/namespaces/{{ element.ns }}/secrets?labelSelector=stateful%3Dtrue
+                  jmesPath: items | length(@)
+              - name: clusterCount
+                apiCall:
+                  urlPath: /apis/postgresql.cnpg.io/v1/namespaces/{{ element.ns }}/clusters?labelSelector=stateful%3Dtrue
+                  jmesPath: items | length(@)
+            deny:
+              conditions:
+                all:
+                  - key: '{{ request.oldObject.metadata.namespace }}/{{ request.oldObject.metadata.name }}'
+                    operator: AnyIn
+                    value:
+                      - '{{ element.n }}/{{ element.m }}'
+                      - '{{ a1.n }}/{{ a1.m }}'
+                      - '{{ a2.n }}/{{ a2.m }}'
+                      - '{{ a3.n }}/{{ a3.m }}'
+                      - '{{ a4.n }}/{{ a4.m }}'
+                      - '{{ a5.n }}/{{ a5.m }}'
+                any:
+                  - key: '{{ pvcCount }}'
+                    operator: GreaterThan
+                    value: 0
+                  - key: '{{ secretCount }}'
+                    operator: GreaterThan
+                    value: 0
+                  - key: '{{ clusterCount }}'
                     operator: GreaterThan
                     value: 0
     - name: deny-delete-helmrelease-holding-stateful
@@ -455,27 +645,33 @@ spec:
       context:
         - name: owner
           variable:
-            value: "helm.toolkit.fluxcd.io%2Fname%3D{{ request.oldObject.metadata.name }}%2Chelm.toolkit.fluxcd.io%2Fnamespace%3D{{ request.oldObject.metadata.namespace }}"
+            value: helm.toolkit.fluxcd.io%2Fname%3D{{ request.oldObject.metadata.name }}%2Chelm.toolkit.fluxcd.io%2Fnamespace%3D{{ request.oldObject.metadata.namespace }}
         - name: pvcCount
           apiCall:
-            urlPath: "/api/v1/persistentvolumeclaims?labelSelector=stateful%3Dtrue%2C{{ owner }}"
-            jmesPath: "items | length(@)"
+            urlPath: /api/v1/persistentvolumeclaims?labelSelector=stateful%3Dtrue%2C{{ owner }}
+            jmesPath: items | length(@)
+        - name: secretCount
+          apiCall:
+            urlPath: /api/v1/secrets?labelSelector=stateful%3Dtrue%2C{{ owner }}
+            jmesPath: items | length(@)
         - name: clusterCount
           apiCall:
-            urlPath: "/apis/postgresql.cnpg.io/v1/clusters?labelSelector=stateful%3Dtrue%2C{{ owner }}"
-            jmesPath: "items | length(@)"
+            urlPath: /apis/postgresql.cnpg.io/v1/clusters?labelSelector=stateful%3Dtrue%2C{{ owner }}
+            jmesPath: items | length(@)
       preconditions:
         any:
-          - key: "{{ pvcCount }}"
+          - key: '{{ pvcCount }}'
             operator: GreaterThan
             value: 0
-          - key: "{{ clusterCount }}"
+          - key: '{{ clusterCount }}'
+            operator: GreaterThan
+            value: 0
+          - key: '{{ secretCount }}'
             operator: GreaterThan
             value: 0
       validate:
         failureAction: Enforce
-        message: >-
-          A policy blocks this delete because deleting it would delete a stateful resource managed by HelmRelease/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
+        message: A policy blocks this delete because deleting it would delete a stateful resource managed by HelmRelease/{{ request.oldObject.metadata.name }}. To delete it, remove it from Git and let Flux prune it.
         deny: {}
     - name: deny-delete-cnpg-crd-holding-stateful
       match:
@@ -525,15 +721,14 @@ spec:
       context:
         - name: statefulClusters
           apiCall:
-            urlPath: "/apis/postgresql.cnpg.io/v1/clusters?labelSelector=stateful%3Dtrue"
-            jmesPath: "items[].join('/', [metadata.namespace, metadata.name])"
+            urlPath: /apis/postgresql.cnpg.io/v1/clusters?labelSelector=stateful%3Dtrue
+            jmesPath: items[].join('/', [metadata.namespace, metadata.name])
       validate:
         failureAction: Enforce
-        message: >-
-          A policy blocks this delete because deleting it would delete stateful resources: Cluster {{ join(', ', statefulClusters) }}. To delete it, remove it from Git and let Flux prune it.
+        message: 'A policy blocks this delete because deleting it would delete stateful resources: Cluster {{ join('', '', statefulClusters) }}. To delete it, remove it from Git and let Flux prune it.'
         deny:
           conditions:
             any:
-              - key: "{{ length(statefulClusters) }}"
+              - key: '{{ length(statefulClusters) }}'
                 operator: GreaterThan
                 value: 0
