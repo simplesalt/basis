@@ -7,6 +7,7 @@ resources:
   - fluent-bit.yaml
   - human-operator.yaml
   - kured-gate.yaml
+  - kyverno-stateful-lookup.yaml
   - logs-api.yaml
   - logs-parity.yaml
   - logs-pg.yaml
@@ -24,6 +25,7 @@ resources:
   - policies.stateful-protection.yaml
   - policies.stateful.yaml
   - policies.storage.yaml
+  - stateful-test.yaml
 configMapGenerator:
   - name: logs-schema
     namespace: cluster-main-observability
