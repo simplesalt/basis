@@ -1,0 +1,25 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stateful-test-ks
+  labels:
+    app.kubernetes.io/name: stateful-test
+    entity: cluster
+    capability: governance
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: stateful-test-ks-claim
+  namespace: stateful-test-ks
+  labels:
+    app.kubernetes.io/name: stateful-test
+    entity: cluster
+    capability: governance
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Mi
