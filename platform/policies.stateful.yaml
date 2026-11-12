@@ -18,7 +18,8 @@ metadata:
       Adds the label stateful=yes, unless the object already sets stateful, and the annotation
       kustomize.toolkit.fluxcd.io/force=Disabled at admission to CNPG
       Clusters, PVCs and Secrets other than Helm release storage. stateful=no on
-      any of them opts it out. projects#913.
+      any of them opts it out, and a PVC annotated storage-tier ephemeral
+      defaults to stateful=no. projects#913.
 spec:
   background: false
   webhookConfiguration:
@@ -49,6 +50,11 @@ spec:
               operations:
                 - CREATE
                 - UPDATE
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."resiliency.simplesalt.company/storage-tier" || '''' }}'
+            operator: NotEquals
+            value: ephemeral
       mutate:
         patchStrategicMerge:
           metadata:
@@ -56,6 +62,25 @@ spec:
               +(stateful): "yes"
             annotations:
               kustomize.toolkit.fluxcd.io/force: Disabled
+    - name: label-ephemeral-pvcs
+      match:
+        any:
+          - resources:
+              kinds:
+                - v1/PersistentVolumeClaim
+              operations:
+                - CREATE
+                - UPDATE
+      preconditions:
+        all:
+          - key: '{{ request.object.metadata.annotations."resiliency.simplesalt.company/storage-tier" || '''' }}'
+            operator: Equals
+            value: ephemeral
+      mutate:
+        patchStrategicMerge:
+          metadata:
+            labels:
+              +(stateful): "no"
     - name: label-secrets
       match:
         any:
