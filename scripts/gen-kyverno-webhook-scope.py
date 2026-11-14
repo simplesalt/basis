@@ -166,7 +166,7 @@ def filters_expression(filters):
         names = ", ".join(lit(n) for n in dict.fromkeys(namespaces))
         terms.append(f"request.namespace in [{names}] || ({NAMESPACE_OBJECT} && request.name in [{names}])")
     terms += rest
-    return f"!({disj(*terms)})"
+    return re.sub(r"\brequest\.(namespace|name|subResource)\b", lambda m: f"(has(request.{m[1]}) ? request.{m[1]} : '')", f"!({disj(*terms)})")
 
 
 def split_exclusions(value):
