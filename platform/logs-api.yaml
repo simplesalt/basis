@@ -46,6 +46,7 @@ metadata:
     entity: cluster
     env: main
     capability: observability
+    resiliency.simplesalt.company/ha: required
 spec:
   replicas: 1
   selector:
