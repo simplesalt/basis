@@ -64,6 +64,8 @@ spec:
     features:
       admissionReports:
         enabled: false
+      forceFailurePolicyIgnore:
+        enabled: true
       logging:
         format: json
         verbosity: 0
