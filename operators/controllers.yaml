@@ -72,6 +72,16 @@ spec:
       logging:
         format: json
         verbosity: 0
+    admissionController:
+      replicas: 2
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/component: admission-controller
+              app.kubernetes.io/instance: kyverno-controller
 ---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease

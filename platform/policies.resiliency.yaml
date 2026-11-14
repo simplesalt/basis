@@ -204,3 +204,74 @@ spec:
               - key: '{{ request.object.spec.affinity.topologyKey || '''' }}'
                 operator: NotEquals
                 value: kubernetes.io/hostname
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: deployment-resiliency
+  labels:
+    app.kubernetes.io/name: deployment-resiliency
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: resiliency
+  annotations:
+    policies.kyverno.io/title: Deployment resiliency governance
+    policies.kyverno.io/category: Resiliency
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Deployment
+    policies.kyverno.io/description: >-
+      A Deployment labelled resiliency.simplesalt.company/ha: required always
+      keeps a ready copy through a node drain or reboot. At admission it is
+      given at least 2 replicas and a hard one-per-node topology spread on its
+      own pod selector; Kubernetes alone keeps that true afterwards.
+spec:
+  background: false
+  webhookConfiguration:
+    failurePolicy: Ignore
+  rules:
+    - name: ha-required-min-replicas
+      match:
+        any:
+          - resources:
+              kinds:
+                - apps/v1/Deployment
+              operations:
+                - CREATE
+                - UPDATE
+              selector:
+                matchLabels:
+                  resiliency.simplesalt.company/ha: required
+      preconditions:
+        all:
+          - key: '{{ request.object.spec.replicas || `1` }}'
+            operator: LessThan
+            value: 2
+      mutate:
+        patchStrategicMerge:
+          spec:
+            replicas: 2
+
+    - name: ha-required-spread-across-nodes
+      match:
+        any:
+          - resources:
+              kinds:
+                - apps/v1/Deployment
+              operations:
+                - CREATE
+                - UPDATE
+              selector:
+                matchLabels:
+                  resiliency.simplesalt.company/ha: required
+      mutate:
+        patchStrategicMerge:
+          spec:
+            template:
+              spec:
+                topologySpreadConstraints:
+                  - maxSkew: 1
+                    topologyKey: kubernetes.io/hostname
+                    whenUnsatisfiable: DoNotSchedule
+                    labelSelector:
+                      matchLabels: '{{ request.object.spec.selector.matchLabels }}'
