@@ -19,7 +19,9 @@ spec:
   background: false
   webhookConfiguration:
     failurePolicy: Ignore
-    timeoutSeconds: 30
+    # Kept short: on node reboot k3s writes its Node before the pod network is up,
+    # this call cannot reach Kyverno, and a long wait outlasts k3s's startup deadline.
+    timeoutSeconds: 5
   rules:
     - name: deny-delete-stateful
       match:

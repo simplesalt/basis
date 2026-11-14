@@ -57,6 +57,13 @@ spec:
         name: kyverno
         namespace: flux-system
   values:
+    admissionController:
+      container:
+        extraArgs:
+          # Default timeout of Kyverno's resource webhooks (was 10s). Kept short so
+          # k3s's Node writes on reboot, made before the pod network is up, fail open
+          # within its startup deadline instead of hanging on an unreachable Kyverno.
+          webhookTimeout: 5
     backgroundController:
       enabled: false
     reportsController:
