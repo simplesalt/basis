@@ -8,6 +8,7 @@ resources:
   - fluent-bit.yaml
   - human-operator.yaml
   - kured-gate.yaml
+  - kured-uncordon.yaml
   - kyverno-stateful-lookup.yaml
   - logs-api.yaml
   - logs-parity.yaml
@@ -119,3 +120,14 @@ configMapGenerator:
         app.kubernetes.io/component: self-heal
         entity: cluster
         capability: resiliency
+  - name: kured-uncordon-script
+    namespace: cluster-main-observability
+    files:
+      - uncordon.py=kured-uncordon/uncordon.py
+    options:
+      labels:
+        app.kubernetes.io/name: kured-uncordon
+        app.kubernetes.io/part-of: basis
+        app.kubernetes.io/component: node-lifecycle
+        entity: cluster
+        capability: lifecycle

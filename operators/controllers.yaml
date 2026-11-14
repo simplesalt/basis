@@ -952,5 +952,6 @@ spec:
       alertFilterRegexp: "^RebootGateClosed$"
       alertFilterMatchOnly: true
       alertFiringOnly: true
+      annotateNodes: true
     tolerations:
       - operator: Exists

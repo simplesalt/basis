@@ -20,13 +20,52 @@ spec:
           expr: |-
             (count(kube_node_status_condition{condition="Ready",status="true"} == 0) > 0)
             or
+            (count(kube_node_spec_unschedulable == 1) > 0)
+            or
             (count(ALERTS{alertstate="firing",severity="critical"}) > 0)
           labels:
             severity: warning
           annotations:
             summary: Kured node reboots are blocked
             description: >-
-              A node is not Ready, or another alert with severity=critical is
-              firing. kured watches this alert (RebootGateClosed) via its
-              Prometheus alert filter and will not drain or reboot any node
-              while it is firing.
+              A node is not Ready, a node is cordoned, or another alert with
+              severity=critical is firing (NodeCannotStartPods and
+              NodeCordonedTooLong among them). kured watches this alert
+              (RebootGateClosed) via its Prometheus alert filter and will not
+              drain or reboot any node while it is firing. projects#943.
+    - name: node-lifecycle.rules
+      interval: 30s
+      rules:
+        - alert: NodeCannotStartPods
+          expr: |-
+            max by (node) (
+              (
+                (kube_pod_container_status_waiting_reason{reason="ContainerCreating"} == 1)
+                or
+                (kube_pod_init_container_status_waiting_reason{reason="ContainerCreating"} == 1)
+              )
+              * on (namespace, pod) group_left (node) max by (namespace, pod, node) (kube_pod_info{node!=""})
+            ) > 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: Node {{ $labels.node }} cannot start pods
+            description: >-
+              Node {{ $labels.node }} has had pods stuck in ContainerCreating
+              for 10 minutes, even if it reports Ready. This usually means
+              the CNI (flannel) did not come up or sandbox creation is
+              failing. The reboot gate stays closed while this fires.
+              projects#943.
+        - alert: NodeCordonedTooLong
+          expr: kube_node_spec_unschedulable == 1
+          for: 1h
+          labels:
+            severity: critical
+          annotations:
+            summary: Node {{ $labels.node }} has been cordoned for over an hour
+            description: >-
+              Node {{ $labels.node }} has been unschedulable for more than an
+              hour. kured-uncordon releases a kured-rebooted node only once it
+              can start pods again, so a node still cordoned after an hour
+              needs a person. projects#943.

@@ -1,0 +1,187 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kured-uncordon
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: kured-uncordon
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: node-lifecycle
+    entity: cluster
+    capability: lifecycle
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kured-uncordon
+  labels:
+    app.kubernetes.io/name: kured-uncordon
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: node-lifecycle
+    entity: cluster
+    capability: lifecycle
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["patch"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kured-uncordon-scope
+  labels:
+    app.kubernetes.io/name: kured-uncordon
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: node-lifecycle
+    entity: cluster
+    capability: lifecycle
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        resources: ["nodes"]
+        operations: ["UPDATE"]
+  matchConditions:
+    - name: kured-uncordon
+      expression: request.userInfo.username == "system:serviceaccount:cluster-main-observability:kured-uncordon"
+  validations:
+    - expression: has(oldObject.spec.unschedulable) && oldObject.spec.unschedulable
+      message: kured-uncordon may only change cordoned nodes
+    - expression: "!has(object.spec.unschedulable) || !object.spec.unschedulable"
+      message: kured-uncordon may only uncordon
+    - expression: "(has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {})"
+      message: kured-uncordon may not change node labels
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kured-uncordon-scope
+  labels:
+    app.kubernetes.io/name: kured-uncordon
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: node-lifecycle
+    entity: cluster
+    capability: lifecycle
+spec:
+  policyName: kured-uncordon-scope
+  validationActions: ["Deny"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kured-uncordon
+  labels:
+    app.kubernetes.io/name: kured-uncordon
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: node-lifecycle
+    entity: cluster
+    capability: lifecycle
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kured-uncordon
+subjects:
+  - kind: ServiceAccount
+    name: kured-uncordon
+    namespace: cluster-main-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kured-uncordon-reader
+  labels:
+    app.kubernetes.io/name: kured-uncordon
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: node-lifecycle
+    entity: cluster
+    capability: lifecycle
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-health-reader
+subjects:
+  - kind: ServiceAccount
+    name: kured-uncordon
+    namespace: cluster-main-observability
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kured-uncordon
+  namespace: cluster-main-observability
+  labels:
+    app.kubernetes.io/name: kured-uncordon
+    app.kubernetes.io/part-of: basis
+    app.kubernetes.io/component: node-lifecycle
+    entity: cluster
+    capability: lifecycle
+  annotations:
+    description: >-
+      Every 5 minutes, uncordons a node that kured cordoned (weave.works/kured-reboot-in-progress) once it has rebooted, has been Ready for SETTLE_MINUTES, has no pod stuck in ContainerCreating, and has started at least one pod-network pod since it came back. It works whether or not kured still holds its lock, and skips a node while kured's lock on it is unexpired or when the node was cordoned before kured took it. A node it cannot release stays cordoned and raises NodeCordonedTooLong after an hour. An admission policy limits it to uncordoning, with labels unchanged. Each decision is logged as one JSON line. projects#943.
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 240
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: kured-uncordon
+            entity: cluster
+            capability: lifecycle
+        spec:
+          restartPolicy: Never
+          serviceAccountName: kured-uncordon
+          tolerations:
+            - key: node.kubernetes.io/unschedulable
+              operator: Exists
+              effect: NoSchedule
+          containers:
+            - name: uncordon
+              image: docker.io/library/python:3.13-alpine
+              command: ["python3", "-u", "/uncordon/uncordon.py"]
+              env:
+                - name: SETTLE_MINUTES
+                  value: "5"
+                - name: KURED_NAMESPACE
+                  value: kured
+                - name: KURED_DAEMONSET
+                  value: kured
+                - name: KURED_LOCK_ANNOTATION
+                  value: weave.works/kured-node-lock
+              volumeMounts:
+                - name: health
+                  mountPath: /scripts
+                  readOnly: true
+                - name: uncordon
+                  mountPath: /uncordon
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 20m
+                  memory: 64Mi
+                limits:
+                  memory: 256Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+                runAsNonRoot: true
+                runAsUser: 65534
+                seccompProfile:
+                  type: RuntimeDefault
+          volumes:
+            - name: health
+              configMap:
+                name: cluster-health-script
+            - name: uncordon
+              configMap:
+                name: kured-uncordon-script
