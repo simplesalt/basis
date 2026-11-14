@@ -22,7 +22,7 @@ metadata:
 spec:
   url: oci://ghcr.io/simplesalt/charts/kyverno
   ref:
-    tag: "3.9.1-ss3"
+    tag: "3.9.1"
   interval: 12h
 ---
 apiVersion: source.toolkit.fluxcd.io/v1
