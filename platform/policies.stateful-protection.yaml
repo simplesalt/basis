@@ -18,7 +18,6 @@ metadata:
 spec:
   background: false
   webhookConfiguration:
-    failurePolicy: Ignore
     timeoutSeconds: 30
   rules:
     - name: deny-delete-stateful

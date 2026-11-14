@@ -24,8 +24,6 @@ metadata:
       so adding them restarts nothing.
 spec:
   background: false
-  webhookConfiguration:
-    failurePolicy: Ignore
   rules:
     - name: default-io-timing
       match:

@@ -27,8 +27,6 @@ metadata:
       only.
 spec:
   background: false
-  webhookConfiguration:
-    failurePolicy: Ignore
   rules:
     - name: sub-hourly-cronjob-bounds
       match:

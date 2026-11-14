@@ -25,8 +25,6 @@ metadata:
       resiliency.simplesalt.company/ha: exempt.
 spec:
   background: false
-  webhookConfiguration:
-    failurePolicy: Ignore
   rules:
     - name: default-storage-tier
       match:
@@ -227,8 +225,6 @@ metadata:
       own pod selector; Kubernetes alone keeps that true afterwards.
 spec:
   background: false
-  webhookConfiguration:
-    failurePolicy: Ignore
   rules:
     - name: ha-required-min-replicas
       match:

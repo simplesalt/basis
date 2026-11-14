@@ -22,8 +22,6 @@ metadata:
       cluster provides no storage that survives losing the node.
 spec:
   background: true
-  webhookConfiguration:
-    failurePolicy: Ignore
   rules:
     - name: reject-unknown-storage-tier
       match:

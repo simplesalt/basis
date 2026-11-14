@@ -22,8 +22,6 @@ metadata:
       only source of the stateful label. projects#913.
 spec:
   background: false
-  webhookConfiguration:
-    failurePolicy: Ignore
   rules:
     - name: label-cnpg-clusters
       match:

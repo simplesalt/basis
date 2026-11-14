@@ -49,8 +49,6 @@ metadata:
       work nodes.
 spec:
   background: false
-  webhookConfiguration:
-    failurePolicy: Ignore
   rules:
     - name: confine-work-to-work-nodes
       match:
