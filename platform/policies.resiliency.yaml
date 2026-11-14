@@ -275,3 +275,5 @@ spec:
                     whenUnsatisfiable: DoNotSchedule
                     labelSelector:
                       matchLabels: '{{ request.object.spec.selector.matchLabels }}'
+                    matchLabelKeys:
+                      - pod-template-hash
