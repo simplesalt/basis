@@ -1,0 +1,6 @@
+config:
+  matchConditions:
+    - name: kyverno-resource-filters
+      expression: '!((request.subResource == '''' && request.kind.kind in ["Event", "Node", "APIService", "TokenReview", "SubjectAccessReview", "SelfSubjectAccessReview", "Binding", "ReplicaSet", "EphemeralReport", "ClusterEphemeralReport"]) || (request.namespace in ["kyverno", "kube-system", "kube-public", "kube-node-lease"] || (request.resource.group == '''' && request.resource.version == ''v1'' && request.resource.resource == ''namespaces'' && request.name in ["kyverno", "kube-system", "kube-public", "kube-node-lease"])) || (((request.subResource != '''') && (request.resource.resource == "nodes")) && (request.subResource != '''')) || (((request.subResource != '''') && (request.resource.resource == "apiservices")) && (request.subResource != '''')) || ((((request.subResource == '''') && (request.kind.kind == "Pod")) || ((request.subResource != '''') && (request.resource.resource == "pods"))) && (request.subResource == "binding")) || (((request.subResource != '''') && (request.resource.resource == "replicasets")) && (request.subResource != '''')))'
+    - name: kyverno-excluded-users
+      expression: '!((has(request.userInfo.groups) && request.userInfo.groups.exists(g, (g == "system:nodes"))))'

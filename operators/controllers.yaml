@@ -56,6 +56,9 @@ spec:
         kind: HelmRepository
         name: kyverno
         namespace: flux-system
+  valuesFrom:
+    - kind: ConfigMap
+      name: kyverno-webhook-scope
   values:
     backgroundController:
       enabled: false
