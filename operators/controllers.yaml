@@ -53,6 +53,29 @@ spec:
     name: kyverno
     namespace: flux-system
   values:
+    admissionController:
+      rbac:
+        clusterRole:
+          extraResources:
+            - apiGroups:
+                - cloudplatform.gcp.upbound.io
+                - cloudplatform.gcp.m.upbound.io
+                - connectivity.upjet-cloudflare.upbound.io
+                - connectivity.upjet-cloudflare.m.upbound.io
+                - dns.upjet-cloudflare.upbound.io
+                - dns.upjet-cloudflare.m.upbound.io
+                - r2.upjet-cloudflare.upbound.io
+                - r2.upjet-cloudflare.m.upbound.io
+                - workers.upjet-cloudflare.upbound.io
+                - workers.upjet-cloudflare.m.upbound.io
+                - zero.upjet-cloudflare.upbound.io
+                - zero.upjet-cloudflare.m.upbound.io
+              resources:
+                - '*'
+              verbs:
+                - get
+                - list
+                - watch
     backgroundController:
       enabled: true
       rbac:
