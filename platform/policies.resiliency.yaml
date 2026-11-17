@@ -281,8 +281,6 @@ spec:
           - resources:
               kinds:
                 - apps/v1/Deployment
-              namespaces:
-                - "*"
               selector:
                 matchLabels:
                   resiliency.simplesalt.company/ha: required
