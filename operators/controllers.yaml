@@ -54,7 +54,19 @@ spec:
     namespace: flux-system
   values:
     backgroundController:
-      enabled: false
+      enabled: true
+      rbac:
+        clusterRole:
+          extraResources:
+            - apiGroups:
+                - policy
+              resources:
+                - poddisruptionbudgets
+              verbs:
+                - create
+                - update
+                - patch
+                - delete
     reportsController:
       enabled: false
     features:
