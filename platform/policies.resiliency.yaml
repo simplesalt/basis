@@ -221,8 +221,9 @@ metadata:
     policies.kyverno.io/description: >-
       A Deployment labelled resiliency.simplesalt.company/ha: required always
       keeps a ready copy through a node drain or reboot. At admission it is
-      given at least 2 replicas and a hard one-per-node topology spread on its
-      own pod selector; Kubernetes alone keeps that true afterwards.
+      given at least 2 replicas, a hard one-per-node topology spread on its
+      own pod selector, and a PodDisruptionBudget of minAvailable 1 on that
+      selector; Flux keeps that true afterwards.
 spec:
   background: false
   rules:
@@ -273,3 +274,27 @@ spec:
                       matchLabels: '{{ request.object.spec.selector.matchLabels }}'
                     matchLabelKeys:
                       - pod-template-hash
+
+    - name: ha-required-pdb
+      match:
+        any:
+          - resources:
+              kinds:
+                - apps/v1/Deployment
+              operations:
+                - CREATE
+                - UPDATE
+              selector:
+                matchLabels:
+                  resiliency.simplesalt.company/ha: required
+      generate:
+        apiVersion: policy/v1
+        kind: PodDisruptionBudget
+        name: '{{ request.object.metadata.name }}'
+        namespace: '{{ request.object.metadata.namespace }}'
+        synchronize: false
+        data:
+          spec:
+            minAvailable: 1
+            selector:
+              matchLabels: '{{ request.object.spec.selector.matchLabels }}'
