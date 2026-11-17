@@ -29,6 +29,7 @@ resources:
   - policies.stateful.yaml
   - policies.storage.yaml
   - policies.segmentation.yaml
+  - cleanup-probe.yaml
 configMapGenerator:
   - name: logs-schema
     namespace: cluster-main-observability

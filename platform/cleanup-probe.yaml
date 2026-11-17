@@ -1,0 +1,90 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cleanup-probe
+  labels:
+    name: cleanup-probe
+    entity: cluster
+    capability: governance
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: cleanup-probe
+spec:
+  background: false
+  rules:
+    - name: network-policy
+      match:
+        any:
+          - resources:
+              kinds:
+                - v1/ConfigMap
+              namespaces:
+                - cleanup-probe
+              selector:
+                matchLabels:
+                  cleanup-probe.simplesalt.company/trigger: "true"
+      generate:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: '{{ request.object.metadata.name }}'
+        namespace: '{{ request.object.metadata.namespace }}'
+        synchronize: true
+        orphanDownstreamOnPolicyDelete: true
+        data:
+          spec:
+            podSelector:
+              matchLabels:
+                cleanup-probe.simplesalt.company/none: "true"
+            policyTypes:
+              - Ingress
+    - name: ingress
+      match:
+        any:
+          - resources:
+              kinds:
+                - v1/ConfigMap
+              namespaces:
+                - cleanup-probe
+              selector:
+                matchLabels:
+                  cleanup-probe.simplesalt.company/trigger: "true"
+      generate:
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        name: '{{ request.object.metadata.name }}'
+        namespace: '{{ request.object.metadata.namespace }}'
+        synchronize: true
+        orphanDownstreamOnPolicyDelete: true
+        data:
+          spec:
+            ingressClassName: cleanup-probe-none
+            defaultBackend:
+              service:
+                name: cleanup-probe-none
+                port:
+                  number: 80
+    - name: namespace
+      match:
+        any:
+          - resources:
+              kinds:
+                - v1/ConfigMap
+              namespaces:
+                - cleanup-probe
+              selector:
+                matchLabels:
+                  cleanup-probe.simplesalt.company/trigger: "true"
+      generate:
+        apiVersion: v1
+        kind: Namespace
+        name: '{{ request.object.metadata.name }}'
+        synchronize: true
+        orphanDownstreamOnPolicyDelete: true
+        data:
+          metadata:
+            labels:
+              cleanup-probe.simplesalt.company/generated: "true"
