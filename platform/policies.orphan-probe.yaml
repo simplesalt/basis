@@ -25,6 +25,8 @@ spec:
         data:
           spec:
             managementPolicies:
-              - '*'
+              - Observe
+              - Create
+              - Update
             forProvider:
               name: orphan-probe
