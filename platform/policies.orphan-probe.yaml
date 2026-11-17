@@ -18,15 +18,13 @@ spec:
       generate:
         synchronize: true
         orphanDownstreamOnPolicyDelete: true
-        apiVersion: r2.upjet-cloudflare.m.upbound.io/v1alpha1
+        apiVersion: r2.upjet-cloudflare.upbound.io/v1alpha1
         kind: Bucket
         name: '{{ request.object.metadata.name }}'
-        namespace: '{{ request.object.metadata.namespace }}'
         data:
           spec:
             managementPolicies:
-              - Observe
-              - Create
-              - Update
+              - '*'
             forProvider:
               name: orphan-probe
+            deletionPolicy: Orphan
