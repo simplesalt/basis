@@ -6,6 +6,7 @@ resources:
   - cnpg-monitoring.yaml
   - finalizer-clearer.yaml
   - fluent-bit.yaml
+  - ha-probe.yaml
   - human-operator.yaml
   - kured-gate.yaml
   - kured-uncordon.yaml
