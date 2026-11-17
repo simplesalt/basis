@@ -21,7 +21,7 @@ metadata:
       PVCs to the node-local StorageClass. `replicated` is denied, because this
       cluster provides no storage that survives losing the node.
 spec:
-  background: true
+  background: false
   rules:
     - name: reject-unknown-storage-tier
       match:
