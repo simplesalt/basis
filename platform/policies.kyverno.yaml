@@ -22,7 +22,9 @@ metadata:
       targets are not allowed. Every generate rule must set synchronize and
       orphanDownstreamOnPolicyDelete and list no operations, so a generated
       object is deleted with its trigger and survives Flux recreating the
-      policy.
+      policy. A generated object may not set deletionPolicy: Orphan, or
+      managementPolicies without Delete, so no cloud resource outlives its
+      trigger.
 spec:
   background: false
   rules:
@@ -128,6 +130,45 @@ spec:
                 operator: GreaterThan
                 value: 0
               - key: '{{ length(request.object.spec.rules[?generate].match.resources.operations[] || `[]`) }}'
+                operator: GreaterThan
+                value: 0
+
+    - name: generated-cloud-resources-follow-their-trigger
+      match:
+        any:
+          - resources:
+              kinds:
+                - kyverno.io/v1/ClusterPolicy
+                - kyverno.io/v1/Policy
+              operations:
+                - CREATE
+                - UPDATE
+      preconditions:
+        all:
+          - key: '{{ length(request.object.spec.rules[?generate]) }}'
+            operator: GreaterThan
+            value: 0
+      validate:
+        failureAction: Enforce
+        message: >-
+          A generated object must not orphan its cloud resource: set no
+          deletionPolicy: Orphan, and any managementPolicies must include
+          Delete or "*". Deleting or reclassifying the trigger deletes the
+          cloud resource with it; keeping its data is the owning
+          application's job, done before the trigger leaves git.
+        deny:
+          conditions:
+            any:
+              - key: '{{ length(request.object.spec.rules[?generate.data.spec.deletionPolicy == `"Orphan"`]) }}'
+                operator: GreaterThan
+                value: 0
+              - key: '{{ length(request.object.spec.rules[].generate.foreach[][?data.spec.deletionPolicy == `"Orphan"`][] || `[]`) }}'
+                operator: GreaterThan
+                value: 0
+              - key: '{{ length(request.object.spec.rules[?generate.data.spec.managementPolicies && !contains(generate.data.spec.managementPolicies, `"*"`) && !contains(generate.data.spec.managementPolicies, `"Delete"`)]) }}'
+                operator: GreaterThan
+                value: 0
+              - key: '{{ length(request.object.spec.rules[].generate.foreach[][?data.spec.managementPolicies && !contains(data.spec.managementPolicies, `"*"`) && !contains(data.spec.managementPolicies, `"Delete"`)][] || `[]`) }}'
                 operator: GreaterThan
                 value: 0
 
