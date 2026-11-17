@@ -281,10 +281,6 @@ spec:
           - resources:
               kinds:
                 - apps/v1/Deployment
-              operations:
-                - CREATE
-                - UPDATE
-                - DELETE
               selector:
                 matchLabels:
                   resiliency.simplesalt.company/ha: required
