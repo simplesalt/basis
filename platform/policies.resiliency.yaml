@@ -292,7 +292,7 @@ spec:
         kind: PodDisruptionBudget
         name: '{{ request.object.metadata.name }}'
         namespace: '{{ request.object.metadata.namespace }}'
-        synchronize: false
+        synchronize: true
         data:
           spec:
             minAvailable: 1
