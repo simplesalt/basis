@@ -1,0 +1,39 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: namespace-segmentation
+  labels:
+    app.kubernetes.io/name: namespace-segmentation
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: governance
+  annotations:
+    policies.kyverno.io/title: Namespace segmentation
+    policies.kyverno.io/category: Segmentation
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Namespace
+    policies.kyverno.io/description: >-
+      Gives every Namespace its own ServiceAccount, named after the Namespace,
+      when the Namespace is admitted. The ServiceAccount mounts no token by
+      default and carries no cloud identity annotations; access is granted
+      only by RoleBindings and cloud bindings in git.
+spec:
+  background: false
+  rules:
+    - name: namespace-service-account
+      match:
+        any:
+          - resources:
+              kinds:
+                - v1/Namespace
+      generate:
+        apiVersion: v1
+        kind: ServiceAccount
+        name: '{{ request.object.metadata.name }}'
+        namespace: '{{ request.object.metadata.name }}'
+        synchronize: true
+        orphanDownstreamOnPolicyDelete: true
+        data:
+          automountServiceAccountToken: false
