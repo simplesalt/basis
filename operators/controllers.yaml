@@ -56,17 +56,74 @@ spec:
     backgroundController:
       enabled: true
       rbac:
-        clusterRole:
+        coreClusterRole:
           extraResources:
+            - apiGroups:
+                - ""
+              resources:
+                - namespaces
+                - serviceaccounts
+                - resourcequotas
+                - limitranges
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - update
+                - patch
+                - delete
+            - apiGroups:
+                - networking.k8s.io
+              resources:
+                - networkpolicies
+                - ingresses
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - update
+                - patch
+                - delete
+            - apiGroups:
+                - gateway.networking.k8s.io
+              resources:
+                - referencegrants
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - update
+                - patch
+                - delete
             - apiGroups:
                 - policy
               resources:
                 - poddisruptionbudgets
               verbs:
+                - get
+                - list
+                - watch
                 - create
                 - update
                 - patch
                 - delete
+            - apiGroups:
+                - postgresql.cnpg.io
+              resources:
+                - scheduledbackups
+              verbs:
+                - get
+                - list
+                - watch
+                - create
+                - update
+                - patch
+                - delete
+        clusterRole:
+          extraResources: []
     reportsController:
       enabled: false
     features:
