@@ -1,0 +1,120 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: kyverno-admission-only
+  labels:
+    app.kubernetes.io/name: kyverno-admission-only
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/component: policy
+    entity: cluster
+    capability: governance
+  annotations:
+    policies.kyverno.io/title: Kyverno acts only at admission
+    policies.kyverno.io/category: Governance
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: ClusterPolicy, Policy, GeneratingPolicy, MutatingPolicy, ValidatingPolicy, ImageValidatingPolicy
+    policies.kyverno.io/description: >-
+      Kyverno acts on an object only while that object is admitted; Flux keeps
+      what is in git true afterwards. Refuses any Kyverno policy that scans,
+      generates for, or mutates objects that already exist: background must be
+      false, and generateExisting, mutateExistingOnPolicyUpdate and mutate
+      targets are not allowed. Generated objects may still be kept in step with
+      their trigger through synchronize.
+spec:
+  background: false
+  rules:
+    - name: background-off
+      match:
+        any:
+          - resources:
+              kinds:
+                - kyverno.io/v1/ClusterPolicy
+                - kyverno.io/v1/Policy
+              operations:
+                - CREATE
+                - UPDATE
+      validate:
+        failureAction: Enforce
+        message: >-
+          Set spec.background: false. Kyverno here acts only when an object is
+          admitted; scanning objects that already exist is Flux's job, not
+          Kyverno's.
+        deny:
+          conditions:
+            any:
+              - key: '{{ to_string(request.object.spec.background) }}'
+                operator: NotEquals
+                value: "false"
+
+    - name: no-existing-object-rules
+      match:
+        any:
+          - resources:
+              kinds:
+                - kyverno.io/v1/ClusterPolicy
+                - kyverno.io/v1/Policy
+              operations:
+                - CREATE
+                - UPDATE
+      validate:
+        failureAction: Enforce
+        message: >-
+          This policy acts on objects that already exist (generateExisting,
+          mutateExistingOnPolicyUpdate or mutate targets). Kyverno here acts
+          only on the object being admitted, and on objects it generates from
+          it. Change the object in git instead and let Flux apply it.
+        deny:
+          conditions:
+            any:
+              - key: '{{ request.object.spec.generateExisting || `false` }}'
+                operator: Equals
+                value: true
+              - key: '{{ request.object.spec.mutateExistingOnPolicyUpdate || `false` }}'
+                operator: Equals
+                value: true
+              - key: '{{ length(request.object.spec.rules[?generate.generateExisting]) }}'
+                operator: GreaterThan
+                value: 0
+              - key: '{{ length(request.object.spec.rules[?mutate.mutateExistingOnPolicyUpdate]) }}'
+                operator: GreaterThan
+                value: 0
+              - key: '{{ length(request.object.spec.rules[?mutate.targets]) }}'
+                operator: GreaterThan
+                value: 0
+
+    - name: no-existing-object-policies
+      match:
+        any:
+          - resources:
+              kinds:
+                - policies.kyverno.io/v1beta1/GeneratingPolicy
+                - policies.kyverno.io/v1beta1/NamespacedGeneratingPolicy
+                - policies.kyverno.io/v1beta1/MutatingPolicy
+                - policies.kyverno.io/v1beta1/NamespacedMutatingPolicy
+                - policies.kyverno.io/v1beta1/ValidatingPolicy
+                - policies.kyverno.io/v1beta1/NamespacedValidatingPolicy
+                - policies.kyverno.io/v1beta1/ImageValidatingPolicy
+                - policies.kyverno.io/v1beta1/NamespacedImageValidatingPolicy
+              operations:
+                - CREATE
+                - UPDATE
+      validate:
+        failureAction: Enforce
+        message: >-
+          This policy acts on objects that already exist (background,
+          generateExisting or mutateExisting). Kyverno here acts only on the
+          object being admitted; set spec.evaluation.background.enabled: false
+          and leave generateExisting and mutateExisting off.
+        deny:
+          conditions:
+            any:
+              - key: '{{ request.object.spec.evaluation.generateExisting.enabled || `false` }}'
+                operator: Equals
+                value: true
+              - key: '{{ request.object.spec.evaluation.mutateExisting.enabled || `false` }}'
+                operator: Equals
+                value: true
+              - key: '{{ request.object.spec.evaluation.background.enabled || `false` }}'
+                operator: Equals
+                value: true
