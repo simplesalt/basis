@@ -19,8 +19,10 @@ metadata:
       what is in git true afterwards. Refuses any Kyverno policy that scans,
       generates for, or mutates objects that already exist: background must be
       false, and generateExisting, mutateExistingOnPolicyUpdate and mutate
-      targets are not allowed. Generated objects may still be kept in step with
-      their trigger through synchronize.
+      targets are not allowed. Every generate rule must set synchronize and
+      orphanDownstreamOnPolicyDelete and list no operations, so a generated
+      object is deleted with its trigger and survives Flux recreating the
+      policy.
 spec:
   background: false
   rules:
@@ -80,6 +82,52 @@ spec:
                 operator: GreaterThan
                 value: 0
               - key: '{{ length(request.object.spec.rules[?mutate.targets]) }}'
+                operator: GreaterThan
+                value: 0
+
+    - name: generated-objects-follow-their-trigger
+      match:
+        any:
+          - resources:
+              kinds:
+                - kyverno.io/v1/ClusterPolicy
+                - kyverno.io/v1/Policy
+              operations:
+                - CREATE
+                - UPDATE
+      preconditions:
+        all:
+          - key: '{{ length(request.object.spec.rules[?generate]) }}'
+            operator: GreaterThan
+            value: 0
+      validate:
+        failureAction: Enforce
+        message: >-
+          A generate rule must set synchronize: true and
+          orphanDownstreamOnPolicyDelete: true, and must not list operations
+          in its match. synchronize deletes the generated object when its
+          trigger is deleted, but only if the rule matches every operation:
+          listing CREATE and UPDATE hides the delete from Kyverno, and listing
+          DELETE generates on delete instead. Flux recreates a policy whose
+          generate rule changes, so without orphanDownstreamOnPolicyDelete
+          every generated object is deleted and, at admission only, not
+          regenerated.
+        deny:
+          conditions:
+            any:
+              - key: '{{ length(request.object.spec.rules[?generate && generate.synchronize != `true`]) }}'
+                operator: GreaterThan
+                value: 0
+              - key: '{{ length(request.object.spec.rules[?generate && generate.orphanDownstreamOnPolicyDelete != `true`]) }}'
+                operator: GreaterThan
+                value: 0
+              - key: '{{ length(request.object.spec.rules[?generate].match.any[].resources.operations[] || `[]`) }}'
+                operator: GreaterThan
+                value: 0
+              - key: '{{ length(request.object.spec.rules[?generate].match.all[].resources.operations[] || `[]`) }}'
+                operator: GreaterThan
+                value: 0
+              - key: '{{ length(request.object.spec.rules[?generate].match.resources.operations[] || `[]`) }}'
                 operator: GreaterThan
                 value: 0
 
