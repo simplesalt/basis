@@ -40,7 +40,7 @@ metadata:
   name: logs-postgrest
   namespace: cluster-main-observability
   annotations:
-    kyverno-relabel: "2026-11-17T13:40"
+    kyverno-relabel: "2026-11-17T14:05"
   labels:
     app.kubernetes.io/name: logs-postgrest
     app.kubernetes.io/part-of: observability
@@ -152,7 +152,7 @@ metadata:
   name: logs-mcp
   namespace: cluster-main-observability
   annotations:
-    kyverno-relabel: "2026-11-17T13:40"
+    kyverno-relabel: "2026-11-17T14:05"
   labels:
     app.kubernetes.io/name: logs-mcp
     app.kubernetes.io/part-of: observability
