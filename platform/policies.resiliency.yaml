@@ -290,6 +290,7 @@ spec:
         name: '{{ request.object.metadata.name }}'
         namespace: '{{ request.object.metadata.namespace }}'
         synchronize: true
+        orphanDownstreamOnPolicyDelete: true
         data:
           spec:
             minAvailable: 1
