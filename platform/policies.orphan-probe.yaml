@@ -1,0 +1,30 @@
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: orphan-probe
+spec:
+  background: false
+  rules:
+    - name: bucket
+      match:
+        any:
+          - resources:
+              kinds:
+                - ConfigMap
+              selector:
+                matchLabels:
+                  orphan-probe.simplesalt.company/never: "true"
+      generate:
+        synchronize: true
+        orphanDownstreamOnPolicyDelete: true
+        apiVersion: r2.upjet-cloudflare.m.upbound.io/v1alpha1
+        kind: Bucket
+        name: '{{ request.object.metadata.name }}'
+        namespace: '{{ request.object.metadata.namespace }}'
+        data:
+          spec:
+            managementPolicies:
+              - '*'
+            forProvider:
+              name: orphan-probe

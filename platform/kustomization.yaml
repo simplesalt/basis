@@ -28,6 +28,7 @@ resources:
   - policies.stateful-protection.yaml
   - policies.stateful.yaml
   - policies.storage.yaml
+  - policies.orphan-probe.yaml
 configMapGenerator:
   - name: logs-schema
     namespace: cluster-main-observability
