@@ -13,7 +13,7 @@ metadata:
     capability: observability
 spec:
   annotations:
-    restart-epoch: "2026-11-19-996-poison-record"
+    restart-epoch: "2026-11-19-996-nul-marker"
   image: ghcr.io/fluent/fluent-operator/fluent-bit:5.1.2
   fluentBitConfigName: fluent-bit-config
   namespaceFluentBitCfgSelector: {}
@@ -287,7 +287,7 @@ spec:
 apiVersion: fluentbit.fluent.io/v1alpha2
 kind: ClusterFilter
 metadata:
-  name: strip-nul
+  name: replace-nul
   labels:
     fluentbit.fluent.io/enabled: "true"
     app.kubernetes.io/name: fluent-bit
@@ -301,13 +301,13 @@ spec:
   ordinal: 100
   filters:
     - lua:
-        call: strip_nul
+        call: replace_nul
         code: >-
-          function strip_nul(tag, ts, record)
+          function replace_nul(tag, ts, record)
           local count = 0
           local function clean(v)
           if type(v) == "string" then
-          local s, n = string.gsub(v, "%z", "")
+          local s, n = string.gsub(v, "%z", "\239\191\189")
           count = count + n
           return s
           elseif type(v) == "table" then
@@ -323,6 +323,6 @@ spec:
           if count == 0 then
           return 0, ts, record
           end
-          cleaned["nul_stripped"] = count
+          cleaned["nul_replaced"] = count
           return 2, ts, cleaned
           end
