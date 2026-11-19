@@ -13,7 +13,7 @@ metadata:
     capability: observability
 spec:
   annotations:
-    restart-epoch: "2026-10-01-393-resume-test"
+    restart-epoch: "2026-11-19-996-poison-record"
   image: ghcr.io/fluent/fluent-operator/fluent-bit:5.1.2
   fluentBitConfigName: fluent-bit-config
   namespaceFluentBitCfgSelector: {}
@@ -272,7 +272,7 @@ metadata:
     capability: observability
 spec:
   matchRegex: ^(kube|host)\..*$
-  retry_limit: no_limits
+  retry_limit: "15"
   customPlugin:
     config: |
       Name pgsql
@@ -283,3 +283,46 @@ spec:
       Database ${LOGS_PG_DATABASE}
       Table logs
       storage.total_limit_size 5G
+---
+apiVersion: fluentbit.fluent.io/v1alpha2
+kind: ClusterFilter
+metadata:
+  name: strip-nul
+  labels:
+    fluentbit.fluent.io/enabled: "true"
+    app.kubernetes.io/name: fluent-bit
+    app.kubernetes.io/part-of: observability
+    app.kubernetes.io/component: logging
+    entity: cluster
+    env: main
+    capability: observability
+spec:
+  matchRegex: ^(kube|host)\..*$
+  ordinal: 100
+  filters:
+    - lua:
+        call: strip_nul
+        code: >-
+          function strip_nul(tag, ts, record)
+          local count = 0
+          local function clean(v)
+          if type(v) == "string" then
+          local s, n = string.gsub(v, "%z", "")
+          count = count + n
+          return s
+          elseif type(v) == "table" then
+          local out = {}
+          for k, x in pairs(v) do
+          out[clean(k)] = clean(x)
+          end
+          return out
+          end
+          return v
+          end
+          local cleaned = clean(record)
+          if count == 0 then
+          return 0, ts, record
+          end
+          cleaned["nul_stripped"] = count
+          return 2, ts, cleaned
+          end
