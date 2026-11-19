@@ -208,7 +208,7 @@ spec:
         config: |
           Name grep
           Regex log (?i)(error|fail|fatal|panic|exception|traceback|refused|denied|timeout|\boom\b)
-          Regex level (?i)^(error|fatal|warn|warning|audit)$
+          Regex level (?i)^(error|fatal|warn|warning|validation)$
           Logical_Op Or
     - grep:
         exclude: "log http: TLS handshake error"
