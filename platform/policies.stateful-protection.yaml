@@ -134,6 +134,22 @@ spec:
           - key: '{{ request.oldObject.metadata.labels.stateful || '''' }}'
             operator: NotEquals
             value: '{{ request.object.metadata.labels.stateful || '''' }}'
+        any:
+          - key: '{{ request.oldObject.metadata.labels.stateful || '''' }}'
+            operator: NotEquals
+            value: ''
+          - key: '{{ request.object.metadata.labels.stateful || '''' }}'
+            operator: NotEquals
+            value: "true"
+          - key: '{{ request.object.apiVersion }}/{{ request.object.kind }}'
+            operator: AnyNotIn
+            value:
+              - v1/Secret
+              - v1/PersistentVolumeClaim
+              - postgresql.cnpg.io/v1/Cluster
+          - key: '{{ request.object.type || '''' }}'
+            operator: Equals
+            value: helm.sh/release.v1
       validate:
         failureAction: Enforce
         message: 'A policy blocks this change because only Kyverno sets the stateful label: {{ request.object.kind }}/{{ request.object.metadata.name }}.'
